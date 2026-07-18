@@ -104,8 +104,7 @@ in-flight operation may still hold a pointer into the old stack.
 
 Builds **into the kernel** (`CONFIG_AUFSNG_FS=y`), not as a loadable
 module — a live-boot sequence needs this filesystem type mounted before
-any loadable module can be reached at all. See `Kconfig` and
-`create-module.sh`'s `AUFSNG=yes` branch.
+any loadable module can be reached at all.
 
 For a quick out-of-tree test build against an already-built kernel tree:
 
