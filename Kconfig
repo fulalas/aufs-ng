@@ -1,0 +1,17 @@
+config AUFSNG_FS
+	tristate "aufs-ng filesystem support (AUFS-compatible union filesystem)"
+	default n
+	help
+	  aufs-ng is a standalone, from-scratch union filesystem
+	  compatible with many live Linux distributions, such as
+	  PorteuX, Porteus and Slax. It registers as filesystem type
+	  "aufs", using AUFS's own mount option syntax and on-disk
+	  whiteout format, so that scripts issuing real AUFS
+	  mount/remount commands work unmodified.
+
+	  A live-boot sequence typically needs this filesystem type
+	  mounted before any loadable module can be reached (the same
+	  reason AUFS and overlayfs are usually built statically), so
+	  this option should be built in ("Y"), not built as a loadable
+	  module, wherever that applies. Say Y if you are building a
+	  live-distro kernel that needs it; say N otherwise.
