@@ -11,7 +11,7 @@
  *    (matching AUFS's "add=1:" - always immediately below branch 0),
  *    so the most recently added branch has top priority.  Generality
  *    for add=N with N>1 is supported via an insert position, but real
- *    PorteuX usage only ever specifies N=1.
+ *    live-distro usage only ever specifies N=1.
  *
  *  - Every add/remove invalidates the dentry cache via the generation
  *    stamp (see dcache.c) rather than attempting a surgical,
@@ -40,8 +40,6 @@
  *  - Removal's busy-scan uses evict_inodes() (one sb-wide pass) after
  *    shrink_dcache_sb(), not a per-inode evict-and-restart loop that
  *    is effectively quadratic in cached inode count.
- *
- * Copyright (C) 2026 PorteuX
  */
 
 #include <linux/fs.h>

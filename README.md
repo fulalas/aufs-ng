@@ -130,3 +130,10 @@ make -C /path/to/kernel/build M=$PWD CONFIG_AUFSNG_FS=m W=1 modules
 
 Boot, module activation/deactivation, and copy-up have been verified
 end-to-end, including activating a module on an already-running system.
+
+## License
+
+`aufs-ng` is free software, released under the **GNU General Public
+License, version 2** (`GPL-2.0-only`) — the same license as the Linux
+kernel it builds against, so the project is fully GPL-friendly and can
+be distributed as part of a GPL kernel tree.

@@ -1,7 +1,7 @@
 ifneq ($(KERNELRELEASE),)
 
 # CONFIG_AUFSNG_FS drives whether this becomes part of vmlinux (=y,
-# what PorteuX's own live-boot sequence requires - see Kconfig) or a
+# what a live-boot sequence typically requires - see Kconfig) or a
 # loadable module (=m, useful for a quick standalone test build
 # against an already-built kernel tree without a full rebuild).
 obj-$(CONFIG_AUFSNG_FS) += aufs-ng.o

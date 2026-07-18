@@ -2,8 +2,6 @@
 /*
  * aufs-ng inode operations: attribute and xattr passthrough to the
  * real object, with copy-up on the first modification.
- *
- * Copyright (C) 2026 PorteuX
  */
 
 #include <linux/fs.h>

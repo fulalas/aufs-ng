@@ -10,8 +10,6 @@
  * through the fresh root.  The generation is only ever bumped when a
  * layer change cannot update the cached state surgically, so this is
  * the rare path, not the common one.
- *
- * Copyright (C) 2026 PorteuX
  */
 
 #include <linux/fs.h>

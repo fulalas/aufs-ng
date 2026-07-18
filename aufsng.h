@@ -1,19 +1,18 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * aufs-ng - standalone union filesystem for PorteuX, semantically
- * compatible with AUFS: registers as filesystem type "aufs", accepts
+ * aufs-ng - standalone union filesystem for live Linux distributions,
+ * semantically compatible with AUFS: registers as filesystem type
+ * "aufs", accepts
  * genuine AUFS mount option syntax (br:, add=N:PATH=MODE, del=PATH,
  * xino=, udba=, dirperm1, nowarn_perm), and uses AUFS's own on-disk
  * whiteout format (".wh.<name>" regular files, ".wh..wh..opq" opaque
  * directory markers) so that scripts which mount, remount, or scan a
- * branch directly (as PorteuX's core-scripts do) need no changes.
+ * branch directly (as live-boot core-scripts do) need no changes.
  *
  * Branch 0 is always the single writable branch; branches 1.. are
  * read-only, highest priority first ("add=1:" always inserts
  * immediately below branch 0, so the most recently added module has
  * highest priority - the same "last-added-wins" semantics as AUFS).
- *
- * Copyright (C) 2026 PorteuX
  */
 #ifndef AUFSNG_H
 #define AUFSNG_H

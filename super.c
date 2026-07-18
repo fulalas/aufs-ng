@@ -5,8 +5,6 @@
  * unmodified, and so the kernel's standard "mount -t aufs" module
  * auto-loading (request_module("fs-aufs")) picks up this module
  * instead of requiring any initrd/script changes.
- *
- * Copyright (C) 2026 PorteuX
  */
 
 #include <linux/module.h>
@@ -20,7 +18,7 @@
 #include <linux/cred.h>
 #include "aufsng.h"
 
-MODULE_AUTHOR("PorteuX");
+MODULE_AUTHOR("aufs-ng contributors");
 MODULE_DESCRIPTION("aufs-ng - standalone AUFS-compatible union filesystem for live Linux distributions");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS_FS(AUFSNG_NAME);
