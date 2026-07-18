@@ -103,10 +103,25 @@ in-flight operation may still hold a pointer into the old stack.
 ## Building
 
 Builds **into the kernel** (`CONFIG_AUFSNG_FS=y`), not as a loadable
-module — a live-boot sequence needs this filesystem type mounted before
-any loadable module can be reached at all.
+module — a live-boot sequence typically needs this filesystem type
+mounted before any loadable module can be reached at all.
 
-For a quick out-of-tree test build against an already-built kernel tree:
+To integrate into a kernel source tree (any anchor line in `fs/Kconfig`/
+`fs/Makefile` works; the overlayfs entry is just a convenient, stable one):
+
+```sh
+git clone --depth 1 https://github.com/fulalas/aufs-ng fs/aufs-ng
+rm -rf fs/aufs-ng/.git fs/aufs-ng/README.md
+sed -i '/source "fs\/overlayfs\/Kconfig"/a source "fs/aufs-ng/Kconfig"' fs/Kconfig
+sed -i '/obj-\$(CONFIG_OVERLAY_FS)\s*+= overlayfs\//a obj-$(CONFIG_AUFSNG_FS)\t+= aufs-ng/' fs/Makefile
+echo "CONFIG_AUFSNG_FS=y" >> .config
+```
+
+Then build the kernel as usual (`make olddefconfig && make`).
+
+For a quick out-of-tree test build against an already-built kernel tree
+(producing a loadable `.ko` instead, no `fs/Kconfig`/`fs/Makefile` edits
+needed):
 
 ```sh
 make -C /path/to/kernel/build M=$PWD CONFIG_AUFSNG_FS=m W=1 modules
