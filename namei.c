@@ -12,8 +12,6 @@
  * stops; only then is "foo" itself looked up.  A directory is
  * "opaque" (nothing below it in lower branches is visible) if it
  * contains a file named ".wh..wh..opq".
- *
- * Copyright (C) 2026 PorteuX
  */
 
 #include <linux/fs.h>

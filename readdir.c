@@ -20,8 +20,6 @@
  * without holding this dir's lock, so a version read after the merge
  * could already account for a change the merge did not see, wrongly
  * marking a stale cache valid.
- *
- * Copyright (C) 2026 PorteuX
  */
 
 #include <linux/fs.h>

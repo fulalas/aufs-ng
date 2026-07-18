@@ -7,8 +7,6 @@
  * symlinks and special files are created in place (their "data" is
  * atomic by nature).  Runs with the mounter's credentials; ownership,
  * mode, times and xattrs are copied from the lower original.
- *
- * Copyright (C) 2026 PorteuX
  */
 
 #include <linux/fs.h>

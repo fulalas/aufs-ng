@@ -3,8 +3,8 @@ config AUFSNG_FS
 	default n
 	help
 	  aufs-ng is a standalone, from-scratch union filesystem
-	  compatible with many live Linux distributions, such as
-	  PorteuX, Porteus and Slax. It registers as filesystem type
+	  compatible with many live Linux distributions. It registers
+	  as filesystem type
 	  "aufs", using AUFS's own mount option syntax and on-disk
 	  whiteout format, so that scripts issuing real AUFS
 	  mount/remount commands work unmodified.

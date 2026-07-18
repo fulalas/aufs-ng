@@ -4,8 +4,6 @@
  * kernel's backing-file API (the same infrastructure FUSE passthrough
  * and overlayfs use), so reads, writes, splice and mmap run at native
  * speed on the layer filesystem with no per-superblock locking.
- *
- * Copyright (C) 2026 PorteuX
  */
 
 #include <linux/fs.h>

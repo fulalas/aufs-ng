@@ -13,8 +13,6 @@
  * the new directory opaque via ".wh..wh..opq".  Renaming a merged
  * directory returns -EXDEV, making mv fall back to copy+delete - AUFS
  * itself has no cross-branch atomic directory rename either.
- *
- * Copyright (C) 2026 PorteuX
  */
 
 #include <linux/fs.h>
