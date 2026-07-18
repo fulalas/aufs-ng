@@ -111,7 +111,6 @@ To integrate into a kernel source tree (any anchor line in `fs/Kconfig`/
 
 ```sh
 git clone --depth 1 https://github.com/fulalas/aufs-ng fs/aufs-ng
-rm -rf fs/aufs-ng/.git fs/aufs-ng/README.md
 sed -i '/source "fs\/overlayfs\/Kconfig"/a source "fs/aufs-ng/Kconfig"' fs/Kconfig
 sed -i '/obj-\$(CONFIG_OVERLAY_FS)\s*+= overlayfs\//a obj-$(CONFIG_AUFSNG_FS)\t+= aufs-ng/' fs/Makefile
 echo "CONFIG_AUFSNG_FS=y" >> .config
