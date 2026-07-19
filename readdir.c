@@ -29,6 +29,7 @@
 #include <linux/mount.h>
 #include <linux/cred.h>
 #include <linux/rbtree.h>
+#include <linux/iversion.h>
 #include "aufsng.h"
 
 struct aufsng_cache_entry {
@@ -44,6 +45,17 @@ struct aufsng_cache_entry {
 struct aufsng_dir_cache {
 	long refcount;
 	u64 version;
+	/*
+	 * The upper (rw) directory's change stamp when this listing was
+	 * built.  Under udba=reval it lets an out-of-band edit of the rw
+	 * branch (e.g. a hand-removed whiteout - the only way the merged
+	 * view can change without bumping @version) invalidate the cache
+	 * without re-reading every branch on each open.  i_version is the
+	 * tick-independent signal where the branch fs supports it; mtime is
+	 * the always-present fallback.  {0,0}/0 means no upper.
+	 */
+	struct timespec64 upper_mtime;
+	u64 upper_iversion;
 	struct list_head entries;
 	struct rb_root root;
 };
@@ -269,6 +281,15 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode)
 	old_cred = override_creds(pfs->creator_cred);
 
 	upper = aufsng_upperdentry(inode);
+	/*
+	 * Sample the upper mtime before reading it: if a concurrent edit
+	 * lands during the read, the stored stamp stays older than the now-
+	 * current mtime, so the next reuse check rebuilds rather than trust
+	 * a listing that might have half-caught the change.
+	 */
+	cache->upper_mtime = upper ? inode_get_mtime(d_inode(upper)) :
+				     (struct timespec64){0};
+	cache->upper_iversion = upper ? inode_query_iversion(d_inode(upper)) : 0;
 	if (upper) {
 		realpath.mnt = aufsng_upper_mnt(pfs);
 		realpath.dentry = upper;
@@ -295,6 +316,30 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode)
 	return cache;
 }
 
+/*
+ * Is @cache still consistent with the branches?  The caller has already
+ * checked @version (in-union mutations).  Under udba=reval also require
+ * the upper directory's mtime to be unchanged - the only signal an out-
+ * of-band rw-branch edit leaves without bumping @version.  Read under
+ * oi->lock so the sampled upper matches the cache being validated.
+ */
+static bool aufsng_dir_cache_fresh(struct aufsng_fs *pfs, struct inode *inode,
+				   struct aufsng_dir_cache *cache)
+{
+	struct dentry *upper;
+	struct timespec64 cur_mtime;
+	u64 cur_iversion;
+
+	if (!aufsng_udba_reval(pfs))
+		return true;
+	upper = aufsng_upperdentry(inode);
+	cur_mtime = upper ? inode_get_mtime(d_inode(upper)) :
+			    (struct timespec64){0};
+	cur_iversion = upper ? inode_query_iversion(d_inode(upper)) : 0;
+	return cur_iversion == cache->upper_iversion &&
+	       timespec64_equal(&cur_mtime, &cache->upper_mtime);
+}
+
 static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
 {
 	struct inode *inode = file_inode(file);
@@ -309,14 +354,13 @@ static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
 	mutex_lock(&oi->lock);
 	cache = oi->cache;
 	/*
-	 * Under udba=reval a direct branch edit (e.g. a hand-removed
-	 * whiteout) does not bump the inode version, so the version-valid
-	 * cache cannot be trusted across opens: rebuild a fresh merged
-	 * listing for this open instead.  The freshly built list is still
-	 * a stable snapshot for the lifetime of this fd's reads.
+	 * Reuse the cached listing while it is version-valid (no in-union
+	 * mutation since it was built) and, under udba=reval, the rw branch
+	 * has not been edited out-of-band.  This makes the common "nothing
+	 * changed" open O(1) instead of re-reading every branch each time.
 	 */
-	if (cache && !aufsng_udba_reval(pfs) &&
-	    cache->version == atomic64_read(&oi->version)) {
+	if (cache && cache->version == atomic64_read(&oi->version) &&
+	    aufsng_dir_cache_fresh(pfs, inode, cache)) {
 		cache->refcount++;
 	} else {
 		mutex_unlock(&oi->lock);

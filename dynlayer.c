@@ -840,14 +840,26 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
 	 * branch.
 	 */
 	for (i = 0; i < scan.nr; i++) {
-		if (new_oes[i])
+		if (new_oes[i]) {
 			aufsng_dyn_commit_rebuild(pfs, scan.dirs[i], new_oes[i],
 					      layer, parked[i]);
+			/*
+			 * Removing a branch that carried a whiteout reveals the
+			 * name it was hiding in a lower-priority branch, so drop
+			 * cached negative children whose "absent" verdict the
+			 * removal may have overturned - the same refresh the add
+			 * path does after splicing.
+			 */
+			aufsng_dyn_drop_neg_children(scan.dirs[i]);
+		}
 		iput(scan.dirs[i]);
 	}
 	kfree(scan.dirs);
 	kfree(new_oes);
 	kfree(parked);
+
+	/* the busy-scan skips the root; refresh its negatives too */
+	aufsng_dyn_drop_neg_children(root_inode);
 
 	pr_info("aufs (aufs-ng): branch '%s' removed\n",
 		pfs->config.br_names[layer->idx]);
