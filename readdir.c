@@ -55,6 +55,7 @@ struct aufsng_dir_file {
 struct aufsng_readdir_data {
 	struct dir_context ctx;
 	struct aufsng_dir_cache *cache;
+	unsigned int idx;	/* branch slot of the layer being read */
 	int count;
 	int err;
 };
@@ -164,7 +165,15 @@ static bool aufsng_fill_merge(struct dir_context *ctx, const char *name,
 
 		err = aufsng_cache_add(rdd->cache, real, reallen, 0, 0, true);
 	} else {
-		err = aufsng_cache_add(rdd->cache, name, namelen, ino, d_type,
+		/*
+		 * Fold the branch slot into the inode number, exactly as the
+		 * stat/getattr path does (aufsng_map_ino), so a file's d_ino
+		 * from readdir matches its st_ino and cannot collide with a
+		 * same-numbered inode in another branch under the one union
+		 * st_dev.
+		 */
+		err = aufsng_cache_add(rdd->cache, name, namelen,
+				    aufsng_map_ino(ino, rdd->idx), d_type,
 				    false);
 	}
 
@@ -177,12 +186,13 @@ static bool aufsng_fill_merge(struct dir_context *ctx, const char *name,
 }
 
 static int aufsng_dir_read_layer(struct aufsng_fs *pfs, const struct path *realpath,
-			      struct aufsng_dir_cache *cache)
+			      struct aufsng_dir_cache *cache, unsigned int idx)
 {
 	struct aufsng_readdir_data rdd = {
 		.ctx.actor = aufsng_fill_merge,
 		.ctx.count = INT_MAX,
 		.cache = cache,
+		.idx = idx,
 	};
 	struct file *realfile;
 	int err;
@@ -262,14 +272,15 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode)
 	if (upper) {
 		realpath.mnt = aufsng_upper_mnt(pfs);
 		realpath.dentry = upper;
-		err = aufsng_dir_read_layer(pfs, &realpath, cache);
+		err = aufsng_dir_read_layer(pfs, &realpath, cache, 0);
 	}
 
 	oe = AUFSNG_I_E(inode);
 	for (i = 0; !err && oe && i < oe->numlower; i++) {
 		realpath.mnt = oe->lowerstack[i].layer->mnt;
 		realpath.dentry = oe->lowerstack[i].dentry;
-		err = aufsng_dir_read_layer(pfs, &realpath, cache);
+		err = aufsng_dir_read_layer(pfs, &realpath, cache,
+					 oe->lowerstack[i].layer->idx);
 	}
 
 	revert_creds(old_cred);
@@ -287,6 +298,7 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode)
 static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
 {
 	struct inode *inode = file_inode(file);
+	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
 	struct aufsng_inode *oi = AUFSNG_I(inode);
 	struct aufsng_dir_file *od = file->private_data;
 	struct aufsng_dir_cache *cache;
@@ -296,7 +308,15 @@ static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
 
 	mutex_lock(&oi->lock);
 	cache = oi->cache;
-	if (cache && cache->version == atomic64_read(&oi->version)) {
+	/*
+	 * Under udba=reval a direct branch edit (e.g. a hand-removed
+	 * whiteout) does not bump the inode version, so the version-valid
+	 * cache cannot be trusted across opens: rebuild a fresh merged
+	 * listing for this open instead.  The freshly built list is still
+	 * a stable snapshot for the lifetime of this fd's reads.
+	 */
+	if (cache && !aufsng_udba_reval(pfs) &&
+	    cache->version == atomic64_read(&oi->version)) {
 		cache->refcount++;
 	} else {
 		mutex_unlock(&oi->lock);
@@ -415,8 +435,10 @@ int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir)
 	 * derived real name, not its on-disk ".wh."+name form); that
 	 * classification is exactly what we need here too.  Re-derive
 	 * each tombstone's on-disk name to unlink it.
+	 * Only tombstone names are inspected below, so the mapped inode
+	 * numbers are irrelevant here - any idx is fine.
 	 */
-	err = aufsng_dir_read_layer(pfs, &realpath, cache);
+	err = aufsng_dir_read_layer(pfs, &realpath, cache, 0);
 	if (err) {
 		aufsng_cache_free(cache);
 		return err;

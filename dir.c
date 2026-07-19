@@ -281,7 +281,9 @@ static int aufsng_create_object(struct dentry *dentry,
 		oe->lowerstack[0] = origin;
 		origin.dentry = NULL;
 	}
+	down_read(&pfs->dyn_lock);
 	inode = aufsng_get_inode(dentry->d_sb, upper, oe);
+	up_read(&pfs->dyn_lock);
 	if (IS_ERR(inode)) {
 		err = PTR_ERR(inode);
 		goto out_origin;

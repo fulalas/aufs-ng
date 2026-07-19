@@ -86,7 +86,28 @@ static int aufsng_dentry_revalidate_common(struct dentry *dentry,
 static int aufsng_d_revalidate(struct inode *dir, const struct qstr *name,
 			    struct dentry *dentry, unsigned int flags)
 {
-	return aufsng_dentry_revalidate_common(dentry, flags, false);
+	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
+	int ret;
+
+	ret = aufsng_dentry_revalidate_common(dentry, flags, false);
+	if (ret <= 0)
+		return ret;
+
+	/*
+	 * udba=reval: the generation stamp only tracks the union's own
+	 * branch add/remove, not a direct out-of-band edit of a branch.
+	 * A negative dentry can therefore be stale after a whiteout is
+	 * removed (or the name is created) straight in the rw branch, so
+	 * re-check the branches and drop it if the name is back.  The
+	 * check blocks on real lookups, so leave RCU walk first.
+	 */
+	if (aufsng_udba_reval(pfs) && dir && d_is_negative(dentry)) {
+		if (flags & LOOKUP_RCU)
+			return -ECHILD;
+		if (!aufsng_lookup_negative_valid(dir, name))
+			return 0;
+	}
+	return 1;
 }
 
 static int aufsng_d_weak_revalidate(struct dentry *dentry, unsigned int flags)

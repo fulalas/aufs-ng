@@ -354,6 +354,9 @@ int aufsng_init_fs_context(struct fs_context *fc)
 	if (!ctx)
 		return -ENOMEM;
 
+	/* AUFS's own default: revalidate branches on access (see udba=) */
+	ctx->config.udba = AUFSNG_UDBA_REVAL;
+
 	fc->fs_private = ctx;
 	fc->ops = &aufsng_context_ops;
 	return 0;
