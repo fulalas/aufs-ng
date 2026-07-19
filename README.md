@@ -65,9 +65,14 @@ mount -o remount,dirperm1,add=1:/path/to/new-lower=rr aufs /mnt
 mount -t aufs -o remount,del=/path/to/lower aufs /mnt
 ```
 
-`xino=` and `udba=` are accepted and stored for `show_options` fidelity
-but have no behavioral effect here (see `params.c`/`super.c`); everything
-else behaves as it would under original AUFS.
+`udba=` accepts `none`, `reval` (the default), and `notify` (accepted
+for AUFS compatibility but currently behaves as `reval`).
+`xino=` is accepted and stored for `show_options` fidelity but has no
+behavioral effect here.
+`dirperm1` and `nowarn_perm` are accepted for AUFS compatibility but
+are no-ops here.
+
+All other mount parameters behave as they would under original AUFS.
 
 ## On-disk format
 
@@ -85,7 +90,7 @@ and anything else that scans a branch directly need no changes.
 | `super.c` | Module init, `file_system_type`, superblock/inode lifecycle, `statfs`, `show_options` |
 | `params.c` | Mount option parsing (AUFS grammar) |
 | `namei.c` | Layered lookup, whiteout/opaque detection, inode hashing |
-| `dcache.c` | Dentry revalidation against the branch-stack generation counter |
+| `dcache.c` | Dentry revalidation against the branch-stack generation counter, plus negative-dentry revalidation under `udba=reval` |
 | `file.c` | Regular-file I/O via the kernel's `backing_file_*` passthrough API |
 | `readdir.c` | Merged directory listing (rbtree + list cache), invalidated by an inode version counter |
 | `inode.c` | `getattr`/`setattr`/xattr passthrough, copy-up-on-write triggers |

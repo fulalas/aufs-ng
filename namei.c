@@ -135,6 +135,66 @@ int aufsng_find_origin(struct aufsng_entry *poe, const struct qstr *name,
 	return 0;
 }
 
+/*
+ * udba=reval negative-dentry revalidation.  A cached negative name may
+ * have been resurrected by a direct branch change the union never saw
+ * (typically a ".wh.<name>" whiteout removed by hand in the rw branch).
+ * Re-run the merge's "does any branch still provide this name" decision
+ * for @name under parent @dir: return true if it is still absent (the
+ * negative dentry remains valid), false if some branch now provides it
+ * (the dentry must be dropped and looked up again).  On error, keep the
+ * dentry valid rather than thrash it.  Caller must not be in RCU walk.
+ */
+bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name)
+{
+	struct aufsng_fs *pfs = AUFSNG_FS(dir->i_sb);
+	const struct cred *old_cred;
+	struct aufsng_entry *poe;
+	struct dentry *pupper;
+	struct dentry *this;
+	bool valid = true;
+	unsigned int i;
+	int wh;
+
+	old_cred = override_creds(pfs->creator_cred);
+	down_read(&pfs->dyn_lock);
+
+	pupper = aufsng_upperdentry(dir);
+	if (pupper) {
+		wh = 0;
+		this = aufsng_lookup_once(aufsng_upper_mnt(pfs), pupper, name,
+				       &wh);
+		if (IS_ERR(this) || wh)
+			goto out;	/* error, or still whited out: valid */
+		if (this) {
+			dput(this);
+			valid = false;	/* the upper now provides the name */
+			goto out;
+		}
+	}
+
+	poe = AUFSNG_I_E(dir);
+	for (i = 0; poe && i < poe->numlower; i++) {
+		wh = 0;
+		this = aufsng_lookup_once(poe->lowerstack[i].layer->mnt,
+				       poe->lowerstack[i].dentry, name, &wh);
+		if (IS_ERR(this))
+			goto out;	/* error: keep the dentry valid */
+		if (wh)
+			goto out;	/* a whiteout hides all lowers: valid */
+		if (this) {
+			dput(this);
+			valid = false;	/* a lower branch now provides it */
+			goto out;
+		}
+	}
+
+out:
+	up_read(&pfs->dyn_lock);
+	revert_creds(old_cred);
+	return valid;
+}
+
 static int aufsng_inode_test(struct inode *inode, void *data)
 {
 	return inode->i_private == data;
@@ -181,7 +241,10 @@ static void aufsng_fill_inode(struct inode *inode, struct inode *realinode)
  * Find or create the union inode for a resolved branch stack.  The
  * inode hash key is the top lower inode when a lower exists (stable
  * across copy-up), the rw-branch inode for pure-rw files.  Consumes
- * @upperdentry and @oe on both success and failure.
+ * @upperdentry and @oe on both success and failure.  Callers must hold
+ * pfs->dyn_lock (read): the upper-adoption heal parks the superseded
+ * upper on dyn_parked, which is otherwise mutated only under dyn_lock
+ * for writing (aufsng_dyn_commit_rebuild).
  */
 struct inode *aufsng_get_inode(struct super_block *sb,
 			    struct dentry *upperdentry,
@@ -219,33 +282,59 @@ struct inode *aufsng_get_inode(struct super_block *sb,
 		 * lookup, or a lower hardlink sibling of a copied-up
 		 * name - the cached state wins (matching AUFS, where
 		 * pseudo-links keep such names on one inode).  This
-		 * lookup found an upper the cached inode lacks: for a
-		 * directory, this is the aliasing a runtime branch
-		 * change can cause (see aufsng_dyn_adopt_upper()); for
-		 * anything else there is only one possible upper
-		 * location, so a fresh find is always adoptable.  Only
-		 * two *different* uppers are irreconcilable.
+		 * lookup found an upper the cached inode lacks, or a
+		 * different one: for a directory this is handled by
+		 * aufsng_dyn_adopt_upper() (which also rebuilds the merged
+		 * listing); for a non-directory there is a single upper
+		 * location, so the freshly found upper is authoritative and
+		 * replaces any stale one - an app that saves by writing a
+		 * temp file and renaming it over the name (geany's config,
+		 * for one) gives the rw copy a new inode on every save, and
+		 * the union inode (keyed by the stable lower origin) must
+		 * follow it instead of failing with ESTALE.  A replacement of
+		 * a different file type (the rw copy became a dir/symlink) is
+		 * NOT adopted - the cached inode's ops were fixed at its type,
+		 * so that falls through to ESTALE.  The superseded upper may
+		 * still be in use by a lockless aufsng_path_real() reader, so
+		 * it is parked and dropped at inode eviction, not here.
 		 */
 		if (!ok && !new_u && oe->numlower)
 			ok = true;
-		if (!ok && new_u && !cached_u) {
-			if (S_ISDIR(inode->i_mode))
+		if (!ok && new_u) {
+			if (S_ISDIR(inode->i_mode)) {
 				ok = aufsng_dyn_adopt_upper(inode,
 							 oe->numlower ?
 							 oe->lowerstack[0].dentry :
 							 NULL,
 							 upperdentry);
-			else {
-				mutex_lock(&AUFSNG_I(inode)->lock);
-				if (!AUFSNG_I(inode)->upperdentry) {
-					AUFSNG_I(inode)->upperdentry =
-						dget(upperdentry);
+			} else if ((inode->i_mode & S_IFMT) ==
+				   (new_u->i_mode & S_IFMT)) {
+				struct aufsng_inode *ai = AUFSNG_I(inode);
+
+				mutex_lock(&ai->lock);
+				if (!ai->upperdentry) {
+					WRITE_ONCE(ai->upperdentry,
+						   dget(upperdentry));
+					ok = true;
+				} else if (d_inode(ai->upperdentry) == new_u) {
 					ok = true;
 				} else {
-					ok = d_inode(AUFSNG_I(inode)->upperdentry)
-					     == new_u;
+					struct aufsng_dyn_parked *pk =
+						kmalloc(sizeof(*pk), GFP_KERNEL);
+
+					if (pk) {
+						pk->oe = NULL;
+						pk->mnt = NULL;
+						pk->upper = ai->upperdentry;
+						WRITE_ONCE(ai->upperdentry,
+							   dget(upperdentry));
+						aufsng_copyattr(inode);
+						pk->next = ai->dyn_parked;
+						ai->dyn_parked = pk;
+						ok = true;
+					}
 				}
-				mutex_unlock(&AUFSNG_I(inode)->lock);
+				mutex_unlock(&ai->lock);
 			}
 		}
 		dput(upperdentry);

@@ -76,19 +76,28 @@ static struct aufsng_entry *aufsng_dyn_swap_root(struct super_block *sb,
 	return old_oe;
 }
 
+static void aufsng_dyn_drop_neg_children(struct inode *inode);
+
 /*
  * With dynamic branches, a directory may be looked up again while an
  * older union inode for it is still cached and pinned: branch changes
  * reorder priorities, so the top lower (the inode hash key) of a
  * fresh lookup can differ from the one the cached inode was created
  * with, temporarily aliasing the directory.  Heal it by adopting the
- * new upper instead of failing the lookup with ESTALE.
+ * new upper instead of failing the lookup with ESTALE.  A directory's
+ * rw copy can also be replaced (rmdir+mkdir at the same path) so its
+ * upper resolves to a different inode; adopt the fresh one, park the
+ * superseded upper for a lockless aufsng_path_real() reader (dropped at
+ * eviction), bump the version so the merged listing is rebuilt, and drop
+ * cached negative children so a name the new upper provides re-resolves.
+ * The top-lower match keeps this from grafting an unrelated directory.
  */
 bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 			 struct dentry *upperdentry)
 {
 	struct aufsng_inode *oi = AUFSNG_I(inode);
 	struct aufsng_entry *oe;
+	bool replaced = false;
 	bool ok = false;
 
 	if (!S_ISDIR(inode->i_mode) || !upperdentry || !lowerdentry)
@@ -101,13 +110,32 @@ bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 	if (oe && oe->numlower && d_inode(oe->lowerstack[0].dentry) ==
 				  d_inode(lowerdentry)) {
 		if (!oi->upperdentry) {
-			oi->upperdentry = dget(upperdentry);
+			WRITE_ONCE(oi->upperdentry, dget(upperdentry));
+			ok = true;
+		} else if (d_inode(oi->upperdentry) == d_inode(upperdentry)) {
 			ok = true;
 		} else {
-			ok = d_inode(oi->upperdentry) == d_inode(upperdentry);
+			struct aufsng_dyn_parked *pk =
+				kmalloc(sizeof(*pk), GFP_KERNEL);
+
+			if (pk) {
+				pk->oe = NULL;
+				pk->mnt = NULL;
+				pk->upper = oi->upperdentry;
+				WRITE_ONCE(oi->upperdentry, dget(upperdentry));
+				aufsng_copyattr(inode);
+				atomic64_inc(&oi->version);
+				pk->next = oi->dyn_parked;
+				oi->dyn_parked = pk;
+				ok = true;
+				replaced = true;
+			}
 		}
 	}
 	mutex_unlock(&oi->lock);
+
+	if (replaced)
+		aufsng_dyn_drop_neg_children(inode);
 
 	return ok;
 }
@@ -639,6 +667,7 @@ static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode
 
 	parked->oe = old_oe;
 	parked->mnt = mntget(layer->mnt);
+	parked->upper = NULL;
 	parked->next = oi->dyn_parked;
 	oi->dyn_parked = parked;
 
@@ -660,9 +689,12 @@ void aufsng_dyn_put_parked(struct aufsng_inode *oi)
 	for (p = oi->dyn_parked; p; p = p->next) {
 		unsigned int i;
 
-		for (i = 0; i < p->oe->numlower; i++)
-			dput(p->oe->lowerstack[i].dentry);
-		mntput(p->mnt);
+		if (p->oe)
+			for (i = 0; i < p->oe->numlower; i++)
+				dput(p->oe->lowerstack[i].dentry);
+		if (p->mnt)
+			mntput(p->mnt);
+		dput(p->upper);
 	}
 }
 

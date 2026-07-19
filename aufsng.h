@@ -109,6 +109,17 @@ static inline struct aufsng_fs *AUFSNG_FS(struct super_block *sb)
 	return sb->s_fs_info;
 }
 
+/*
+ * udba=reval (and =notify, a superset) re-examine the real branches on
+ * access so that a direct, out-of-band change to a branch - most
+ * commonly a ".wh.<name>" whiteout removed by hand in the rw branch -
+ * is reflected in the merged view; udba=none trusts the cache instead.
+ */
+static inline bool aufsng_udba_reval(struct aufsng_fs *pfs)
+{
+	return pfs->config.udba >= AUFSNG_UDBA_REVAL;
+}
+
 static inline struct aufsng_inode *AUFSNG_I(struct inode *inode)
 {
 	return container_of(inode, struct aufsng_inode, vfs_inode);
@@ -256,6 +267,7 @@ struct aufsng_dyn_parked {
 	struct aufsng_dyn_parked *next;
 	struct aufsng_entry *oe;
 	struct vfsmount *mnt;
+	struct dentry *upper;
 };
 
 /* mount-time branch context collected by params.c */
@@ -307,6 +319,7 @@ int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir);
 /* namei.c */
 struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 			  unsigned int flags);
+bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name);
 struct inode *aufsng_get_inode(struct super_block *sb,
 			    struct dentry *upperdentry,
 			    struct aufsng_entry *oe);
