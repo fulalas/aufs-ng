@@ -160,17 +160,29 @@ bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name)
 	down_read(&pfs->dyn_lock);
 
 	pupper = aufsng_upperdentry(dir);
-	if (pupper) {
-		wh = 0;
-		this = aufsng_lookup_once(aufsng_upper_mnt(pfs), pupper, name,
-				       &wh);
-		if (IS_ERR(this) || wh)
-			goto out;	/* error, or still whited out: valid */
-		if (this) {
-			dput(this);
-			valid = false;	/* the upper now provides the name */
-			goto out;
-		}
+	/*
+	 * No upper: whiteouts live only in the rw branch, and the lowers are
+	 * read-only, so a name absent when this negative dentry was created
+	 * stays absent until the branch set changes - and both add and remove
+	 * drop affected negative children through the dynamic path (a removed
+	 * branch may have carried a whiteout that hid a lower-priority name,
+	 * so removal calls aufsng_dyn_drop_neg_children() too).  A surviving
+	 * negative is therefore still absent: skip the per-branch rescan.
+	 * This is the common case for read-only system directories, where
+	 * repeated misses (PATH, include and library probes) would otherwise
+	 * scan every lower.
+	 */
+	if (!pupper)
+		goto out;
+
+	wh = 0;
+	this = aufsng_lookup_once(aufsng_upper_mnt(pfs), pupper, name, &wh);
+	if (IS_ERR(this) || wh)
+		goto out;	/* error, or still whited out: valid */
+	if (this) {
+		dput(this);
+		valid = false;		/* the upper now provides the name */
+		goto out;
 	}
 
 	poe = AUFSNG_I_E(dir);
