@@ -225,6 +225,20 @@ static int aufsng_create_object(struct dentry *dentry,
 		err = found;
 		goto out_creds;
 	}
+	/*
+	 * A same-named lower of a different type is not this object's
+	 * copy-up origin (e.g. creating a symlink where a lower regular
+	 * file exists); the new upper shadows it as an independent object
+	 * and must be keyed by itself, not aliased onto the lower's
+	 * identity.  Directory creates use @found only for opaque marking,
+	 * which is type-independent, so this is scoped to non-directories.
+	 */
+	if (!is_dir && found &&
+	    (d_inode(origin.dentry)->i_mode & S_IFMT) != (a->mode & S_IFMT)) {
+		dput(origin.dentry);
+		origin.dentry = NULL;
+		found = 0;
+	}
 
 	slot = aufsng_create_slot(pfs, pupper, &dentry->d_name);
 	if (IS_ERR(slot)) {
