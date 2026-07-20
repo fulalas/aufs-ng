@@ -439,7 +439,12 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 		 * origin (the topmost lower still visibly providing this
 		 * name) is still collected: the union inode is hashed by
 		 * the origin, which keeps the inode - and st_ino -
-		 * stable across copy-up and cache eviction.
+		 * stable across copy-up and cache eviction.  A same-named
+		 * lower of a *different* type is not an origin, though: the
+		 * upper is then an independent object shadowing it (e.g. a
+		 * symlink created over a lower regular file), and keying it
+		 * onto the lower's identity would alias two unrelated
+		 * objects of conflicting type - so it is keyed by its upper.
 		 */
 		struct aufsng_path origin = { NULL, NULL };
 		int found;
@@ -448,6 +453,12 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 		if (found < 0) {
 			err = found;
 			goto out;
+		}
+		if (found && (d_inode(origin.dentry)->i_mode & S_IFMT) !=
+			     (d_inode(upper)->i_mode & S_IFMT)) {
+			dput(origin.dentry);
+			origin.dentry = NULL;
+			found = 0;
 		}
 		err = -ENOMEM;
 		oe = aufsng_alloc_entry(found);
