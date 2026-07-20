@@ -233,8 +233,7 @@ static int aufsng_create_object(struct dentry *dentry,
 	 * identity.  Directory creates use @found only for opaque marking,
 	 * which is type-independent, so this is scoped to non-directories.
 	 */
-	if (!is_dir && found &&
-	    (d_inode(origin.dentry)->i_mode & S_IFMT) != (a->mode & S_IFMT)) {
+	if (!is_dir && found && !aufsng_origin_type_ok(origin.dentry, a->mode)) {
 		dput(origin.dentry);
 		origin.dentry = NULL;
 		found = 0;

@@ -454,8 +454,8 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 			err = found;
 			goto out;
 		}
-		if (found && (d_inode(origin.dentry)->i_mode & S_IFMT) !=
-			     (d_inode(upper)->i_mode & S_IFMT)) {
+		if (found && !aufsng_origin_type_ok(origin.dentry,
+						    d_inode(upper)->i_mode)) {
 			dput(origin.dentry);
 			origin.dentry = NULL;
 			found = 0;

@@ -172,6 +172,17 @@ static inline void aufsng_path_real(struct inode *inode, struct path *path)
 	}
 }
 
+/*
+ * Is the lower @origin a valid copy-up origin for an object of type
+ * @mode?  Only when they are the same file type: a same-named lower of
+ * a different type is an independent object shadowed by the upper, not
+ * its origin, and must not be aliased onto the lower's identity.
+ */
+static inline bool aufsng_origin_type_ok(struct dentry *origin, umode_t mode)
+{
+	return (d_inode(origin)->i_mode & S_IFMT) == (mode & S_IFMT);
+}
+
 static inline void aufsng_copyattr(struct inode *inode)
 {
 	struct inode *realinode = aufsng_inode_real(inode);
