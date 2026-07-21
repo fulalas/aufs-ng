@@ -35,24 +35,24 @@ grammar with:
 This is new code, not a driver hardened by two decades of real-world use.
 Also, some AUFS features are intentionally out of scope:
 
-- **Pseudo-links (`plink`)** — linking a file that comes from a module
-  still works, just makes a full copy behind the scenes instead of a
-  true link.
+- **Pseudo-links (`plink`)** — hard-linking (not to be confused with
+  symlinking) a file that comes from a layer (module) still works, just
+  makes a full copy behind the scenes instead of a true link.
 - **Directory-rename metadata (`dirren`)** — renaming a folder that comes
-  from a module still works, just slower (a copy instead of an instant
+  from a layer still works, just slower (a copy instead of an instant
   rename) for large folders.
-- **FHSM** (automatic storage tiering) — not needed: aufs-ng only ever
-  has one writable location, so there's nothing to move files between.
 - **`shwh`** (flattening layers into one) — no built-in way to merge a
   stack of read-only layers into one clean image.
+- **RDU** (readdir speed-up helper) — no userspace listing accelerator;
+  only a directory with tens of thousands of entries spread across many
+  layers would notice.
 - **Multiple writable branches** — only one writable location is used at
   a time; all your changes go there, you can't spread them across
   several disks.
 - **NFS export** — the union filesystem isn't meant to be shared out to
   other computers over the network; it's for local use only.
-- **RDU** (readdir performance helper) — listing very large folders
-  always happens the standard way, with no optional speed-up helper;
-  only noticeable for unusually large folders.
+- **FHSM** (automatic storage tiering) — not needed: aufs-ng only ever
+  has one writable location, so there's nothing to move files between.
 
 ## Mount syntax
 
