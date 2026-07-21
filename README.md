@@ -81,12 +81,16 @@ other read-only spelling `rr` (meant for natively read-only filesystems
 like squashfs) and mode suffixes such as `+wh` or `+nolwh` — they all
 simply mean read-only here.
 
-- `udba=` — what happens when a branch is edited directly, behind the
-  union's back: `reval` (the default) picks such edits up; `none` trusts
-  the cache (slightly faster, fine when branches only ever change
-  through the union); `notify` is accepted and behaves as `reval`.
-- `xino=`, `dirperm1`, `nowarn_perm` — accepted so existing AUFS mount
-  lines work unchanged; they have no effect.
+- `udba=` — `reval` (the default) shows changes made directly inside a
+  branch; `none` skips that detection (faster and safe if branches are
+  never modified directly); `notify` is accepted but behaves as `reval`.
+- `xino=` — where original AUFS writes its inode-number table; aufs-ng
+  keeps inode numbers stable without a table, so this is ignored.
+- `dirperm1` — makes original AUFS check only the topmost branch's
+  permissions for a directory; aufs-ng always behaves that way, so the
+  option changes nothing.
+- `nowarn_perm` — silences original AUFS's warnings about branches with
+  differing owner/permissions; aufs-ng never prints those warnings.
 
 On remount, unknown options are silently ignored. Unlike original AUFS,
 there is no `/sys/fs/aufs` tree; the branch list appears directly in
