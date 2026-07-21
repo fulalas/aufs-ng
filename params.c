@@ -106,31 +106,47 @@ static int aufsng_mount_dir(struct fs_context *fc, const char *name,
 	return 0;
 }
 
-static enum aufsng_br_perm aufsng_parse_perm(const char *s)
+/*
+ * Parse an AUFS branch mode: a base permission "rw"/"ro"/"rr",
+ * optionally followed by "+attr" suffixes ("ro+wh", "rw+nolwh", ...).
+ * "rr" (real-readonly, e.g. squashfs) and "ro" are equivalent here -
+ * neither is ever written to - and the attributes tune whiteout
+ * handling that aufs-ng applies uniformly, so they parse but have no
+ * further effect.  Returns -EINVAL if @s is not a mode at all.
+ */
+static int aufsng_parse_perm(const char *s, enum aufsng_br_perm *perm)
 {
-	/* "rr" (real-readonly, e.g. squashfs) and "ro" are equivalent
-	 * here: neither is ever written to.
-	 */
-	if (!strcmp(s, "rw"))
-		return AUFSNG_BR_RW;
-	return AUFSNG_BR_RO;
+	if (!strncmp(s, "rw", 2))
+		*perm = AUFSNG_BR_RW;
+	else if (!strncmp(s, "ro", 2) || !strncmp(s, "rr", 2))
+		*perm = AUFSNG_BR_RO;
+	else
+		return -EINVAL;
+	if (s[2] != '\0' && s[2] != '+')
+		return -EINVAL;
+	return 0;
 }
 
 /*
  * Split "PATH=MODE" (MODE optional, defaults to ro) into a resolved
  * path and a permission.  @spec is consumed (NUL bytes inserted).
+ * The suffix after the last '=' is treated as a mode only when it
+ * actually parses as one; otherwise the '=' belongs to the branch
+ * path itself ("br:/data/a=b" is a path, not a mode "b").
  */
 static int aufsng_parse_branch_spec(struct fs_context *fc, char *spec,
 				 struct aufsng_ctx_branch *out)
 {
 	char *eq = strrchr(spec, '=');
+	enum aufsng_br_perm perm = AUFSNG_BR_RO;
 	const char *permstr = "ro";
 	int err;
 
-	if (eq) {
+	if (eq && !aufsng_parse_perm(eq + 1, &perm)) {
 		*eq = '\0';
 		permstr = eq + 1;
 	}
+	strscpy(out->permstr, permstr, sizeof(out->permstr));
 
 	out->name = kstrdup(spec, GFP_KERNEL);
 	if (!out->name)
@@ -142,7 +158,7 @@ static int aufsng_parse_branch_spec(struct fs_context *fc, char *spec,
 		out->name = NULL;
 		return err;
 	}
-	out->perm = aufsng_parse_perm(permstr);
+	out->perm = perm;
 	return 0;
 }
 

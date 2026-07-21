@@ -37,31 +37,55 @@ struct aufsng_cache_entry {
 	struct list_head l_node;
 	u64 ino;
 	unsigned int d_type;
+	unsigned short idx;	/* branch slot that provided this entry */
 	bool hidden;	/* tombstone: never emitted, blocks lower branches */
+	bool ino_fixed;	/* @ino settled; no lower origin can change it */
 	int len;
 	char name[];
+};
+
+/* one branch directory's change signal (see aufsng_dir_cache_fresh) */
+struct aufsng_dir_stamp {
+	struct timespec64 mtime;
+	u64 iversion;
 };
 
 struct aufsng_dir_cache {
 	long refcount;
 	u64 version;
 	/*
-	 * The upper (rw) directory's change stamp when this listing was
-	 * built.  Under udba=reval it lets an out-of-band edit of the rw
-	 * branch (e.g. a hand-removed whiteout - the only way the merged
-	 * view can change without bumping @version) invalidate the cache
-	 * without re-reading every branch on each open.  i_version is the
-	 * tick-independent signal where the branch fs supports it; mtime is
-	 * the always-present fallback.  {0,0}/0 means no upper.
+	 * Every branch directory's change stamp when this listing was
+	 * built (slot 0 = upper, then the lower stack in order).  Under
+	 * udba=reval they let an out-of-band edit of ANY branch - a
+	 * hand-removed whiteout in the rw branch, a file created in a
+	 * lower branch through its source mount - invalidate the cache
+	 * without re-reading every branch on each open; those edits are
+	 * the only way the merged view can change without bumping
+	 * @version, and lookup's own revalidation already honors them,
+	 * so readdir must too or the two permanently disagree.
+	 * i_version is the tick-independent signal where the branch fs
+	 * supports it; mtime is the always-present fallback.
 	 */
-	struct timespec64 upper_mtime;
-	u64 upper_iversion;
+	unsigned int nr_stamps;
+	struct aufsng_dir_stamp *stamps;
+	/* non-tombstone entries; the union-emptiness answer for rmdir */
+	unsigned int nr_visible;
 	struct list_head entries;
 	struct rb_root root;
 };
 
 struct aufsng_dir_file {
 	struct aufsng_dir_cache *cache;
+	/*
+	 * Where the previous getdents on this fd stopped: the list node
+	 * whose entry sits at offset @cursor_pos.  Only trusted while
+	 * @cache is unchanged and ctx->pos still equals @cursor_pos;
+	 * anything else (llseek, rewind, cache rebuild) falls back to a
+	 * scan from the head.  Without it, each getdents call re-skips
+	 * everything already returned and a full listing goes O(n^2).
+	 */
+	struct list_head *cursor;
+	loff_t cursor_pos;
 };
 
 struct aufsng_readdir_data {
@@ -129,15 +153,46 @@ static void aufsng_cache_entry_insert(struct rb_root *root,
 
 static int aufsng_cache_add(struct aufsng_dir_cache *cache, const char *name,
 			 int namelen, u64 ino, unsigned int d_type,
-			 bool hidden)
+			 bool hidden, unsigned int idx)
 {
 	struct aufsng_cache_entry *p;
 
-	/* the first (highest priority) branch to claim a name wins,
-	 * whether that claim is a real entry or a whiteout tombstone
+	/*
+	 * The first (highest priority) branch to claim a name wins,
+	 * whether that claim is a real entry or a whiteout tombstone -
+	 * with two refinements for later occurrences:
+	 *
+	 * - "foo" and ".wh.foo" inside the SAME branch directory: the
+	 *   whiteout wins no matter which one getdents returned first,
+	 *   matching lookup's whiteout-first probe.  (The state occurs
+	 *   transiently inside a delete, after a crash mid-delete, or
+	 *   via an out-of-band branch edit; hash-ordered getdents makes
+	 *   the arrival order arbitrary.)
+	 *
+	 * - an upper entry's d_ino must match what stat() reports: the
+	 *   union inode is keyed by the topmost same-type LOWER origin
+	 *   when one exists (see aufsng_get_inode()), so the first
+	 *   lower occurrence of an upper-provided name donates its
+	 *   inode number.  A type-mismatched lower is shadowed as an
+	 *   unrelated object (the upper keeps its own ino), and a
+	 *   whiteout ends the origin search - both settle the number
+	 *   for all deeper branches.
 	 */
-	if (aufsng_cache_entry_find(&cache->root, name, namelen))
+	p = aufsng_cache_entry_find(&cache->root, name, namelen);
+	if (p) {
+		if (hidden && !p->hidden && p->idx == idx) {
+			p->hidden = true;
+			cache->nr_visible--;
+		} else if (!p->hidden && !p->ino_fixed && p->idx == 0 &&
+			   idx != 0) {
+			if (!hidden &&
+			    (p->d_type == d_type || p->d_type == DT_UNKNOWN ||
+			     d_type == DT_UNKNOWN))
+				p->ino = aufsng_map_ino(ino, idx);
+			p->ino_fixed = true;
+		}
 		return 0;
+	}
 
 	p = kmalloc(sizeof(*p) + namelen + 1, GFP_KERNEL);
 	if (!p)
@@ -149,6 +204,10 @@ static int aufsng_cache_add(struct aufsng_dir_cache *cache, const char *name,
 	p->ino = ino;
 	p->d_type = d_type;
 	p->hidden = hidden;
+	p->idx = idx;
+	p->ino_fixed = idx != 0;
+	if (!hidden)
+		cache->nr_visible++;
 
 	aufsng_cache_entry_insert(&cache->root, p);
 	list_add_tail(&p->l_node, &cache->entries);
@@ -175,18 +234,21 @@ static bool aufsng_fill_merge(struct dir_context *ctx, const char *name,
 		const char *real = name + AUFSNG_WH_PFX_LEN;
 		int reallen = namelen - AUFSNG_WH_PFX_LEN;
 
-		err = aufsng_cache_add(rdd->cache, real, reallen, 0, 0, true);
+		err = aufsng_cache_add(rdd->cache, real, reallen, 0, 0, true,
+				    rdd->idx);
 	} else {
 		/*
 		 * Fold the branch slot into the inode number, exactly as the
 		 * stat/getattr path does (aufsng_map_ino), so a file's d_ino
 		 * from readdir matches its st_ino and cannot collide with a
 		 * same-numbered inode in another branch under the one union
-		 * st_dev.
+		 * st_dev.  (For upper names with a lower origin the number
+		 * is corrected to the origin's when the origin's branch is
+		 * merged - see aufsng_cache_add().)
 		 */
 		err = aufsng_cache_add(rdd->cache, name, namelen,
 				    aufsng_map_ino(ino, rdd->idx), d_type,
-				    false);
+				    false, rdd->idx);
 	}
 
 	if (err) {
@@ -236,7 +298,29 @@ static void aufsng_cache_free(struct aufsng_dir_cache *cache)
 
 	list_for_each_entry_safe(p, n, &cache->entries, l_node)
 		kfree(p);
+	kfree(cache->stamps);
 	kfree(cache);
+}
+
+static void aufsng_stamp_sample(struct aufsng_dir_stamp *s, struct inode *dir)
+{
+	if (!dir) {
+		s->mtime = (struct timespec64){0};
+		s->iversion = 0;
+		return;
+	}
+	s->mtime = inode_get_mtime(dir);
+	s->iversion = inode_query_iversion(dir);
+}
+
+static bool aufsng_stamp_match(const struct aufsng_dir_stamp *s,
+			    struct inode *dir)
+{
+	struct aufsng_dir_stamp cur;
+
+	aufsng_stamp_sample(&cur, dir);
+	return cur.iversion == s->iversion &&
+	       timespec64_equal(&cur.mtime, &s->mtime);
 }
 
 static void aufsng_cache_put(struct aufsng_dir_cache *cache)
@@ -252,7 +336,17 @@ void aufsng_dir_cache_release(struct aufsng_inode *oi)
 	oi->cache = NULL;
 }
 
-static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode)
+/*
+ * Merge every branch of @inode into a fresh cache.  With
+ * @stop_when_visible (the rmdir/union-emptiness probe) the merge
+ * stops at the first branch boundary after a visible entry appears:
+ * the answer is already "not empty", and materializing a huge lower
+ * directory's full listing just to throw it away would be pure waste.
+ * (Stopping mid-branch would be wrong: a later ".wh.<name>" in the
+ * same branch may still hide the entry just seen.)
+ */
+static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
+						bool stop_when_visible)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
 	struct aufsng_entry *oe;
@@ -281,29 +375,42 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode)
 	old_cred = override_creds(pfs->creator_cred);
 
 	upper = aufsng_upperdentry(inode);
+	oe = AUFSNG_I_E(inode);
+
 	/*
-	 * Sample the upper mtime before reading it: if a concurrent edit
-	 * lands during the read, the stored stamp stays older than the now-
-	 * current mtime, so the next reuse check rebuilds rather than trust
-	 * a listing that might have half-caught the change.
+	 * Sample every branch's stamp before reading anything: if a
+	 * concurrent edit lands during the read, the stored stamp stays
+	 * older than the now-current one, so the next reuse check
+	 * rebuilds rather than trust a listing that might have
+	 * half-caught the change.
 	 */
-	cache->upper_mtime = upper ? inode_get_mtime(d_inode(upper)) :
-				     (struct timespec64){0};
-	cache->upper_iversion = upper ? inode_query_iversion(d_inode(upper)) : 0;
+	cache->nr_stamps = 1 + (oe ? oe->numlower : 0);
+	cache->stamps = kcalloc(cache->nr_stamps, sizeof(*cache->stamps),
+				GFP_KERNEL);
+	if (!cache->stamps) {
+		err = -ENOMEM;
+		goto out;
+	}
+	aufsng_stamp_sample(&cache->stamps[0], upper ? d_inode(upper) : NULL);
+	for (i = 0; oe && i < oe->numlower; i++)
+		aufsng_stamp_sample(&cache->stamps[1 + i],
+				 d_inode(oe->lowerstack[i].dentry));
+
 	if (upper) {
 		realpath.mnt = aufsng_upper_mnt(pfs);
 		realpath.dentry = upper;
 		err = aufsng_dir_read_layer(pfs, &realpath, cache, 0);
 	}
 
-	oe = AUFSNG_I_E(inode);
-	for (i = 0; !err && oe && i < oe->numlower; i++) {
+	for (i = 0; !err && oe && i < oe->numlower &&
+		    !(stop_when_visible && cache->nr_visible); i++) {
 		realpath.mnt = oe->lowerstack[i].layer->mnt;
 		realpath.dentry = oe->lowerstack[i].dentry;
 		err = aufsng_dir_read_layer(pfs, &realpath, cache,
 					 oe->lowerstack[i].layer->idx);
 	}
 
+out:
 	revert_creds(old_cred);
 	up_read(&pfs->dyn_lock);
 
@@ -319,25 +426,31 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode)
 /*
  * Is @cache still consistent with the branches?  The caller has already
  * checked @version (in-union mutations).  Under udba=reval also require
- * the upper directory's mtime to be unchanged - the only signal an out-
- * of-band rw-branch edit leaves without bumping @version.  Read under
- * oi->lock so the sampled upper matches the cache being validated.
+ * every branch directory's stamp to be unchanged - the only signal an
+ * out-of-band branch edit leaves without bumping @version.  Read under
+ * oi->lock so the sampled branches match the cache being validated.
  */
 static bool aufsng_dir_cache_fresh(struct aufsng_fs *pfs, struct inode *inode,
 				   struct aufsng_dir_cache *cache)
 {
 	struct dentry *upper;
-	struct timespec64 cur_mtime;
-	u64 cur_iversion;
+	struct aufsng_entry *oe;
+	unsigned int i;
 
 	if (!aufsng_udba_reval(pfs))
 		return true;
 	upper = aufsng_upperdentry(inode);
-	cur_mtime = upper ? inode_get_mtime(d_inode(upper)) :
-			    (struct timespec64){0};
-	cur_iversion = upper ? inode_query_iversion(d_inode(upper)) : 0;
-	return cur_iversion == cache->upper_iversion &&
-	       timespec64_equal(&cur_mtime, &cache->upper_mtime);
+	oe = AUFSNG_I_E(inode);
+	if (cache->nr_stamps != 1 + (oe ? oe->numlower : 0))
+		return false;
+	if (!aufsng_stamp_match(&cache->stamps[0],
+			     upper ? d_inode(upper) : NULL))
+		return false;
+	for (i = 0; oe && i < oe->numlower; i++)
+		if (!aufsng_stamp_match(&cache->stamps[1 + i],
+				     d_inode(oe->lowerstack[i].dentry)))
+			return false;
+	return true;
 }
 
 static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
@@ -364,7 +477,7 @@ static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
 		cache->refcount++;
 	} else {
 		mutex_unlock(&oi->lock);
-		cache = aufsng_cache_build(inode);
+		cache = aufsng_cache_build(inode, false);
 		if (IS_ERR(cache))
 			return cache;
 		mutex_lock(&oi->lock);
@@ -376,28 +489,45 @@ static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
 	mutex_unlock(&oi->lock);
 
 	od->cache = cache;
+	od->cursor = NULL;
 	return cache;
 }
 
 static void aufsng_dir_reset(struct file *file)
 {
 	struct inode *inode = file_inode(file);
+	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
 	struct aufsng_inode *oi = AUFSNG_I(inode);
 	struct aufsng_dir_file *od = file->private_data;
+	bool stale;
 
-	if (od->cache && od->cache->version != atomic64_read(&oi->version)) {
-		mutex_lock(&oi->lock);
+	if (!od->cache)
+		return;
+	/*
+	 * rewinddir() must reflect the directory's current state, so
+	 * the freshness probe runs here exactly as it does on a fresh
+	 * open - the version check alone would keep replaying a
+	 * listing an out-of-band branch edit already invalidated.
+	 */
+	mutex_lock(&oi->lock);
+	stale = od->cache->version != atomic64_read(&oi->version) ||
+		!aufsng_dir_cache_fresh(pfs, inode, od->cache);
+	if (stale)
 		aufsng_cache_put(od->cache);
-		mutex_unlock(&oi->lock);
+	mutex_unlock(&oi->lock);
+	if (stale) {
 		od->cache = NULL;
+		od->cursor = NULL;
 	}
 }
 
 static int aufsng_iterate(struct file *file, struct dir_context *ctx)
 {
+	struct aufsng_dir_file *od = file->private_data;
 	struct aufsng_dir_cache *cache;
 	struct aufsng_cache_entry *p;
-	loff_t off = 2;
+	struct list_head *node;
+	loff_t off;
 
 	if (!ctx->pos)
 		aufsng_dir_reset(file);
@@ -412,9 +542,20 @@ static int aufsng_iterate(struct file *file, struct dir_context *ctx)
 	/*
 	 * Offsets 2.. index the (stable, immutable once built) merged
 	 * list; hidden tombstone entries consume an offset so cookies
-	 * stay valid across getdents calls on the same cache.
+	 * stay valid across getdents calls on the same cache.  The
+	 * cursor resumes where the previous call stopped, so a full
+	 * listing costs O(n) in total; a seek anywhere else falls back
+	 * to a scan from the head.
 	 */
-	list_for_each_entry(p, &cache->entries, l_node) {
+	if (od->cursor && od->cursor_pos == ctx->pos) {
+		node = od->cursor;
+		off = ctx->pos;
+	} else {
+		node = cache->entries.next;
+		off = 2;
+	}
+	for (; node != &cache->entries; node = node->next) {
+		p = list_entry(node, struct aufsng_cache_entry, l_node);
 		if (off++ < ctx->pos)
 			continue;
 		if (!p->hidden &&
@@ -422,28 +563,45 @@ static int aufsng_iterate(struct file *file, struct dir_context *ctx)
 			break;
 		ctx->pos = off;
 	}
+	od->cursor = node;
+	od->cursor_pos = ctx->pos;
 	return 0;
 }
 
 /* is the merged view of @dentry empty (whiteouts aside)? */
 int aufsng_check_empty_dir(struct dentry *dentry)
 {
-	struct aufsng_dir_cache *cache;
-	struct aufsng_cache_entry *p;
-	int err = 0;
+	struct inode *inode = d_inode(dentry);
+	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
+	struct aufsng_inode *oi = AUFSNG_I(inode);
+	struct aufsng_dir_cache *cache = NULL;
+	int err;
 
-	cache = aufsng_cache_build(d_inode(dentry));
-	if (IS_ERR(cache))
-		return PTR_ERR(cache);
+	/*
+	 * A still-valid cached listing already knows the answer; only
+	 * rebuild (aborting at the first visible entry) without one.
+	 */
+	mutex_lock(&oi->lock);
+	if (oi->cache && oi->cache->version == atomic64_read(&oi->version) &&
+	    aufsng_dir_cache_fresh(pfs, inode, oi->cache)) {
+		cache = oi->cache;
+		cache->refcount++;
+	}
+	mutex_unlock(&oi->lock);
 
-	list_for_each_entry(p, &cache->entries, l_node) {
-		if (!p->hidden) {
-			err = -ENOTEMPTY;
-			break;
-		}
+	if (!cache) {
+		cache = aufsng_cache_build(inode, true);
+		if (IS_ERR(cache))
+			return PTR_ERR(cache);
+		err = cache->nr_visible ? -ENOTEMPTY : 0;
+		aufsng_cache_free(cache);
+		return err;
 	}
 
-	aufsng_cache_free(cache);
+	err = cache->nr_visible ? -ENOTEMPTY : 0;
+	mutex_lock(&oi->lock);
+	aufsng_cache_put(cache);
+	mutex_unlock(&oi->lock);
 	return err;
 }
 
@@ -488,41 +646,59 @@ int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir)
 		return err;
 	}
 
+	/*
+	 * One lock for the whole sweep.  I_MUTEX_CHILD, not the dirop
+	 * helpers' I_MUTEX_PARENT: the rmdir path already holds the
+	 * upper PARENT directory's lock at that subclass while this
+	 * runs on its child, and taking the same subclass twice in the
+	 * same i_rwsem class is a lockdep splat even though the
+	 * parent->child order itself is fine (this mirrors the VFS's
+	 * own parent-PARENT/victim-plain convention in vfs_rmdir()).
+	 */
+	inode_lock_nested(d_inode(upperdir), I_MUTEX_CHILD);
+
 	list_for_each_entry_safe(p, n, &cache->entries, l_node) {
-		char buf[NAME_MAX + AUFSNG_WH_PFX_LEN + 1];
-		struct qstr wh;
-		struct dentry *slot;
+		char buf[NAME_MAX + 1];
+		struct qstr q, wh;
+		struct dentry *whd;
+		int err2;
 
 		if (!p->hidden)
 			continue;
 
-		memcpy(buf, AUFSNG_WH_PFX, AUFSNG_WH_PFX_LEN);
-		memcpy(buf + AUFSNG_WH_PFX_LEN, p->name, p->len);
-		wh = QSTR_LEN(buf, AUFSNG_WH_PFX_LEN + p->len);
-
-		slot = start_removing_noperm(upperdir, &wh);
-		if (IS_ERR(slot)) {
-			err = PTR_ERR(slot);
+		/* derived from an on-disk ".wh." name, so it must fit back */
+		q = QSTR_LEN(p->name, p->len);
+		err2 = aufsng_wh_name(buf, &q, &wh);
+		if (WARN_ON_ONCE(err2)) {
+			err = err2;
 			continue;
 		}
-		if (d_is_positive(slot))
-			err = vfs_unlink(idmap, d_inode(upperdir), slot, NULL);
-		end_dirop(slot);
+
+		whd = lookup_one(idmap, &wh, upperdir);
+		if (IS_ERR(whd)) {
+			err = PTR_ERR(whd);
+			continue;
+		}
+		if (d_is_positive(whd))
+			err = vfs_unlink(idmap, d_inode(upperdir), whd, NULL);
+		dput(whd);
 	}
 
 	/* the opaque marker, if this directory carries one */
 	{
 		struct qstr opq = QSTR(AUFSNG_WH_DIROPQ);
-		struct dentry *slot;
+		struct dentry *whd;
 
-		slot = start_removing_noperm(upperdir, &opq);
-		if (!IS_ERR(slot)) {
-			if (d_is_positive(slot))
-				vfs_unlink(idmap, d_inode(upperdir), slot,
+		whd = lookup_one(idmap, &opq, upperdir);
+		if (!IS_ERR(whd)) {
+			if (d_is_positive(whd))
+				vfs_unlink(idmap, d_inode(upperdir), whd,
 					   NULL);
-			end_dirop(slot);
+			dput(whd);
 		}
 	}
+
+	inode_unlock(d_inode(upperdir));
 
 	aufsng_cache_free(cache);
 	return err;

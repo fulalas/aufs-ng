@@ -7,12 +7,16 @@
  * get the right owner), after copying up the parent chain.  Removing
  * a name still provided by a lower branch leaves a ".wh.<name>"
  * whiteout marker behind (a plain 0444 regular file - the real AUFS
- * on-disk format, verified against fs/aufs/whout.c); creating over a
- * whiteout removes the marker first.  Creating a directory that would
- * otherwise still show a same-named lower directory's content marks
- * the new directory opaque via ".wh..wh..opq".  Renaming a merged
- * directory returns -EXDEV, making mv fall back to copy+delete - AUFS
- * itself has no cross-branch atomic directory rename either.
+ * on-disk format, verified against fs/aufs/whout.c), created BEFORE
+ * the removal so a failure or crash between the two steps preserves
+ * the delete rather than resurrecting the lower name.  Creating over
+ * a whiteout parks the marker under a hidden temp name and restores
+ * it if the create fails.  Creating - or renaming - a directory onto
+ * a name that would otherwise still show a same-named lower
+ * directory's content marks the directory opaque via ".wh..wh..opq".
+ * Renaming a merged directory returns -EXDEV, making mv fall back to
+ * copy+delete - AUFS itself has no cross-branch atomic directory
+ * rename either.
  */
 
 #include <linux/fs.h>
@@ -54,18 +58,20 @@ static const struct cred *aufsng_override_create_creds(struct aufsng_fs *pfs,
  * behind.  Returns 1/0, negative errno on error - an error must never
  * be treated as "not covered", or the delete silently skips the
  * whiteout and the lower file resurrects later.
+ *
+ * The caller must hold pfs->dyn_lock across BOTH this check and the
+ * mutation it guards: a branch spliced in or out between the two
+ * would make the verdict stale (a deleted name would resurrect
+ * uncovered, or a stray whiteout would mask nothing), and must run
+ * under credentials able to search the branch dirs (creator creds).
  */
 static int aufsng_lower_covers(struct aufsng_fs *pfs, struct inode *dir,
 			    const struct qstr *name)
 {
-	const struct cred *old_cred = override_creds(pfs->creator_cred);
 	struct aufsng_path origin;
 	int found;
 
-	down_read(&pfs->dyn_lock);
 	found = aufsng_find_origin(AUFSNG_I_E(dir), name, &origin);
-	up_read(&pfs->dyn_lock);
-	revert_creds(old_cred);
 	if (found > 0)
 		dput(origin.dentry);
 	return found;
@@ -142,28 +148,16 @@ int aufsng_remove_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
 }
 
 /*
- * Get a locked negative dentry for creating @name in @upperdir.  A
- * stale whiteout for @name (left behind by an earlier delete, now
- * being recreated) is removed first: leaving both a whiteout and a
- * real object for the same name in the same branch would make
- * lookup/readdir results ambiguous.
+ * Get a locked negative dentry for creating @name in @upperdir; a
+ * positive occupant means EEXIST.  A stale whiteout for @name is the
+ * caller's business: it is parked via aufsng_park_whiteout() first so
+ * that it can be restored if the create then fails.
  */
-static struct dentry *aufsng_create_slot(struct aufsng_fs *pfs,
-				      struct dentry *upperdir,
-				      const struct qstr *name)
+struct dentry *aufsng_create_slot(struct dentry *upperdir,
+			       const struct qstr *name)
 {
 	struct qstr q = QSTR_LEN(name->name, name->len);
 	struct dentry *slot;
-	int wh, err;
-
-	wh = aufsng_check_whiteout(aufsng_upper_mnt(pfs), upperdir, name);
-	if (wh < 0)
-		return ERR_PTR(wh);
-	if (wh) {
-		err = aufsng_remove_whiteout(pfs, upperdir, name);
-		if (err)
-			return ERR_PTR(err);
-	}
 
 	slot = start_creating_noperm(upperdir, &q);
 	if (IS_ERR(slot) || d_is_negative(slot))
@@ -171,6 +165,98 @@ static struct dentry *aufsng_create_slot(struct aufsng_fs *pfs,
 
 	end_dirop(slot);
 	return ERR_PTR(-EEXIST);
+}
+
+static atomic_t aufsng_whtmp_seq = ATOMIC_INIT(0);
+
+/*
+ * Move an existing ".wh.<name>" whiteout aside to a hidden temp name
+ * (".wh..wh.tmp.<seq>", inside AUFS's own ".wh..wh." bookkeeping
+ * namespace, so it is invisible to lookup and readdir) instead of
+ * deleting it up front: if the operation that is about to take over
+ * the name then fails - ENOSPC being the everyday case - the whiteout
+ * is renamed back, so a failed create/rename can never cancel an
+ * earlier, successful delete.  Deleting it outright would need a new
+ * inode to restore it, exactly what a full branch cannot provide;
+ * renaming back allocates nothing.  Real AUFS parks whiteouts the
+ * same way (au_whtmp).
+ *
+ * Returns 1 with @tmp/@tmpbuf (NAME_MAX + 1 bytes) filled if parked,
+ * 0 if there was no whiteout, negative errno.
+ */
+static int aufsng_park_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
+			     const struct qstr *name, struct qstr *tmp,
+			     char *tmpbuf)
+{
+	struct renamedata rd = {};
+	char whbuf[NAME_MAX + 1];
+	struct qstr wh;
+	int present;
+	int err;
+
+	present = aufsng_check_whiteout(aufsng_upper_mnt(pfs), upperdir, name);
+	if (present <= 0)
+		return present;
+
+	err = aufsng_wh_name(whbuf, name, &wh);
+	if (err)
+		return err;
+	*tmp = QSTR_LEN(tmpbuf, snprintf(tmpbuf, NAME_MAX + 1, ".wh..wh.tmp.%u",
+					 atomic_inc_return(&aufsng_whtmp_seq)));
+
+	rd.mnt_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	rd.old_parent = upperdir;
+	rd.new_parent = upperdir;
+	err = start_renaming(&rd, 0, &wh, tmp);
+	if (err)
+		return err;
+	err = vfs_rename(&rd);
+	end_renaming(&rd);
+	return err ? err : 1;
+}
+
+/* on success drop the parked whiteout; on failure rename it back */
+static void aufsng_unpark_whiteout(struct aufsng_fs *pfs,
+				struct dentry *upperdir,
+				const struct qstr *name,
+				struct qstr *tmp, bool restore)
+{
+	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	int err;
+
+	if (restore) {
+		struct renamedata rd = {};
+		char whbuf[NAME_MAX + 1];
+		struct qstr wh;
+
+		err = aufsng_wh_name(whbuf, name, &wh);
+		if (!err) {
+			rd.mnt_idmap = idmap;
+			rd.old_parent = upperdir;
+			rd.new_parent = upperdir;
+			err = start_renaming(&rd, 0, tmp, &wh);
+		}
+		if (!err) {
+			err = vfs_rename(&rd);
+			end_renaming(&rd);
+		}
+	} else {
+		struct dentry *slot = start_removing_noperm(upperdir, tmp);
+
+		err = PTR_ERR_OR_ZERO(slot);
+		if (!err) {
+			err = vfs_unlink(idmap, d_inode(upperdir), slot, NULL);
+			end_dirop(slot);
+		}
+	}
+	/*
+	 * Both directions are metadata-only operations on entries this
+	 * call just manipulated; failure means the branch fs is in
+	 * serious trouble.  The parked name stays hidden either way.
+	 */
+	if (err)
+		pr_err("aufs (aufs-ng): failed to %s parked whiteout '%.*s' (%d)\n",
+		       restore ? "restore" : "drop", tmp->len, tmp->name, err);
 }
 
 struct aufsng_create_args {
@@ -193,6 +279,9 @@ static int aufsng_create_object(struct dentry *dentry,
 	struct aufsng_entry *oe;
 	struct inode *inode;
 	bool is_dir = (a->mode & S_IFMT) == S_IFDIR;
+	char whtmpbuf[NAME_MAX + 1];
+	struct qstr whtmp;
+	int parked = 0;
 	int found;
 	int err;
 
@@ -217,10 +306,13 @@ static int aufsng_create_object(struct dentry *dentry,
 	 * non-directory keeps it as the union inode's hash key origin,
 	 * exactly as a copy-up of that lower would - so the keying is
 	 * identical no matter which path created the upper object.
+	 * dyn_lock stays held from this verdict through the mutation
+	 * and the inode hashing that consume it, so a concurrent
+	 * branch add/remove cannot invalidate either the opaque/keying
+	 * decision or the origin's branch pinning in between.
 	 */
 	down_read(&pfs->dyn_lock);
 	found = aufsng_find_origin(AUFSNG_I_E(dir), &dentry->d_name, &origin);
-	up_read(&pfs->dyn_lock);
 	if (found < 0) {
 		err = found;
 		goto out_creds;
@@ -239,10 +331,17 @@ static int aufsng_create_object(struct dentry *dentry,
 		found = 0;
 	}
 
-	slot = aufsng_create_slot(pfs, pupper, &dentry->d_name);
+	parked = aufsng_park_whiteout(pfs, pupper, &dentry->d_name,
+				   &whtmp, whtmpbuf);
+	if (parked < 0) {
+		err = parked;
+		goto out_origin;
+	}
+
+	slot = aufsng_create_slot(pupper, &dentry->d_name);
 	if (IS_ERR(slot)) {
 		err = PTR_ERR(slot);
-		goto out_origin;
+		goto out_unpark;
 	}
 
 	switch (a->mode & S_IFMT) {
@@ -254,7 +353,7 @@ static int aufsng_create_object(struct dentry *dentry,
 		if (IS_ERR(made)) {
 			/* vfs_mkdir consumed the dentry and the lock */
 			err = PTR_ERR(made);
-			goto out_origin;
+			goto out_unpark;
 		}
 		slot = made;
 		err = 0;
@@ -270,7 +369,7 @@ static int aufsng_create_object(struct dentry *dentry,
 	}
 	if (err) {
 		end_dirop(slot);
-		goto out_origin;
+		goto out_unpark;
 	}
 
 	upper = dget(slot);
@@ -280,7 +379,7 @@ static int aufsng_create_object(struct dentry *dentry,
 		err = aufsng_mark_diropq(pfs, upper);
 		if (err) {
 			dput(upper);
-			goto out_origin;
+			goto out_unpark;
 		}
 	}
 
@@ -288,27 +387,30 @@ static int aufsng_create_object(struct dentry *dentry,
 	if (!oe) {
 		dput(upper);
 		err = -ENOMEM;
-		goto out_origin;
+		goto out_unpark;
 	}
 	if (oe->numlower) {
 		oe->lowerstack[0] = origin;
 		origin.dentry = NULL;
 	}
-	down_read(&pfs->dyn_lock);
 	inode = aufsng_get_inode(dentry->d_sb, upper, oe);
-	up_read(&pfs->dyn_lock);
 	if (IS_ERR(inode)) {
 		err = PTR_ERR(inode);
-		goto out_origin;
+		goto out_unpark;
 	}
 	d_instantiate(dentry, inode);
 
 	atomic64_inc(&AUFSNG_I(dir)->version);
 	aufsng_copyattr(dir);
 
+out_unpark:
+	if (parked)
+		aufsng_unpark_whiteout(pfs, pupper, &dentry->d_name, &whtmp,
+				    err != 0);
 out_origin:
 	dput(origin.dentry);
 out_creds:
+	up_read(&pfs->dyn_lock);
 	revert_creds(old_cred);
 	put_cred(create_cred);
 out_write:
@@ -367,6 +469,9 @@ int aufsng_link(struct dentry *old, struct inode *dir, struct dentry *new)
 	struct cred *create_cred = NULL;
 	struct dentry *pupper, *oldupper, *slot;
 	struct inode *inode;
+	char whtmpbuf[NAME_MAX + 1];
+	struct qstr whtmp;
+	int parked = 0;
 	int err;
 
 	err = aufsng_copy_up(old);
@@ -392,16 +497,23 @@ int aufsng_link(struct dentry *old, struct inode *dir, struct dentry *new)
 		goto out_creds;
 	}
 
-	slot = aufsng_create_slot(pfs, pupper, &new->d_name);
+	parked = aufsng_park_whiteout(pfs, pupper, &new->d_name,
+				   &whtmp, whtmpbuf);
+	if (parked < 0) {
+		err = parked;
+		goto out_creds;
+	}
+
+	slot = aufsng_create_slot(pupper, &new->d_name);
 	if (IS_ERR(slot)) {
 		err = PTR_ERR(slot);
-		goto out_creds;
+		goto out_unpark;
 	}
 
 	err = vfs_link(oldupper, idmap, d_inode(pupper), slot, NULL);
 	end_dirop(slot);
 	if (err)
-		goto out_creds;
+		goto out_unpark;
 
 	inode = d_inode(old);
 	ihold(inode);
@@ -411,6 +523,10 @@ int aufsng_link(struct dentry *old, struct inode *dir, struct dentry *new)
 	aufsng_copyattr(dir);
 	aufsng_copyattr(inode);
 
+out_unpark:
+	if (parked)
+		aufsng_unpark_whiteout(pfs, pupper, &new->d_name, &whtmp,
+				    err != 0);
 out_creds:
 	revert_creds(old_cred);
 	put_cred(create_cred);
@@ -442,15 +558,25 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 			return err;
 	}
 
-	covered = aufsng_lower_covers(pfs, dir, &dentry->d_name);
-	if (covered < 0)
-		return covered;
-
 	err = mnt_want_write(aufsng_upper_mnt(pfs));
 	if (err)
 		return err;
 
 	old_cred = override_creds(pfs->creator_cred);
+
+	/*
+	 * dyn_lock is held from the coverage verdict through the
+	 * mutation it decides: a branch spliced in between the two
+	 * could provide the name being deleted, and skipping the
+	 * whiteout against the old stack would resurrect it the moment
+	 * the delete returns.
+	 */
+	down_read(&pfs->dyn_lock);
+	covered = aufsng_lower_covers(pfs, dir, &dentry->d_name);
+	if (covered < 0) {
+		err = covered;
+		goto out_dyn;
+	}
 
 	/*
 	 * Serialize against a concurrent copy-up of this same inode
@@ -466,6 +592,22 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	pupper = aufsng_upperdentry(dir);
 	upper = oi->upperdentry;
 
+	/*
+	 * Whiteout FIRST, removal second - AUFS's own ordering.  If the
+	 * whiteout cannot be created (ENOSPC), the object is untouched
+	 * and the delete fails cleanly; the reverse order would destroy
+	 * the upper copy and then fail, silently replacing the file
+	 * with its stale lower version.  In the transient window where
+	 * both the whiteout and the real entry exist, the whiteout wins
+	 * in both lookup and readdir, so a crash between the two steps
+	 * preserves the delete.
+	 */
+	if (covered) {
+		err = aufsng_create_whiteout(pfs, pupper, &dentry->d_name);
+		if (err)
+			goto out;
+	}
+
 	if (upper) {
 		struct qstr q = QSTR_LEN(dentry->d_name.name,
 					 dentry->d_name.len);
@@ -474,26 +616,26 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 		slot = start_removing_noperm(pupper, &q);
 		if (IS_ERR(slot)) {
 			err = PTR_ERR(slot);
-			goto out;
-		}
-		if (is_dir) {
-			/* union-empty: only whiteouts/opq may remain inside */
-			err = aufsng_clear_whiteouts(pfs, upper);
-			if (!err)
-				err = vfs_rmdir(idmap, d_inode(pupper), slot,
-						NULL);
 		} else {
-			err = vfs_unlink(idmap, d_inode(pupper), slot, NULL);
+			if (is_dir) {
+				/* union-empty: only whiteouts/opq remain inside */
+				err = aufsng_clear_whiteouts(pfs, upper);
+				if (!err)
+					err = vfs_rmdir(idmap, d_inode(pupper),
+							slot, NULL);
+			} else {
+				err = vfs_unlink(idmap, d_inode(pupper), slot,
+						 NULL);
+			}
+			end_dirop(slot);
 		}
-		end_dirop(slot);
-		if (err)
+		if (err) {
+			/* roll the pre-created whiteout back */
+			if (covered)
+				aufsng_remove_whiteout(pfs, pupper,
+						    &dentry->d_name);
 			goto out;
-	}
-
-	if (covered) {
-		err = aufsng_create_whiteout(pfs, pupper, &dentry->d_name);
-		if (err)
-			goto out;
+		}
 	}
 
 	if (is_dir)
@@ -505,6 +647,8 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 
 out:
 	mutex_unlock(&oi->lock);
+out_dyn:
+	up_read(&pfs->dyn_lock);
 	revert_creds(old_cred);
 	mnt_drop_write(aufsng_upper_mnt(pfs));
 	return err;
@@ -531,7 +675,10 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	struct aufsng_entry *oe = AUFSNG_I_E(d_inode(old));
 	struct dentry *newupperdir;
 	bool replace_dir = d_is_positive(new) && d_is_dir(new);
-	int covered;
+	char whtmpbuf[NAME_MAX + 1];
+	struct qstr whtmp;
+	int parked = 0;
+	int covered, covered_new;
 	int err;
 
 	if (flags & ~RENAME_NOREPLACE)
@@ -562,32 +709,59 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	if (err)
 		return err;
 
-	covered = aufsng_lower_covers(pfs, olddir, &old->d_name);
-	if (covered < 0)
-		return covered;
-
 	err = mnt_want_write(aufsng_upper_mnt(pfs));
 	if (err)
 		return err;
 
 	old_cred = override_creds(pfs->creator_cred);
 
+	/*
+	 * dyn_lock is held from both coverage verdicts (does the old
+	 * name need a whiteout? would lower content show through the
+	 * new name?) through the rename and markers they decide, so a
+	 * concurrent branch add/remove cannot make either stale.
+	 */
+	down_read(&pfs->dyn_lock);
+	covered = aufsng_lower_covers(pfs, olddir, &old->d_name);
+	if (covered < 0) {
+		err = covered;
+		goto out;
+	}
+	covered_new = d_is_dir(old) ?
+		aufsng_lower_covers(pfs, newdir, &new->d_name) : 0;
+	if (covered_new < 0) {
+		err = covered_new;
+		goto out;
+	}
+
 	newupperdir = aufsng_upperdentry(newdir);
 
 	/*
 	 * A stale ".wh.<newname>" from an earlier delete of a name a
 	 * lower branch also provides would otherwise keep hiding the
-	 * name after this rename gives it fresh upper content - the
-	 * same reason copy-up clears it before its own rename.  A
-	 * union-empty target directory being replaced still physically
-	 * contains its own whiteouts/opaque marker; vfs_rename() would
-	 * fail with -ENOTEMPTY on the real upper directory otherwise.
+	 * name after this rename gives it fresh upper content.  It is
+	 * parked, not deleted: if the rename then fails, it is renamed
+	 * back, so the earlier delete survives.  A union-empty target
+	 * directory being replaced still physically contains its own
+	 * whiteouts/opaque marker; vfs_rename() would fail with
+	 * -ENOTEMPTY on the real upper directory otherwise.  (Those
+	 * marker deletions cannot be parked without AUFS's whole-dir
+	 * whtmp machinery; the residual window is a rename that fails
+	 * AFTER clear_whiteouts succeeded, resurrecting lower names
+	 * inside the surviving, union-empty target dir.)
 	 */
-	err = aufsng_remove_whiteout(pfs, newupperdir, &new->d_name);
-	if (!err && replace_dir && d_inode(new) && aufsng_upperdentry(d_inode(new)))
-		err = aufsng_clear_whiteouts(pfs, aufsng_upperdentry(d_inode(new)));
-	if (err)
+	parked = aufsng_park_whiteout(pfs, newupperdir, &new->d_name,
+				   &whtmp, whtmpbuf);
+	if (parked < 0) {
+		err = parked;
 		goto out;
+	}
+	if (replace_dir && d_inode(new) && aufsng_upperdentry(d_inode(new))) {
+		err = aufsng_clear_whiteouts(pfs,
+					  aufsng_upperdentry(d_inode(new)));
+		if (err)
+			goto out_unpark;
+	}
 
 	rd.mnt_idmap = upper_idmap;
 	rd.old_parent = aufsng_upperdentry(olddir);
@@ -601,12 +775,12 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 
 		err = start_renaming(&rd, 0, &oldq, &newq);
 	}
+	if (!err) {
+		err = vfs_rename(&rd);
+		end_renaming(&rd);
+	}
 	if (err)
-		goto out;
-	err = vfs_rename(&rd);
-	end_renaming(&rd);
-	if (err)
-		goto out;
+		goto out_unpark;
 
 	if (covered) {
 		int wherr = aufsng_create_whiteout(pfs, aufsng_upperdentry(olddir),
@@ -622,6 +796,24 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 			       old->d_name.len, old->d_name.name, wherr);
 	}
 
+	/*
+	 * A directory moved onto a name that lower branches still
+	 * provide must be marked opaque, exactly as mkdir over that
+	 * name would be (AUFS's rename DIROPQ): without the marker the
+	 * deleted lower directory's content would merge into - and
+	 * "resurrect" inside - the renamed directory.  The rename
+	 * committed, so a marker failure is reported but cannot fail
+	 * the operation (same rationale as the whiteout above).
+	 */
+	if (covered_new) {
+		int opqerr = aufsng_mark_diropq(pfs,
+					aufsng_upperdentry(d_inode(old)));
+
+		if (opqerr)
+			pr_err("aufs (aufs-ng): failed to mark renamed dir '%.*s' opaque (%d), deleted lower content may show through\n",
+			       new->d_name.len, new->d_name.name, opqerr);
+	}
+
 	atomic64_inc(&AUFSNG_I(olddir)->version);
 	if (newdir != olddir)
 		atomic64_inc(&AUFSNG_I(newdir)->version);
@@ -629,7 +821,12 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	if (newdir != olddir)
 		aufsng_copyattr(newdir);
 
+out_unpark:
+	if (parked)
+		aufsng_unpark_whiteout(pfs, newupperdir, &new->d_name, &whtmp,
+				    err != 0);
 out:
+	up_read(&pfs->dyn_lock);
 	revert_creds(old_cred);
 	mnt_drop_write(aufsng_upper_mnt(pfs));
 	return err;

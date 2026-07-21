@@ -31,6 +31,7 @@
 
 #define AUFSNG_NAME		"aufs"
 #define AUFSNG_SUPER_MAGIC	0x61756673	/* "aufs" */
+#define AUFSNG_ROOT_INO		2		/* AUFS_ROOT_INO */
 
 #define AUFSNG_MAX_STACK		500
 #define AUFSNG_MAXBRANCH_DEF	128
@@ -66,8 +67,19 @@ struct aufsng_entry {
 	struct aufsng_path lowerstack[];
 };
 
+/* longest AUFS branch mode token is "rw+nolwh" */
+#define AUFSNG_PERM_LEN	12
+
 struct aufsng_config {
-	char **br_names;	/* slot-indexed branch path strings */
+	/*
+	 * Slot-indexed branch path strings and mode tokens, only
+	 * consumed by show_options: the private clone mounts have no
+	 * namespace path to resolve at print time, and the mode is
+	 * echoed back exactly as given ("rr" stays "rr"), so both are
+	 * kept verbatim.
+	 */
+	char **br_paths;
+	char (*br_perms)[AUFSNG_PERM_LEN];
 	char *xino_path;	/* accepted, not functionally used */
 	unsigned int udba;	/* accepted, not functionally used */
 	unsigned int maxbranch;
@@ -82,8 +94,6 @@ struct aufsng_fs {
 	const struct cred *creator_cred;
 	/* excludes lookup/readdir during runtime branch add/remove */
 	struct rw_semaphore dyn_lock;
-	/* bumped when cached state must be flushed non-surgically */
-	atomic_long_t dyn_gen;
 	struct backing_file_ctx backing_ctx;
 	struct aufsng_config config;
 	int namelen;
@@ -183,10 +193,14 @@ static inline bool aufsng_origin_type_ok(struct dentry *origin, umode_t mode)
 	return (d_inode(origin)->i_mode & S_IFMT) == (mode & S_IFMT);
 }
 
-static inline void aufsng_copyattr(struct inode *inode)
+/*
+ * The single definition of "the union inode mirrors the real inode's
+ * attributes", shared by first instantiation (aufsng_fill_inode) and
+ * every later refresh (aufsng_copyattr).
+ */
+static inline void aufsng_copyattr_from(struct inode *inode,
+					struct inode *realinode)
 {
-	struct inode *realinode = aufsng_inode_real(inode);
-
 	inode->i_uid = realinode->i_uid;
 	inode->i_gid = realinode->i_gid;
 	inode->i_mode = realinode->i_mode;
@@ -195,6 +209,11 @@ static inline void aufsng_copyattr(struct inode *inode)
 	inode_set_ctime_to_ts(inode, inode_get_ctime(realinode));
 	i_size_write(inode, i_size_read(realinode));
 	set_nlink(inode, realinode->i_nlink);
+}
+
+static inline void aufsng_copyattr(struct inode *inode)
+{
+	aufsng_copyattr_from(inode, aufsng_inode_real(inode));
 }
 
 /*
@@ -245,40 +264,26 @@ static inline u64 aufsng_map_ino(u64 ino, unsigned int idx)
 }
 
 /*
- * d_fsdata holds the branch stack generation in the high bits and the
- * AUFSNG_D_* flags in the low 8 bits, inherited from the parent at
- * instantiation time.  A dentry whose generation does not match
- * pfs->dyn_gen is stale and fails revalidation.
- */
-#define AUFSNG_D_GEN_SHIFT		8
-#define AUFSNG_D_FLAGS_MASK	((1UL << AUFSNG_D_GEN_SHIFT) - 1)
-#define AUFSNG_D_GEN_MASK		(~0UL >> AUFSNG_D_GEN_SHIFT)
-
-static inline unsigned long aufsng_dentry_gen(struct dentry *dentry)
-{
-	return (unsigned long)READ_ONCE(dentry->d_fsdata) >> AUFSNG_D_GEN_SHIFT;
-}
-
-static inline bool aufsng_dentry_gen_stale(struct aufsng_fs *pfs,
-					struct dentry *dentry)
-{
-	/* both sides truncated to the generation field width */
-	return aufsng_dentry_gen(dentry) !=
-	       ((unsigned long)atomic_long_read(&pfs->dyn_gen) &
-		AUFSNG_D_GEN_MASK);
-}
-
-/*
- * A lower stack superseded by dynamic branch removal, kept (with the
- * removed branch's mount pinned) until the inode is evicted: an
- * operation that resolved a lower path before the removal may still
- * hold pointers into it, and it holds the inode for its duration.
+ * A lower stack superseded by a dynamic branch change (or a replaced
+ * upper), kept until the inode is evicted: an operation that resolved
+ * a lower path before the change may still hold pointers into it, and
+ * it holds the inode for its duration.
  */
 struct aufsng_dyn_parked {
 	struct aufsng_dyn_parked *next;
 	struct aufsng_entry *oe;
-	struct vfsmount *mnt;
 	struct dentry *upper;
+	/*
+	 * EVERY branch mount the parked stack's dentries point into,
+	 * pinned for the park's lifetime: dropping a branch's last
+	 * mount reference while an older parked stack still held
+	 * dentries in that branch's sb would tear the branch down
+	 * under them ("Dentry still in use" panic on umount).  Each
+	 * node pins its own referenced mounts, so nodes are safe to
+	 * release in any order.
+	 */
+	unsigned int nr_mnt;
+	struct vfsmount *mnts[];
 };
 
 /* mount-time branch context collected by params.c */
@@ -286,6 +291,7 @@ struct aufsng_ctx_branch {
 	char *name;
 	struct path path;
 	enum aufsng_br_perm perm;
+	char permstr[AUFSNG_PERM_LEN];	/* the mode as given, for show_options */
 	unsigned int pos;	/* insert position; only used by dyn_add */
 };
 
@@ -330,6 +336,8 @@ int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir);
 /* namei.c */
 struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 			  unsigned int flags);
+struct dentry *aufsng_lookup_once(struct vfsmount *mnt, struct dentry *base,
+			       const struct qstr *name, int *whiteout);
 bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name);
 struct inode *aufsng_get_inode(struct super_block *sb,
 			    struct dentry *upperdentry,
@@ -372,16 +380,16 @@ int aufsng_create_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
 			const struct qstr *name);
 int aufsng_remove_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
 			const struct qstr *name);
+struct dentry *aufsng_create_slot(struct dentry *upperdir,
+			       const struct qstr *name);
 
 /* dcache.c */
-void aufsng_dentry_restamp_gen(struct dentry *dentry, unsigned long gen);
-void aufsng_dentry_init_gen(struct dentry *dentry);
 extern const struct dentry_operations aufsng_dentry_operations;
 
 /* dynlayer.c */
 int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 		       const struct path *path, unsigned int pos,
-		       enum aufsng_br_perm perm);
+		       enum aufsng_br_perm perm, const char *permstr);
 int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
 		       bool *dcache_fresh);
 bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,

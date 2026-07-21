@@ -31,9 +31,23 @@ static int aufsng_getattr(struct mnt_idmap *idmap, const struct path *path,
 
 	stat->dev = inode->i_sb->s_dev;
 	stat->ino = inode->i_ino;
-	/* merged directories have no meaningful real link count */
-	if (S_ISDIR(inode->i_mode))
-		stat->nlink = 1;
+	/*
+	 * Directories report a merged link count the way AUFS does
+	 * (au_cpup_attr_nlink): the top branch's, plus each additional
+	 * branch's subdirectory links with its own "."/".." discounted.
+	 * find-style tools use nlink-2 as the subdirectory count.
+	 */
+	if (S_ISDIR(inode->i_mode)) {
+		struct aufsng_entry *oe = AUFSNG_I_E(inode);
+		unsigned int i = aufsng_upperdentry(inode) ? 0 : 1;
+
+		for (; oe && i < oe->numlower; i++) {
+			unsigned int n =
+				d_inode(oe->lowerstack[i].dentry)->i_nlink;
+
+			stat->nlink += n >= 2 ? n - 2 : 0;
+		}
+	}
 
 	return 0;
 }

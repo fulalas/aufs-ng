@@ -1,121 +1,148 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * aufs-ng dentry operations: layer-generation revalidation.
+ * aufs-ng dentry revalidation.
  *
- * Every dentry carries the layer stack generation it was instantiated
- * against in the high bits of d_fsdata (inherited from its parent);
- * the low bits hold AUFSNG_D_* flags.  A dentry whose generation does
- * not match pfs->dyn_gen may hide or wrongly resolve names provided
- * by the current stack: it fails revalidation and is looked up again
- * through the fresh root.  The generation is only ever bumped when a
- * layer change cannot update the cached state surgically, so this is
- * the rare path, not the common one.
+ * The branch stack itself is updated surgically on runtime branch
+ * add/remove (see dynlayer.c), so cached dentries never go stale from
+ * the union's own operations.  What CAN go stale under udba=reval is
+ * the relationship to the real branches when one is edited directly,
+ * out of band:
+ *
+ *  - a cached negative dentry hides a name a branch now provides
+ *    (typically a ".wh.<name>" whiteout removed by hand in the rw
+ *    branch);
+ *  - a cached positive dentry keeps serving an object whose real
+ *    upper/lower entry was unlinked or renamed away;
+ *  - a cached lower-only positive dentry misses an upper entry (or
+ *    whiteout) created out-of-band in the rw branch directory.
+ *
+ * The first is a per-branch rescan (aufsng_lookup_negative_valid); the
+ * second is free, because the pinned real dentries share the branch
+ * filesystem's own dcache, so the out-of-band edit unhashes the very
+ * dentry cached here.  Only the third needs a real lookup in the upper
+ * directory, so it is gated by an mtime/iversion stamp of that
+ * directory cached in d_fsdata: the probe runs once per observed
+ * upper-dir change, not once per access.
  */
 
 #include <linux/fs.h>
 #include <linux/namei.h>
+#include <linux/iversion.h>
+#include <linux/cred.h>
 #include "aufsng.h"
 
-/*
- * Restamp the generation bits of d_fsdata, preserving the flag bits
- * which may be modified concurrently with set_bit/clear_bit.
- */
-void aufsng_dentry_restamp_gen(struct dentry *dentry, unsigned long gen)
+/* fold the upper dir's change signal into one d_fsdata-sized stamp */
+static unsigned long aufsng_dir_stamp(struct inode *dir)
 {
-	unsigned long *p = (unsigned long *)&dentry->d_fsdata;
-	unsigned long old, new;
+	struct timespec64 mtime = inode_get_mtime(dir);
 
-	old = READ_ONCE(*p);
-	do {
-		new = (gen << AUFSNG_D_GEN_SHIFT) | (old & AUFSNG_D_FLAGS_MASK);
-	} while (!try_cmpxchg(p, &old, new));
+	return (unsigned long)(inode_query_iversion(dir) ^
+			       ((u64)mtime.tv_sec << 20) ^ mtime.tv_nsec);
 }
 
-/* stamp a fresh dentry with its parent's generation */
-void aufsng_dentry_init_gen(struct dentry *dentry)
-{
-	aufsng_dentry_restamp_gen(dentry, aufsng_dentry_gen(dentry->d_parent));
-}
-
-static int aufsng_dentry_revalidate_common(struct dentry *dentry,
-					unsigned int flags, bool weak)
+static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
+			      struct dentry *dentry, unsigned int flags)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
+	struct inode *inode = d_inode(dentry);
+	struct dentry *upper = aufsng_upperdentry(inode);
+	struct aufsng_entry *oe = AUFSNG_I_E(inode);
+	const struct cred *old_cred;
+	struct dentry *pupper;
+	struct dentry *this;
+	unsigned long stamp;
+	int ret = 1;
+	int wh = 0;
 
 	/*
-	 * The root is never stale: its aufsng_entry is swapped in place
-	 * when the layer stack changes.  Real dentries never need
-	 * revalidation either: remote filesystems are refused as
-	 * layers at mount and layer-add time.
+	 * An out-of-band unlink/rename of the real entry unhashes the
+	 * pinned real dentry itself - detectable without any lookup,
+	 * also in RCU walk.
 	 */
-	if (unlikely(IS_ROOT(dentry)))
-		return 1;
-
-	if (likely(!aufsng_dentry_gen_stale(pfs, dentry)))
-		return 1;
+	if (upper)
+		return !(d_unhashed(upper) || d_is_negative(upper));
+	if (oe && oe->numlower &&
+	    (d_unhashed(oe->lowerstack[0].dentry) ||
+	     d_is_negative(oe->lowerstack[0].dentry)))
+		return 0;
 
 	/*
-	 * Mounts sitting on a stale dentry, or reachable underneath one,
-	 * must not be detached by d_invalidate(): it walks the whole
-	 * subtree looking for mounts to lazily detach, and a branch
-	 * change elsewhere in the tree is not a reason to tear down a
-	 * user's unrelated mount several directories down.  A mounted
-	 * descendant is only ever reachable through cached ancestors (a
-	 * dentry always holds a reference on its parent), so a quick,
-	 * lockless "does this directory still have cached children"
-	 * check catches the whole chain up from any mountpoint below,
-	 * not only a mountpoint at this exact dentry.
+	 * Lower-only object: an upper entry or whiteout created
+	 * out-of-band in the rw branch would shadow or hide it.  Probe
+	 * the upper dir, but only when its stamp says it changed since
+	 * the last probe recorded in d_fsdata.
 	 */
-	if (d_mountpoint(dentry) || !hlist_empty(&dentry->d_children))
+	pupper = dir ? aufsng_upperdentry(dir) : NULL;
+	if (!pupper)
 		return 1;
-	/*
-	 * Weak revalidation runs on fd-based re-resolution
-	 * (/proc/self/fd magic links, AT_EMPTY_PATH, jumps at the end
-	 * of a walk), where returning 0 surfaces as ESTALE to userspace
-	 * and a retry jumps straight back to this same dentry - it can
-	 * never self-heal through a fresh lookup.  Tolerate the older
-	 * but self-consistent view instead.
-	 */
-	if (weak)
+	stamp = aufsng_dir_stamp(d_inode(pupper));
+	if ((unsigned long)READ_ONCE(dentry->d_fsdata) == stamp)
 		return 1;
 	if (flags & LOOKUP_RCU)
 		return -ECHILD;
-	return 0;
+
+	old_cred = override_creds(pfs->creator_cred);
+	down_read(&pfs->dyn_lock);
+
+	this = aufsng_lookup_once(aufsng_upper_mnt(pfs), pupper, name, &wh);
+	if (IS_ERR(this))
+		goto out;	/* error: keep the dentry, re-probe later */
+	if (wh) {
+		ret = 0;	/* whited out: the name is deleted now */
+		goto out;
+	}
+	if (this) {
+		/*
+		 * The rw branch now provides the name.  A same-type
+		 * upper is adopted in place - this also refreshes a
+		 * directory's merged listing and preserves submounts
+		 * that a d_invalidate() would detach.  A different type
+		 * means the cached inode is the wrong object: drop it.
+		 */
+		if ((d_inode(this)->i_mode ^ inode->i_mode) & S_IFMT)
+			ret = 0;
+		else
+			ret = aufsng_dyn_adopt_upper(inode,
+						  oe && oe->numlower ?
+						  oe->lowerstack[0].dentry :
+						  NULL,
+						  this);
+		dput(this);
+	}
+	if (ret)
+		WRITE_ONCE(dentry->d_fsdata, (void *)stamp);
+out:
+	up_read(&pfs->dyn_lock);
+	revert_creds(old_cred);
+	return ret;
 }
 
 static int aufsng_d_revalidate(struct inode *dir, const struct qstr *name,
 			    struct dentry *dentry, unsigned int flags)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
-	int ret;
-
-	ret = aufsng_dentry_revalidate_common(dentry, flags, false);
-	if (ret <= 0)
-		return ret;
 
 	/*
-	 * udba=reval: the generation stamp only tracks the union's own
-	 * branch add/remove, not a direct out-of-band edit of a branch.
-	 * A negative dentry can therefore be stale after a whiteout is
-	 * removed (or the name is created) straight in the rw branch, so
-	 * re-check the branches and drop it if the name is back.  The
-	 * check blocks on real lookups, so leave RCU walk first.
+	 * The root is never stale: its aufsng_entry is swapped in place
+	 * when the layer stack changes.  udba=none trusts the cache
+	 * entirely, matching AUFS.
 	 */
-	if (aufsng_udba_reval(pfs) && dir && d_is_negative(dentry)) {
+	if (unlikely(IS_ROOT(dentry)))
+		return 1;
+	if (!aufsng_udba_reval(pfs))
+		return 1;
+
+	if (d_is_negative(dentry)) {
+		if (!dir)
+			return 1;
 		if (flags & LOOKUP_RCU)
 			return -ECHILD;
-		if (!aufsng_lookup_negative_valid(dir, name))
-			return 0;
+		return aufsng_lookup_negative_valid(dir, name) ? 1 : 0;
 	}
-	return 1;
-}
 
-static int aufsng_d_weak_revalidate(struct dentry *dentry, unsigned int flags)
-{
-	return aufsng_dentry_revalidate_common(dentry, flags, true);
+	return aufsng_positive_valid(dir, name, dentry, flags);
 }
 
 const struct dentry_operations aufsng_dentry_operations = {
 	.d_revalidate		= aufsng_d_revalidate,
-	.d_weak_revalidate	= aufsng_d_weak_revalidate,
 };

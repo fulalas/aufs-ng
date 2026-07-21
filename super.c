@@ -123,24 +123,37 @@ static int aufsng_statfs(struct dentry *dentry, struct kstatfs *buf)
 static int aufsng_show_options(struct seq_file *m, struct dentry *dentry)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
-	size_t nr, nr_live = 0;
+	struct aufsng_entry *oe;
+	unsigned int i;
 
 	/*
-	 * Never print the individual branch paths: BusyBox's mount
-	 * replays a mount's current options through a small fixed-size
-	 * single-line buffer on bare-mountpoint remounts, and an
-	 * unbounded option line comes back truncated mid-path, breaking
-	 * every later branch change.  A count stands in for the list;
-	 * the branches themselves are visible as their own mounts.
+	 * The full branch list in priority order, as real AUFS prints
+	 * it without sysfs: branch 0 (rw) first, then the root stack
+	 * top-down.  This is the only place branch PRIORITY is visible
+	 * to userspace (the branches' own mounts show membership, not
+	 * order).  Long lines are safe for every consumer PorteuX
+	 * actually runs: boot-time module adds pass explicit options
+	 * (no replay), the live system's mount is util-linux, and the
+	 * shutdown script only ever umounts - all verified against the
+	 * real scripts and BusyBox 1.37 under strace.  (BusyBox's
+	 * getmntent does truncate >1K lines on bare-mountpoint option
+	 * REPLAY, but the parse ignores a replayed br: on remount, so
+	 * even a manual `busybox mount -o remount` in an initrd rescue
+	 * shell cannot feed a truncated branch list back in.)
 	 */
 	down_read(&pfs->dyn_lock);
-	for (nr = 0; nr < pfs->numlayer; nr++) {
-		if (pfs->layers[nr].mnt)
-			nr_live++;
+	seq_puts(m, ",br:");
+	seq_escape(m, pfs->config.br_paths[0], " \t\n\\");
+	seq_printf(m, "=%s", pfs->config.br_perms[0]);
+	oe = AUFSNG_E(dentry);
+	for (i = 0; oe && i < oe->numlower; i++) {
+		unsigned int idx = oe->lowerstack[i].layer->idx;
+
+		seq_putc(m, ':');
+		seq_escape(m, pfs->config.br_paths[idx], " \t\n\\");
+		seq_printf(m, "=%s", pfs->config.br_perms[idx]);
 	}
 	up_read(&pfs->dyn_lock);
-
-	seq_printf(m, ",br=%zu", nr_live);
 	if (pfs->config.xino_path)
 		seq_show_option(m, "xino", pfs->config.xino_path);
 	switch (pfs->config.udba) {
@@ -164,11 +177,12 @@ static void aufsng_free_fs(struct aufsng_fs *pfs)
 	for (i = 0; i < pfs->numlayer; i++) {
 		if (pfs->layers[i].mnt)
 			kern_unmount(pfs->layers[i].mnt);
-		if (pfs->config.br_names)
-			kfree(pfs->config.br_names[i]);
+		if (pfs->config.br_paths)
+			kfree(pfs->config.br_paths[i]);
 	}
 	kfree(pfs->layers);
-	kfree(pfs->config.br_names);
+	kfree(pfs->config.br_paths);
+	kfree(pfs->config.br_perms);
 	if (pfs->creator_cred)
 		put_cred(pfs->creator_cred);
 	kfree(pfs->config.xino_path);
@@ -268,7 +282,6 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		return err;
 	sb->s_fs_info = pfs;
 	init_rwsem(&pfs->dyn_lock);
-	atomic_long_set(&pfs->dyn_gen, 0);
 	pfs->config.maxbranch = max_t(size_t, ctx->nr, AUFSNG_MAXBRANCH_DEF);
 	pfs->config.xino_path = ctx->config.xino_path;
 	ctx->config.xino_path = NULL;
@@ -279,9 +292,13 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 			      GFP_KERNEL);
 	if (!pfs->layers)
 		goto out_free;
-	pfs->config.br_names = kcalloc(pfs->numlayer_cap, sizeof(char *),
+	pfs->config.br_paths = kcalloc(pfs->numlayer_cap, sizeof(char *),
 				       GFP_KERNEL);
-	if (!pfs->config.br_names)
+	if (!pfs->config.br_paths)
+		goto out_free;
+	pfs->config.br_perms = kcalloc(pfs->numlayer_cap, AUFSNG_PERM_LEN,
+				       GFP_KERNEL);
+	if (!pfs->config.br_perms)
 		goto out_free;
 
 	pfs->creator_cred = prepare_creds();
@@ -320,8 +337,10 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 
 		pfs->layers[i].mnt = mnt;
 		pfs->layers[i].idx = i;
-		pfs->config.br_names[i] = ctx->br[i].name;
+		pfs->config.br_paths[i] = ctx->br[i].name;
 		ctx->br[i].name = NULL;
+		strscpy(pfs->config.br_perms[i], ctx->br[i].permstr,
+			AUFSNG_PERM_LEN);
 		pfs->numlayer++;
 	}
 
@@ -347,7 +366,8 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto out_free;
 
 	rw_inode = d_inode(aufsng_upper_mnt(pfs)->mnt_root);
-	root_inode->i_ino = get_next_ino();
+	/* AUFS mounts always have root inode 2; scripts test for it */
+	root_inode->i_ino = AUFSNG_ROOT_INO;
 	root_inode->i_mode = rw_inode->i_mode;
 	root_inode->i_uid = rw_inode->i_uid;
 	root_inode->i_gid = rw_inode->i_gid;

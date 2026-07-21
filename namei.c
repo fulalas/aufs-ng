@@ -34,9 +34,17 @@ int aufsng_check_whiteout(struct vfsmount *mnt, struct dentry *parent,
 	struct dentry *whd;
 	int ret;
 
+	/*
+	 * A name too long to have a ".wh." sibling at all cannot be
+	 * whited out - the branch fs could never store the marker - so
+	 * the probe answers "no whiteout" rather than failing lookups
+	 * of legally existing long lower names with ENAMETOOLONG.
+	 * (Deleting such a name still fails in aufsng_create_whiteout(),
+	 * as it does on real AUFS.)
+	 */
 	ret = aufsng_wh_name(buf, name, &wh);
 	if (ret)
-		return ret;
+		return 0;
 
 	whd = lookup_one_unlocked(mnt_idmap(mnt), &wh, parent);
 	if (IS_ERR(whd))
@@ -75,10 +83,10 @@ int aufsng_check_diropq(struct vfsmount *mnt, struct dentry *dir)
  * (via *whiteout) 1 if this branch whites the name out (in which
  * case NULL is always returned and the search must stop here).
  */
-static struct dentry *aufsng_lookup_once(struct vfsmount *mnt,
-				      struct dentry *base,
-				      const struct qstr *name,
-				      int *whiteout)
+struct dentry *aufsng_lookup_once(struct vfsmount *mnt,
+			       struct dentry *base,
+			       const struct qstr *name,
+			       int *whiteout)
 {
 	struct qstr q = QSTR_LEN(name->name, name->len);
 	struct dentry *this;
@@ -149,11 +157,11 @@ bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(dir->i_sb);
 	const struct cred *old_cred;
-	struct aufsng_entry *poe;
+	struct aufsng_path origin;
 	struct dentry *pupper;
 	struct dentry *this;
 	bool valid = true;
-	unsigned int i;
+	int found;
 	int wh;
 
 	old_cred = override_creds(pfs->creator_cred);
@@ -185,20 +193,15 @@ bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name)
 		goto out;
 	}
 
-	poe = AUFSNG_I_E(dir);
-	for (i = 0; poe && i < poe->numlower; i++) {
-		wh = 0;
-		this = aufsng_lookup_once(poe->lowerstack[i].layer->mnt,
-				       poe->lowerstack[i].dentry, name, &wh);
-		if (IS_ERR(this))
-			goto out;	/* error: keep the dentry valid */
-		if (wh)
-			goto out;	/* a whiteout hides all lowers: valid */
-		if (this) {
-			dput(this);
-			valid = false;	/* a lower branch now provides it */
-			goto out;
-		}
+	/*
+	 * Same "does any lower still provide this name" decision the
+	 * merge itself makes; errors keep the dentry valid rather than
+	 * thrash it.
+	 */
+	found = aufsng_find_origin(AUFSNG_I_E(dir), name, &origin);
+	if (found > 0) {
+		dput(origin.dentry);
+		valid = false;	/* a lower branch now provides it */
 	}
 
 out:
@@ -220,15 +223,8 @@ static int aufsng_inode_set(struct inode *inode, void *data)
 
 static void aufsng_fill_inode(struct inode *inode, struct inode *realinode)
 {
-	inode->i_mode = realinode->i_mode;
-	inode->i_uid = realinode->i_uid;
-	inode->i_gid = realinode->i_gid;
 	inode->i_rdev = realinode->i_rdev;
-	inode->i_size = i_size_read(realinode);
-	inode_set_atime_to_ts(inode, inode_get_atime(realinode));
-	inode_set_mtime_to_ts(inode, inode_get_mtime(realinode));
-	inode_set_ctime_to_ts(inode, inode_get_ctime(realinode));
-	set_nlink(inode, realinode->i_nlink);
+	aufsng_copyattr_from(inode, realinode);
 
 	switch (inode->i_mode & S_IFMT) {
 	case S_IFDIR:
@@ -295,60 +291,24 @@ struct inode *aufsng_get_inode(struct super_block *sb,
 		 * name - the cached state wins (matching AUFS, where
 		 * pseudo-links keep such names on one inode).  This
 		 * lookup found an upper the cached inode lacks, or a
-		 * different one: for a directory this is handled by
-		 * aufsng_dyn_adopt_upper() (which also rebuilds the merged
-		 * listing); for a non-directory there is a single upper
-		 * location, so the freshly found upper is authoritative and
-		 * replaces any stale one - an app that saves by writing a
-		 * temp file and renaming it over the name (geany's config,
-		 * for one) gives the rw copy a new inode on every save, and
-		 * the union inode (keyed by the stable lower origin) must
-		 * follow it instead of failing with ESTALE.  A replacement of
-		 * a different file type (the rw copy became a dir/symlink) is
-		 * NOT adopted - the cached inode's ops were fixed at its type,
-		 * so that falls through to ESTALE.  The superseded upper may
-		 * still be in use by a lockless aufsng_path_real() reader, so
-		 * it is parked and dropped at inode eviction, not here.
+		 * different one (an app that saves by writing a temp
+		 * file and renaming it over the name gives the rw copy
+		 * a new inode on every save, and the union inode -
+		 * keyed by the stable lower origin - must follow it
+		 * instead of failing with ESTALE): adopt it via the
+		 * shared adopt-or-park machinery in dynlayer.c, which
+		 * also handles type mismatches (not adopted, fall
+		 * through to ESTALE) and parking the superseded upper
+		 * for lockless aufsng_path_real() readers.
 		 */
 		if (!ok && !new_u && oe->numlower)
 			ok = true;
-		if (!ok && new_u) {
-			if (S_ISDIR(inode->i_mode)) {
-				ok = aufsng_dyn_adopt_upper(inode,
-							 oe->numlower ?
-							 oe->lowerstack[0].dentry :
-							 NULL,
-							 upperdentry);
-			} else if ((inode->i_mode & S_IFMT) ==
-				   (new_u->i_mode & S_IFMT)) {
-				struct aufsng_inode *ai = AUFSNG_I(inode);
-
-				mutex_lock(&ai->lock);
-				if (!ai->upperdentry) {
-					WRITE_ONCE(ai->upperdentry,
-						   dget(upperdentry));
-					ok = true;
-				} else if (d_inode(ai->upperdentry) == new_u) {
-					ok = true;
-				} else {
-					struct aufsng_dyn_parked *pk =
-						kmalloc(sizeof(*pk), GFP_KERNEL);
-
-					if (pk) {
-						pk->oe = NULL;
-						pk->mnt = NULL;
-						pk->upper = ai->upperdentry;
-						WRITE_ONCE(ai->upperdentry,
-							   dget(upperdentry));
-						aufsng_copyattr(inode);
-						pk->next = ai->dyn_parked;
-						ai->dyn_parked = pk;
-						ok = true;
-					}
-				}
-				mutex_unlock(&ai->lock);
-			}
-		}
+		if (!ok && new_u)
+			ok = aufsng_dyn_adopt_upper(inode,
+						 oe->numlower ?
+						 oe->lowerstack[0].dentry :
+						 NULL,
+						 upperdentry);
 		dput(upperdentry);
 		aufsng_free_entry(oe);
 		if (!ok) {
@@ -377,14 +337,11 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 	struct dentry *this;
 	struct dentry *pupper;
 	struct inode *inode = NULL;
-	struct dentry *ret;
 	const struct cred *old_cred;
 	unsigned int i;
 	bool stopped = false;
 	int wh, err = 0;
 
-	if (dentry->d_name.len > pfs->namelen)
-		return ERR_PTR(-ENAMETOOLONG);
 	/*
 	 * ".wh."-prefixed names are AUFS bookkeeping: refusing them here
 	 * (as real AUFS does) also blocks every way of creating one
@@ -402,7 +359,6 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 	 * add/remove; exclude that for the whole lookup.
 	 */
 	down_read(&pfs->dyn_lock);
-	aufsng_dentry_init_gen(dentry);
 	old_cred = override_creds(pfs->creator_cred);
 
 	poe = AUFSNG_E(dentry->d_parent);
@@ -551,20 +507,7 @@ out:
 	if (err)
 		return ERR_PTR(err);
 
-	ret = d_splice_alias(inode, dentry);
-	/*
-	 * d_splice_alias() may return a preexisting alias of this
-	 * inode instead of the fresh dentry stamped above.  The alias
-	 * may still carry a stale generation from before a branch
-	 * change, but this lookup just resolved it against the current
-	 * stack, so restamp it - otherwise a pinned directory alias
-	 * could fail revalidation forever, as no fresh lookup can ever
-	 * replace it.
-	 */
-	if (!IS_ERR_OR_NULL(ret))
-		aufsng_dentry_restamp_gen(ret, aufsng_dentry_gen(dentry));
-
-	return ret;
+	return d_splice_alias(inode, dentry);
 }
 
 const char *aufsng_get_link(struct dentry *dentry, struct inode *inode,

@@ -119,7 +119,6 @@ static int aufsng_copy_data(struct aufsng_fs *pfs, const struct path *lowerpath,
 	};
 	struct file *in, *out;
 	loff_t pos_in = 0, pos_out = 0;
-	void *buf = NULL;
 	int err = 0;
 
 	in = kernel_file_open(lowerpath, O_RDONLY | O_LARGEFILE,
@@ -133,33 +132,21 @@ static int aufsng_copy_data(struct aufsng_fs *pfs, const struct path *lowerpath,
 		return PTR_ERR(out);
 	}
 
+	/*
+	 * COPY_FILE_SPLICE (kernel-internal) makes the VFS handle the
+	 * cross-sb case itself, falling back to an in-kernel splice
+	 * that moves pages through a pipe - no bounce buffer, and the
+	 * fallback policy stays maintained with the VFS instead of a
+	 * hand-picked errno list here (this is what nfsd and overlayfs
+	 * do).  No fsync: the union offers no crash consistency across
+	 * the copy-up + rename pair anyway, and neither AUFS nor
+	 * overlayfs flush here - it only serializes every copy-up
+	 * against the branch device.
+	 */
 	while (pos_in < len) {
-		ssize_t bytes;
-
-		bytes = vfs_copy_file_range(in, pos_in, out, pos_out,
-					    len - pos_in, 0);
-		if (bytes == -EOPNOTSUPP || bytes == -EXDEV ||
-		    bytes == -ENOSYS || bytes == -EINVAL) {
-			/* plain read/write fallback, 64k at a time */
-			size_t chunk = min_t(loff_t, len - pos_in, SZ_64K);
-
-			if (!buf) {
-				buf = kvmalloc(SZ_64K, GFP_KERNEL);
-				if (!buf) {
-					err = -ENOMEM;
-					break;
-				}
-			}
-			bytes = kernel_read(in, buf, chunk, &pos_in);
-			if (bytes > 0)
-				bytes = kernel_write(out, buf, bytes,
-						     &pos_out);
-			if (bytes <= 0) {
-				err = bytes < 0 ? bytes : -EIO;
-				break;
-			}
-			continue;
-		}
+		ssize_t bytes = vfs_copy_file_range(in, pos_in, out, pos_out,
+						    len - pos_in,
+						    COPY_FILE_SPLICE);
 		if (bytes <= 0) {
 			err = bytes < 0 ? bytes : -EIO;
 			break;
@@ -168,24 +155,22 @@ static int aufsng_copy_data(struct aufsng_fs *pfs, const struct path *lowerpath,
 		pos_out += bytes;
 	}
 
-	if (!err)
-		err = vfs_fsync(out, 0);
-
-	kvfree(buf);
 	fput(out);
 	fput(in);
 	return err;
 }
 
 /*
- * Copy a regular file into a uniquely named hidden file inside the
+ * Copy a regular file into a uniquely named temp file inside the
  * SAME directory as the final target, fill in data and metadata,
  * then rename it over the real name.  AUFS has no separate workdir;
- * the temp name is never ".wh."-prefixed, so it can never be mistaken
- * for whiteout bookkeeping, and it is always cleaned up (renamed away
- * or unlinked) within this single call - no external script ever
- * observes it, since copy-up only runs from live filesystem
- * operations, not from the shutdown-time raw directory scan.
+ * the temp lives in AUFS's own ".wh..wh." bookkeeping namespace
+ * (".wh..wh.pxu<seq>"), so it is invisible to lookup and readdir for
+ * the whole duration of the data copy - a plain visible name would
+ * show up in any concurrent listing of the directory (and stay there
+ * forever after a crash mid-copy).  Leftovers from a crash are
+ * cleaned up like any other stale marker: rmdir's clear_whiteouts
+ * sweep removes them with the directory.
  */
 static struct dentry *aufsng_copy_up_regular(struct aufsng_fs *pfs,
 					  struct dentry *dentry,
@@ -201,7 +186,7 @@ static struct dentry *aufsng_copy_up_regular(struct aufsng_fs *pfs,
 	struct qstr tmpq;
 	int err;
 
-	snprintf(tmpname, sizeof(tmpname), "#pxu%u",
+	snprintf(tmpname, sizeof(tmpname), ".wh..wh.pxu%u",
 		 atomic_inc_return(&aufsng_tmpfile_seq));
 	tmpq = QSTR(tmpname);
 
@@ -229,16 +214,13 @@ static struct dentry *aufsng_copy_up_regular(struct aufsng_fs *pfs,
 		goto out_cleanup;
 
 	/*
-	 * A stale ".wh.<name>" may still sit at the target from an
-	 * earlier delete of a name a lower branch also provides; the
-	 * rename below only replaces "<name>" itself, so the whiteout
-	 * must be cleared first or it would keep hiding the file we are
-	 * about to give it real upper content for.
+	 * No whiteout can sit at the target: the name was visible to
+	 * the lookup that triggered this copy-up (a whiteout would
+	 * have hidden it), and one appearing since means a completed
+	 * unlink - aufsng_copy_up_one() re-checks for that under
+	 * oi->lock before calling here, and aufsng_do_remove() holds
+	 * the same lock for its whole whiteout + unlink sequence.
 	 */
-	err = aufsng_remove_whiteout(pfs, pupper, &dentry->d_name);
-	if (err)
-		goto out_cleanup;
-
 	rd.mnt_idmap = idmap;
 	rd.old_parent = pupper;
 	rd.new_parent = pupper;
@@ -274,11 +256,10 @@ out_cleanup:
 
 /*
  * Create the upper copy of a non-regular object directly in the rw
- * parent dir.  A stale whiteout for this name (from an earlier
- * delete of a name a lower branch also provides) is a SEPARATE
- * ".wh.<name>" sibling under AUFS semantics, not a property of the
- * name's own (negative) dentry, so it is removed up front rather
- * than detected via the create slot itself.
+ * parent dir.  No whiteout can occupy the name here for the same
+ * reason as in the regular-file path: the name was visible to the
+ * lookup that led here, and copy_up_one aborts under oi->lock if a
+ * delete slipped in since.
  */
 static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 					  struct dentry *dentry,
@@ -288,7 +269,6 @@ static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 {
 	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	struct dentry *slot, *upper = NULL;
-	struct qstr nameq = QSTR_LEN(dentry->d_name.name, dentry->d_name.len);
 	DEFINE_DELAYED_CALL(done);
 	const char *link = NULL;
 	int err;
@@ -299,20 +279,10 @@ static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 			return ERR_CAST(link);
 	}
 
-	err = aufsng_remove_whiteout(pfs, pupper, &dentry->d_name);
-	if (err) {
-		do_delayed_call(&done);
-		return ERR_PTR(err);
-	}
-
-	slot = start_creating_noperm(pupper, &nameq);
+	slot = aufsng_create_slot(pupper, &dentry->d_name);
 	if (IS_ERR(slot)) {
 		do_delayed_call(&done);
 		return slot;
-	}
-	if (d_is_positive(slot)) {
-		err = -EEXIST;
-		goto out_end;
 	}
 
 	switch (stat->mode & S_IFMT) {
@@ -377,6 +347,25 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 	mutex_lock(&oi->lock);
 	if (oi->upperdentry)
 		goto out;
+
+	/*
+	 * The lookup that led here saw the name alive, but an unlink or
+	 * rename may have won oi->lock first: the whiteout it left (and
+	 * the dropped link count / unhashed dentry) mark the name dead.
+	 * Copying up regardless would recreate the name with full upper
+	 * content - and destroy the whiteout - silently undoing a
+	 * delete that already returned success to userspace.
+	 */
+	if (d_unhashed(dentry) || !inode->i_nlink) {
+		err = -ENOENT;
+		goto out;
+	}
+	err = aufsng_check_whiteout(aufsng_upper_mnt(pfs), pupper,
+				 &dentry->d_name);
+	if (err) {
+		err = err < 0 ? err : -ENOENT;
+		goto out;
+	}
 
 	oe = AUFSNG_I_E(inode);
 	if (!oe || !oe->numlower) {
