@@ -25,7 +25,7 @@ grammar with:
 
 - **No kernel patches** — every symbol it uses is a standard, currently
   exported kernel API.
-- **A much smaller surface** — ~3,500 lines, vs. AUFS's ~28,000.
+- **A much smaller surface** — ~5,400 lines, vs. AUFS's ~28,000.
 - **Modern I/O passthrough** — reads/writes/splice/mmap go through the
   kernel's `backing_file_*` API (the same infrastructure FUSE passthrough
   and OverlayFS use) instead of a per-superblock rwsem on the hot path.
@@ -65,12 +65,23 @@ mount -o remount,dirperm1,add=1:/path/to/new-lower=rr aufs /mnt
 mount -t aufs -o remount,del=/path/to/lower aufs /mnt
 ```
 
+Branch modes accept the full AUFS grammar: `rw`, `ro`, `rr` plus
+`+attr` suffixes (`rw+nolwh`, `ro+wh`, `rr+wh`, ...); `ro` and `rr`
+are treated identically (never written to), and the attribute suffixes
+parse but have no further effect.
 `udba=` accepts `none`, `reval` (the default), and `notify` (accepted
-for AUFS compatibility but currently behaves as `reval`).
+for AUFS compatibility but currently behaves as `reval`).  Under
+`udba=reval`, both positive and negative cached names are revalidated
+against the real branches, so out-of-band edits made directly in a
+branch are reflected in the merged view.
 `xino=` is accepted and stored for `show_options` fidelity but has no
 behavioral effect here.
 `dirperm1` and `nowarn_perm` are accepted for AUFS compatibility but
 are no-ops here.
+
+`/proc/mounts` shows the full branch list in priority order with the
+mode tokens echoed exactly as given, like original AUFS without sysfs
+(there is no `/sys/fs/aufs` tree or `si=` id).
 
 All other mount parameters behave as they would under original AUFS.
 
@@ -83,6 +94,16 @@ carries a `.wh..wh..opq` marker. Verified byte-for-byte against the
 upstream `aufs-standalone` source, so `save-changes`, `dump-session`,
 and anything else that scans a branch directly need no changes.
 
+Deletion is whiteout-first, as in AUFS: the `.wh.<name>` marker is
+created before the object is removed (and rolled back on failure), so
+a crash or a full branch can never silently resurrect stale lower
+content. Transient bookkeeping lives in AUFS's own hidden `.wh..wh.`
+namespace: copy-up temp files are `.wh..wh.pxu<seq>` and a whiteout
+parked aside during a create/rename is `.wh..wh.tmp.<seq>`; both are
+invisible to the merged view, cleaned up within the operation, and —
+after a crash mid-operation — swept with the directory like any other
+stale marker.
+
 ## Architecture (one file per concern)
 
 | File | Responsibility |
@@ -90,9 +111,9 @@ and anything else that scans a branch directly need no changes.
 | `super.c` | Module init, `file_system_type`, superblock/inode lifecycle, `statfs`, `show_options` |
 | `params.c` | Mount option parsing (AUFS grammar) |
 | `namei.c` | Layered lookup, whiteout/opaque detection, inode hashing |
-| `dcache.c` | Dentry revalidation against the branch-stack generation counter, plus negative-dentry revalidation under `udba=reval` |
+| `dcache.c` | Dentry revalidation under `udba=reval`: cheap unhashed checks on the pinned real dentries for positive names, per-branch rescan for negative ones, and a stamped upper-dir probe that adopts an out-of-band upper in place |
 | `file.c` | Regular-file I/O via the kernel's `backing_file_*` passthrough API |
-| `readdir.c` | Merged directory listing (rbtree + list cache), invalidated by an inode version counter |
+| `readdir.c` | Merged directory listing (rbtree + list cache), invalidated by an inode version counter and per-branch change stamps, with a per-open cursor for O(n) large listings |
 | `inode.c` | `getattr`/`setattr`/xattr passthrough, copy-up-on-write triggers |
 | `copy_up.c` | Give a lower-backed file/dir a real upper copy on first write |
 | `dir.c` | `create`/`mkdir`/`mknod`/`symlink`/`link`/`unlink`/`rmdir`/`rename`, whiteout creation/removal |
@@ -100,10 +121,11 @@ and anything else that scans a branch directly need no changes.
 | `compat.h` | `LINUX_VERSION_CODE` guards across kernel versions |
 
 Concurrency: a `dyn_lock` rwsem excludes lookup/readdir during a
-branch-stack change; a per-dentry generation counter catches stale
-cached state; superseded per-directory stacks are "parked" on the inode
-(with the removed branch's mount pinned) until eviction, since an
-in-flight operation may still hold a pointer into the old stack.
+branch-stack change, and every mutation holds it from its
+branch-coverage verdict through the operation that verdict guards;
+superseded per-directory stacks are "parked" on the inode (pinning
+every branch mount they reference) until eviction, since an in-flight
+operation may still hold a pointer into the old stack.
 
 ## Building
 
@@ -135,6 +157,9 @@ make -C /path/to/kernel/build M=$PWD CONFIG_AUFSNG_FS=m W=1 modules
 
 Boot, module activation/deactivation, and copy-up have been verified
 end-to-end, including activating a module on an already-running system.
+The full-tree review rework (whiteout ordering, udba=reval positive
+revalidation, branch-add splicing, readdir caching) compiles clean but
+has not yet been re-verified on a live system.
 
 ## License
 
