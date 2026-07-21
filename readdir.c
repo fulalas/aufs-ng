@@ -605,102 +605,132 @@ int aufsng_check_empty_dir(struct dentry *dentry)
 	return err;
 }
 
+struct aufsng_wh_sweep_name {
+	struct list_head node;
+	int len;
+	char name[];
+};
+
+struct aufsng_wh_sweep {
+	struct dir_context ctx;
+	struct list_head names;
+	int count;
+	int err;
+};
+
+static bool aufsng_wh_sweep_actor(struct dir_context *ctx, const char *name,
+			       int namelen, loff_t offset, u64 ino,
+			       unsigned int d_type)
+{
+	struct aufsng_wh_sweep *sw =
+		container_of(ctx, struct aufsng_wh_sweep, ctx);
+	struct aufsng_wh_sweep_name *p;
+
+	if (!aufsng_is_wh_name(name, namelen))
+		return true;
+
+	p = kmalloc(sizeof(*p) + namelen + 1, GFP_KERNEL);
+	if (!p) {
+		sw->err = -ENOMEM;
+		return false;
+	}
+	memcpy(p->name, name, namelen);
+	p->name[namelen] = '\0';
+	p->len = namelen;
+	list_add_tail(&p->node, &sw->names);
+	sw->count++;
+	return true;
+}
+
 /*
- * Remove every ".wh."-prefixed bookkeeping name (per-entry whiteouts
- * and the opaque marker) physically present in the rw branch's own
- * @upperdir, so that a union-empty merged dir (see
- * aufsng_check_empty_dir()) can actually be vfs_rmdir'ed - rmdir fails
- * on a directory that still physically contains these marker files,
- * even though they are invisible to the merged view.  This is a raw
- * scan of @upperdir alone, not the merged cache.
+ * Remove every ".wh."-prefixed bookkeeping name physically present in
+ * the rw branch's own @upperdir - per-entry whiteouts, the opaque
+ * marker, AND any crash-leftover ".wh..wh." temp (a parked whiteout or
+ * copy-up temp file) - so that a union-empty merged dir (see
+ * aufsng_check_empty_dir()) can actually be vfs_rmdir'ed: rmdir fails
+ * on a directory that still physically contains any of them, even
+ * though every one is invisible to the merged view.  The on-disk names
+ * are swept verbatim (raw scan of @upperdir alone, not the merged
+ * cache): deriving them back from the readdir merge's tombstones would
+ * miss exactly the ".wh..wh." bookkeeping class, which the merge
+ * deliberately never records.
  */
 int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir)
 {
 	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
-	struct aufsng_dir_cache *cache;
-	struct aufsng_cache_entry *p, *n;
+	struct aufsng_wh_sweep sw = {
+		.ctx.actor = aufsng_wh_sweep_actor,
+		.ctx.count = INT_MAX,
+	};
+	struct aufsng_wh_sweep_name *p, *n;
 	struct path realpath = {
 		.mnt = aufsng_upper_mnt(pfs),
 		.dentry = upperdir,
 	};
+	struct file *realfile;
 	int err;
 
-	cache = kzalloc(sizeof(*cache), GFP_KERNEL);
-	if (!cache)
-		return -ENOMEM;
-	INIT_LIST_HEAD(&cache->entries);
-	cache->root = RB_ROOT;
+	INIT_LIST_HEAD(&sw.names);
 
-	/*
-	 * aufsng_dir_read_layer()/aufsng_fill_merge() classify entries into
-	 * real names and whiteout tombstones (storing the tombstone's
-	 * derived real name, not its on-disk ".wh."+name form); that
-	 * classification is exactly what we need here too.  Re-derive
-	 * each tombstone's on-disk name to unlink it.
-	 * Only tombstone names are inspected below, so the mapped inode
-	 * numbers are irrelevant here - any idx is fine.
-	 */
-	err = aufsng_dir_read_layer(pfs, &realpath, cache, 0);
-	if (err) {
-		aufsng_cache_free(cache);
-		return err;
-	}
+	realfile = dentry_open(&realpath, O_RDONLY | O_DIRECTORY | O_LARGEFILE,
+			       pfs->creator_cred);
+	if (IS_ERR(realfile))
+		return PTR_ERR(realfile);
+	/* as in aufsng_dir_read_layer(): iterate until a call adds nothing */
+	do {
+		sw.count = 0;
+		sw.err = 0;
+		err = iterate_dir(realfile, &sw.ctx);
+		if (!err)
+			err = sw.err;
+	} while (!err && sw.count);
+	fput(realfile);
 
-	/*
-	 * One lock for the whole sweep.  I_MUTEX_CHILD, not the dirop
-	 * helpers' I_MUTEX_PARENT: the rmdir path already holds the
-	 * upper PARENT directory's lock at that subclass while this
-	 * runs on its child, and taking the same subclass twice in the
-	 * same i_rwsem class is a lockdep splat even though the
-	 * parent->child order itself is fine (this mirrors the VFS's
-	 * own parent-PARENT/victim-plain convention in vfs_rmdir()).
-	 */
-	inode_lock_nested(d_inode(upperdir), I_MUTEX_CHILD);
+	if (!err) {
+		/*
+		 * One lock for the whole sweep.  I_MUTEX_CHILD, not the
+		 * dirop helpers' I_MUTEX_PARENT: the rmdir path already
+		 * holds the upper PARENT directory's lock at that
+		 * subclass while this runs on its child, and taking the
+		 * same subclass twice in the same i_rwsem class is a
+		 * lockdep splat even though the parent->child order
+		 * itself is fine (this mirrors the VFS's own
+		 * parent-PARENT/victim-plain convention in vfs_rmdir()).
+		 */
+		inode_lock_nested(d_inode(upperdir), I_MUTEX_CHILD);
+		list_for_each_entry(p, &sw.names, node) {
+			struct qstr q = QSTR_LEN(p->name, p->len);
+			struct dentry *whd;
 
-	list_for_each_entry_safe(p, n, &cache->entries, l_node) {
-		char buf[NAME_MAX + 1];
-		struct qstr q, wh;
-		struct dentry *whd;
-		int err2;
-
-		if (!p->hidden)
-			continue;
-
-		/* derived from an on-disk ".wh." name, so it must fit back */
-		q = QSTR_LEN(p->name, p->len);
-		err2 = aufsng_wh_name(buf, &q, &wh);
-		if (WARN_ON_ONCE(err2)) {
-			err = err2;
-			continue;
-		}
-
-		whd = lookup_one(idmap, &wh, upperdir);
-		if (IS_ERR(whd)) {
-			err = PTR_ERR(whd);
-			continue;
-		}
-		if (d_is_positive(whd))
-			err = vfs_unlink(idmap, d_inode(upperdir), whd, NULL);
-		dput(whd);
-	}
-
-	/* the opaque marker, if this directory carries one */
-	{
-		struct qstr opq = QSTR(AUFSNG_WH_DIROPQ);
-		struct dentry *whd;
-
-		whd = lookup_one(idmap, &opq, upperdir);
-		if (!IS_ERR(whd)) {
-			if (d_is_positive(whd))
-				vfs_unlink(idmap, d_inode(upperdir), whd,
-					   NULL);
+			whd = lookup_one(idmap, &q, upperdir);
+			if (IS_ERR(whd)) {
+				err = PTR_ERR(whd);
+				continue;
+			}
+			if (d_is_positive(whd)) {
+				/*
+				 * ".wh..wh.plnk"/".wh..wh.orph" style
+				 * bookkeeping DIRS (real-AUFS branches,
+				 * live-distro boot scripts) at a branch
+				 * root can reach here via rename over a
+				 * union-empty dir; sweep them too.
+				 */
+				if (d_is_dir(whd))
+					err = vfs_rmdir(idmap,
+							d_inode(upperdir),
+							whd, NULL);
+				else
+					err = vfs_unlink(idmap,
+							 d_inode(upperdir),
+							 whd, NULL);
+			}
 			dput(whd);
 		}
+		inode_unlock(d_inode(upperdir));
 	}
 
-	inode_unlock(d_inode(upperdir));
-
-	aufsng_cache_free(cache);
+	list_for_each_entry_safe(p, n, &sw.names, node)
+		kfree(p);
 	return err;
 }
 
