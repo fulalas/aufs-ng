@@ -147,12 +147,20 @@ static int aufsng_fsync(struct file *file, loff_t start, loff_t end,
 		     int datasync)
 {
 	struct inode *inode = file_inode(file);
+	struct file *realfile = file->private_data;
+	struct dentry *upper = aufsng_upperdentry(inode);
 
-	/* lower layers are read-only squashfs: nothing to sync there */
-	if (!aufsng_upperdentry(inode))
+	/*
+	 * Nothing to sync unless this fd's own backing file is the
+	 * upper one: lower layers are read-only, and an fd opened
+	 * O_RDONLY before a copy-up still points at the (possibly
+	 * fsync-less, e.g. squashfs) lower file and has written
+	 * nothing.
+	 */
+	if (!upper || file_inode(realfile) != d_inode(upper))
 		return 0;
 
-	return vfs_fsync_range(file->private_data, start, end, datasync);
+	return vfs_fsync_range(realfile, start, end, datasync);
 }
 
 static int aufsng_flush(struct file *file, fl_owner_t id)
