@@ -1,22 +1,19 @@
 # `aufs-ng`
 
 `aufs-ng` is a standalone, from-scratch union filesystem, written to be a
-drop-in kernel-side replacement for `aufs` to be used mainly by live distros.
-It builds against a **stock, unpatched kernel tree** — no `aufs` patch set,
-no OverlayFS patch, nothing outside this directory.
+drop-in kernel-side replacement for `aufs`, aimed mainly at live distros.
+It builds against a **stock, unpatched kernel tree** — no `aufs` or `OverlayFS`
+patch, nothing outside this directory.
 
 It registers with the kernel as filesystem type **`aufs`** (not `aufs-ng`)
 and speaks `aufs`'s own mount option grammar and on-disk whiteout format, so
-that any script issuing original `aufs` `mount`/`remount` commands works
-completely unmodified. `aufs-ng` is just the project name; `aufs` is
-the filesystem name the kernel and userspace see.
+that any script issuing original `aufs` `mount`/`remount` commands should
+work (see [usage](#usage) below).
 
 It also carries over one of `aufs`'s defining abilities: branches can be
 added to or removed from the union while it's mounted, with no unmount
-or reboot required — and without disturbing open files, working
-directories, or mounts nested inside the union. This is what lets
-distros such as PorteuX load and unload `.xzm` modules on an
-already-running system.
+or reboot required. This is what lets distros like PorteuX load and unload
+modules on an already-running system.
 
 ## Why this exists
 
@@ -30,7 +27,7 @@ grammar with:
 - **A much smaller surface** — ~4,000 lines, vs. `aufs`'s ~28,000.
 - **Modern I/O passthrough** — reads/writes/splice/mmap go through the
   kernel's `backing_file_*` API (the same infrastructure FUSE passthrough
-  and OverlayFS use) instead of taking a filesystem-wide lock on every
+  and `OverlayFS` use) instead of taking a filesystem-wide lock on every
   read and write.
 
 ## Trade-offs
@@ -147,7 +144,7 @@ module — a live-boot sequence typically needs this filesystem type
 mounted before any loadable module can be reached at all.
 
 To integrate into a kernel source tree (any anchor line in `fs/Kconfig`/
-`fs/Makefile` works; the overlayfs entry is just a convenient, stable one):
+`fs/Makefile` works; the `OverlayFS` entry is just a convenient, stable one):
 
 ```sh
 git clone --depth 1 https://github.com/fulalas/aufs-ng fs/aufs-ng
