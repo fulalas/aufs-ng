@@ -1,9 +1,9 @@
 # aufs-ng
 
 `aufs-ng` is a standalone, from-scratch union filesystem, written to be a
-drop-in kernel-side replacement for AUFS. It builds against a **stock,
-unpatched kernel tree** — no AUFS patch set, no OverlayFS patch, nothing
-outside this directory.
+drop-in kernel-side replacement for AUFS to be used mainly by live distros.
+It builds against a **stock, unpatched kernel tree** — no AUFS patch set,
+no OverlayFS patch, nothing outside this directory.
 
 It registers with the kernel as filesystem type **`aufs`** (not `aufs-ng`)
 and speaks AUFS's own mount option grammar and on-disk whiteout format, so
@@ -25,7 +25,7 @@ grammar with:
 
 - **No kernel patches** — every symbol it uses is a standard, currently
   exported kernel API.
-- **A much smaller surface** — ~5,400 lines, vs. AUFS's ~28,000.
+- **A much smaller surface** — ~4,000 lines, vs. AUFS's ~28,000.
 - **Modern I/O passthrough** — reads/writes/splice/mmap go through the
   kernel's `backing_file_*` API (the same infrastructure FUSE passthrough
   and OverlayFS use) instead of a per-superblock rwsem on the hot path.
