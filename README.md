@@ -90,9 +90,9 @@ highest-priority first — when the same name exists in several branches,
 the one listed first wins. The option syntax is original `aufs`'s:
 
 ```
-mount -t aufs -o nowarn_perm,xino=/memory/xino/.aufs.xino,br:/memory/changes=rw,udba=reval aufs /union
-mount -no remount,dirperm1,add=1:module=rr aufs /    # add a layer to the live union
-mount -t aufs -o remount,del=module aufs /      # remove one
+mount -t aufs -o br:/memory/changes=rw,udba=reval aufs /union
+mount -no remount,add=1:/path/to/module=rr aufs /    # add a module to the live union
+mount -t aufs -o remount,del=/path/to/module aufs /  # remove the layer
 ```
 
 `add=1:` inserts the new branch right below the writable one, so the
@@ -147,7 +147,7 @@ To integrate into a kernel source tree (any anchor line in `fs/Kconfig`/
 `fs/Makefile` works; the `OverlayFS` entry is just a convenient, stable one):
 
 ```sh
-git clone --depth 1 https://github.com/fulalas/aufs-ng fs/aufs-ng
+git clone https://github.com/fulalas/aufs-ng fs/aufs-ng
 sed -i '/source "fs\/overlayfs\/Kconfig"/a source "fs/aufs-ng/Kconfig"' fs/Kconfig
 sed -i '/obj-\$(CONFIG_OVERLAY_FS)\s*+= overlayfs\//a obj-$(CONFIG_AUFSNG_FS)\t+= aufs-ng/' fs/Makefile
 echo "CONFIG_AUFSNG_FS=y" >> .config
