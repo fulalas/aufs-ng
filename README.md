@@ -67,9 +67,9 @@ highest-priority first — when the same name exists in several branches,
 the one listed first wins. The option syntax is original AUFS's:
 
 ```
-mount -t aufs -o br:/changes=rw:/image2=ro:/image1=ro aufs /mnt
-mount -o remount,add=1:/image3=ro aufs /mnt    # add a layer to the live union
-mount -o remount,del=/image1 aufs /mnt         # remove one
+mount -t aufs -o nowarn_perm,xino=/memory/xino/.aufs.xino,br:/memory/changes=rw,udba=reval aufs /union
+mount -no remount,dirperm1,add=1:module=rr aufs /    # add a layer to the live union
+mount -t aufs -o remount,del=module aufs /      # remove one
 ```
 
 `add=1:` inserts the new branch right below the writable one, so the
@@ -88,10 +88,9 @@ simply mean read-only here.
 - `xino=`, `dirperm1`, `nowarn_perm` — accepted so existing AUFS mount
   lines work unchanged; they have no effect.
 
-Anything else is rejected at mount time and ignored on remount (where
-mount tools replay a mount's existing options). `/proc/mounts` shows
-the full branch list in priority order, like original AUFS (there is
-no `/sys/fs/aufs` tree).
+On remount, unknown options are silently ignored. Unlike original AUFS,
+there is no `/sys/fs/aufs` tree; the branch list appears directly in
+`/proc/mounts`.
 
 ## On-disk format
 
