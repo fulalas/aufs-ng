@@ -668,6 +668,7 @@ static int aufsng_dyn_scan_branch(struct super_block *sb,
 			       bool force_shrink, bool *dcache_fresh)
 {
 	struct inode *inode;
+	unsigned int i;
 
 	if (force_shrink || !*dcache_fresh) {
 		shrink_dcache_sb(sb);
@@ -676,6 +677,16 @@ static int aufsng_dyn_scan_branch(struct super_block *sb,
 	}
 
 again:
+	/*
+	 * A restart rewalks the whole list, so the previous pass's
+	 * collection must be dropped first: every in-use directory would
+	 * otherwise be collected once more per restart, growing
+	 * scan->dirs (and the allocations later sized by scan->nr) by
+	 * O(in-use dirs) for each cache-only inode evicted below.
+	 */
+	for (i = 0; i < scan->nr; i++)
+		iput(scan->dirs[i]);
+	scan->nr = 0;
 	scan->nr_busy = 0;
 	spin_lock(&sb->s_inode_list_lock);
 	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
