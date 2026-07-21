@@ -8,13 +8,15 @@ no OverlayFS patch, nothing outside this directory.
 It registers with the kernel as filesystem type **`aufs`** (not `aufs-ng`)
 and speaks AUFS's own mount option grammar and on-disk whiteout format, so
 that any script issuing original AUFS `mount`/`remount` commands works
-completely unmodified. `aufs-ng` is the project/module name; `aufs`
-remains the wire-compatible identity the kernel and userspace see.
+completely unmodified. `aufs-ng` is just the project name; `aufs` is
+the filesystem name the kernel and userspace see.
 
 It also carries over one of AUFS's defining abilities: branches can be
 added to or removed from the union while it's mounted, with no unmount
-or reboot required. This is what lets distros such as PorteuX load and
-unload `.xzm` modules on an already-running system.
+or reboot required — and without disturbing open files, working
+directories, or mounts nested inside the union. This is what lets
+distros such as PorteuX load and unload `.xzm` modules on an
+already-running system.
 
 ## Why this exists
 
@@ -28,7 +30,8 @@ grammar with:
 - **A much smaller surface** — ~4,000 lines, vs. AUFS's ~28,000.
 - **Modern I/O passthrough** — reads/writes/splice/mmap go through the
   kernel's `backing_file_*` API (the same infrastructure FUSE passthrough
-  and OverlayFS use) instead of a per-superblock rwsem on the hot path.
+  and OverlayFS use) instead of taking a filesystem-wide lock on every
+  read and write.
 
 ## Trade-offs
 
@@ -54,78 +57,59 @@ Also, some AUFS features are intentionally out of scope:
 - **FHSM** (automatic storage tiering) — not needed: aufs-ng only ever
   has one writable location, so there's nothing to move files between.
 
-## Mount syntax
+## Usage
 
-Identical to original AUFS — `br:`, `add=N:PATH=MODE`, `del=PATH`,
-`dirperm1`, `udba=`, `xino=`, `nowarn_perm`:
+A union stacks one writable directory on top of any number of read-only
+ones and presents them as a single filesystem: everything you create,
+modify or delete lands in the writable branch; the read-only branches
+below provide the rest of the content. Branches are listed
+highest-priority first — when the same name exists in several branches,
+the one listed first wins. The option syntax is original AUFS's:
 
 ```
-mount -t aufs -o br:/path/to/rw=rw[:/path/to/lower=ro[:...]] aufs /mnt
-mount -o remount,dirperm1,add=1:/path/to/new-lower=rr aufs /mnt
-mount -t aufs -o remount,del=/path/to/lower aufs /mnt
+mount -t aufs -o br:/changes=rw:/image2=ro:/image1=ro aufs /mnt
+mount -o remount,add=1:/image3=ro aufs /mnt    # add a layer to the live union
+mount -o remount,del=/image1 aufs /mnt         # remove one
 ```
 
-Branch modes accept the full AUFS grammar: `rw`, `ro`, `rr` plus
-`+attr` suffixes (`rw+nolwh`, `ro+wh`, `rr+wh`, ...); `ro` and `rr`
-are treated identically (never written to), and the attribute suffixes
-parse but have no further effect.
-`udba=` accepts `none`, `reval` (the default), and `notify` (accepted
-for AUFS compatibility but currently behaves as `reval`).  Under
-`udba=reval`, both positive and negative cached names are revalidated
-against the real branches, so out-of-band edits made directly in a
-branch are reflected in the merged view.
-`xino=` is accepted and stored for `show_options` fidelity but has no
-behavioral effect here.
-`dirperm1` and `nowarn_perm` are accepted for AUFS compatibility but
-are no-ops here.
+`add=1:` inserts the new branch right below the writable one, so the
+newest layer wins over older ones — the AUFS convention.
 
-`/proc/mounts` shows the full branch list in priority order with the
-mode tokens echoed exactly as given, like original AUFS without sysfs
-(there is no `/sys/fs/aufs` tree or `si=` id).
+Each branch gets a mode: `rw` (writable — only the first branch can be)
+or `ro` (read-only). For compatibility, aufs-ng also accepts AUFS's
+other read-only spelling `rr` (meant for natively read-only filesystems
+like squashfs) and mode suffixes such as `+wh` or `+nolwh` — they all
+simply mean read-only here.
 
-All other mount parameters behave as they would under original AUFS.
+- `udba=` — what happens when a branch is edited directly, behind the
+  union's back: `reval` (the default) picks such edits up; `none` trusts
+  the cache (slightly faster, fine when branches only ever change
+  through the union); `notify` is accepted and behaves as `reval`.
+- `xino=`, `dirperm1`, `nowarn_perm` — accepted so existing AUFS mount
+  lines work unchanged; they have no effect.
+
+Anything else is rejected at mount time and ignored on remount (where
+mount tools replay a mount's existing options). `/proc/mounts` shows
+the full branch list in priority order, like original AUFS (there is
+no `/sys/fs/aufs` tree).
 
 ## On-disk format
 
 Identical to original AUFS: a deleted name still provided by a lower
 branch is masked by a sibling regular file `.wh.<name>` (mode `0444`,
 not a character device); a directory that fully shadows lower content
-carries a `.wh..wh..opq` marker. Verified byte-for-byte against the
-upstream `aufs-standalone` source, so `save-changes`, `dump-session`,
-and anything else that scans a branch directly need no changes.
+carries a `.wh..wh..opq` marker. Verified byte-for-byte against
+original AUFS, so external tools that read or edit a branch directly
+work unchanged.
 
 Deletion is whiteout-first, as in AUFS: the `.wh.<name>` marker is
 created before the object is removed (and rolled back on failure), so
 a crash or a full branch can never silently resurrect stale lower
 content. Transient bookkeeping lives in AUFS's own hidden `.wh..wh.`
-namespace: copy-up temp files are `.wh..wh.pxu<seq>` and a whiteout
-parked aside during a create/rename is `.wh..wh.tmp.<seq>`; both are
-invisible to the merged view, cleaned up within the operation, and —
-after a crash mid-operation — swept with the directory like any other
-stale marker.
-
-## Architecture (one file per concern)
-
-| File | Responsibility |
-|---|---|
-| `super.c` | Module init, `file_system_type`, superblock/inode lifecycle, `statfs`, `show_options` |
-| `params.c` | Mount option parsing (AUFS grammar) |
-| `namei.c` | Layered lookup, whiteout/opaque detection, inode hashing |
-| `dcache.c` | Dentry revalidation under `udba=reval`: cheap unhashed checks on the pinned real dentries for positive names, per-branch rescan for negative ones, and a stamped upper-dir probe that adopts an out-of-band upper in place |
-| `file.c` | Regular-file I/O via the kernel's `backing_file_*` passthrough API |
-| `readdir.c` | Merged directory listing (rbtree + list cache), invalidated by an inode version counter and per-branch change stamps, with a per-open cursor for O(n) large listings |
-| `inode.c` | `getattr`/`setattr`/xattr passthrough, copy-up-on-write triggers |
-| `copy_up.c` | Give a lower-backed file/dir a real upper copy on first write |
-| `dir.c` | `create`/`mkdir`/`mknod`/`symlink`/`link`/`unlink`/`rmdir`/`rename`, whiteout creation/removal |
-| `dynlayer.c` | Runtime branch add/remove, including **surgical add**: splicing a new branch into every already-cached directory in place, so pinned directories (open fds, cwds) see new content without a `d_invalidate()` that would detach nested mounts |
-| `compat.h` | `LINUX_VERSION_CODE` guards across kernel versions |
-
-Concurrency: a `dyn_lock` rwsem excludes lookup/readdir during a
-branch-stack change, and every mutation holds it from its
-branch-coverage verdict through the operation that verdict guards;
-superseded per-directory stacks are "parked" on the inode (pinning
-every branch mount they reference) until eviction, since an in-flight
-operation may still hold a pointer into the old stack.
+namespace (`.wh..wh.pxu<seq>` copy-up temps, `.wh..wh.tmp.<seq>` parked
+whiteouts): invisible to the merged view, cleaned up within the
+operation, and — after a crash — swept with the directory like any
+other stale marker.
 
 ## Building
 
@@ -155,8 +139,8 @@ make -C /path/to/kernel/build M=$PWD CONFIG_AUFSNG_FS=m W=1 modules
 
 ## Status
 
-Boot, module activation/deactivation, and copy-up have been verified
-end-to-end, including activating a module on an already-running system.
+Boot, runtime branch add/remove, and copy-up have been verified
+end-to-end, including adding a branch on an already-running system.
 The full-tree review rework (whiteout ordering, udba=reval positive
 revalidation, branch-add splicing, readdir caching) compiles clean but
 has not yet been re-verified on a live system.
