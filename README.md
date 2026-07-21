@@ -153,7 +153,7 @@ sed -i '/obj-\$(CONFIG_OVERLAY_FS)\s*+= overlayfs\//a obj-$(CONFIG_AUFSNG_FS)\t+
 echo "CONFIG_AUFSNG_FS=y" >> .config
 ```
 
-Then build the kernel as usual (`make olddefconfig && make`).
+Then build the kernel as usual.
 
 For a quick out-of-tree test build against an already-built kernel tree
 (producing a loadable `.ko` instead, no `fs/Kconfig`/`fs/Makefile` edits
