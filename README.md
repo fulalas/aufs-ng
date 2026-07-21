@@ -59,7 +59,7 @@ Also, some `aufs` features are intentionally out of scope:
 Estimated from code comparison against the original `aufs`, not from
 benchmarks.
 
-**CPU** — biggest difference shows on cached, syscall-heavy workloads.
+**CPU** — biggest gain shows on cached, syscall-heavy workloads.
 
 - **Reads and writes** — `aufs` takes a filesystem-wide lock on every
   call; `aufs-ng` hands opened files to the kernel's backing-file API
