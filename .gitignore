@@ -1,0 +1,10 @@
+/linux-*/
+/tests-guest.log
+
+# out-of-tree module build artifacts (see README)
+*.o
+*.mod
+*.mod.c
+.*.cmd
+modules.order
+Module.symvers
