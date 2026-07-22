@@ -65,7 +65,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=52; PASS=0; FAIL=0
+	N=0; TOTAL=55; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -314,6 +314,28 @@ guest_main() {
 		&& ok "merged dir nlink counts all branches" \
 		|| bad "merged dir nlink counts all branches (got $(stat -c %h $U/md), want $exp)"
 
+	echo "=== 19. hardlink siblings vs branch add (per-name revalidation) ==="
+	# ha and hb share one union inode; the added branch whiteouts ONLY
+	# hb.  Both dentries are PINNED with open fds across the remount:
+	# this kernel's reconfigure_super() shrinks the dcache on every
+	# remount, so unpinned dentries get flushed by the VFS itself and
+	# only pinned ones exercise aufs-ng's own revalidation.  ha is
+	# then deliberately revalidated first: with a shared (per-inode)
+	# generation stamp, ha's pass would mask hb's needed re-check and
+	# hb would stay visible - the gate must be per-name (d_time).
+	echo hardlinked > $L1/ha
+	ln $L1/ha $L1/hb
+	exec 8<$U/ha 9<$U/hb                             # pin both dentries
+	touch $L3/.wh.hb                                 # new branch hides ONLY hb
+	$M aufs aufs $U "add=1:$L3=rr" 32
+	cat $U/ha >/dev/null 2>&1                        # sibling revalidates FIRST
+	check "hardlink ha still visible after add" grep -q hardlinked $U/ha
+	checkfail "whiteouted sibling hb hidden after add" test -e $U/hb
+	exec 8<&- 9<&-
+	$M aufs aufs $U "del=$L3" 32
+	check "hb returns after branch removal" grep -q hardlinked $U/hb
+	rm -f $L3/.wh.hb
+
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.
 	if [ "$N" != "$TOTAL" ]; then
@@ -441,7 +463,7 @@ aufsng_fetch_kernel() {
 }
 
 host_main() {
-	local self here repo JOBS TIMEOUT KDIR work log fails warnpat status d
+	local self here repo JOBS TIMEOUT KDIR work log fails warnpat status d f lock
 
 	self=$(readlink -f "$0")
 	here=$(dirname "$self")
@@ -470,28 +492,57 @@ host_main() {
 	fi
 	echo "run-tests: kernel tree: $KDIR"
 
+	# One run per tree: cp/sed/config/make/boot on a shared tree
+	# interleave destructively, and the grep||sed integration guards
+	# below are not atomic (two racing runs would both insert).
+	lock="$KDIR/.aufsng-run-tests.lock"
+	if ! mkdir "$lock" 2>/dev/null; then
+		echo "run-tests: another instance is using $KDIR (if stale: rmdir '$lock')" >&2
+		exit 2
+	fi
 	work=$(mktemp -d)
-	trap 'rm -rf "$work"' EXIT
+	trap 'rm -rf "$work"; rmdir "$lock" 2>/dev/null' EXIT
 
 	# 1. Wire aufs-ng into the tree (idempotent; the README's documented
-	#    integration, with the overlayfs entries as anchors).
+	#    integration, with the overlayfs entries as anchors).  The copy
+	#    is content-guarded: a plain cp would refresh every mtime and
+	#    force kbuild to rebuild all objects + relink the UML binary on
+	#    every run, even with no source change.
 	mkdir -p "$KDIR/fs/aufs-ng"
-	cp "$repo"/*.c "$repo"/*.h "$repo"/Kconfig "$repo"/Makefile "$KDIR/fs/aufs-ng/" || exit
+	for f in "$repo"/*.c "$repo"/*.h "$repo"/Kconfig "$repo"/Makefile; do
+		cmp -s "$f" "$KDIR/fs/aufs-ng/${f##*/}" 2>/dev/null ||
+			cp "$f" "$KDIR/fs/aufs-ng/" || exit
+	done
 	grep -q 'fs/aufs-ng/Kconfig' "$KDIR/fs/Kconfig" ||
 		sed -i '/source "fs\/overlayfs\/Kconfig"/a source "fs/aufs-ng/Kconfig"' "$KDIR/fs/Kconfig"
 	grep -q 'aufs-ng/' "$KDIR/fs/Makefile" ||
 		sed -i '/obj-\$(CONFIG_OVERLAY_FS)\s*+= overlayfs\//a obj-$(CONFIG_AUFSNG_FS)\t+= aufs-ng/' "$KDIR/fs/Makefile"
+	if ! grep -q 'fs/aufs-ng/Kconfig' "$KDIR/fs/Kconfig" ||
+	   ! grep -q 'aufs-ng/' "$KDIR/fs/Makefile"; then
+		echo "run-tests: could not wire aufs-ng into $KDIR (the overlayfs" >&2
+		echo "run-tests: anchor lines in fs/Kconfig / fs/Makefile were not found;" >&2
+		echo "run-tests: integrate manually as the top-level README describes)" >&2
+		exit 1
+	fi
 
 	# 2. Configure for ARCH=um with aufs-ng and the debug instrumentation
-	#    the suite relies on (lockdep also implies PROVE_RCU).  An
-	#    existing UML config with aufs-ng enabled is reused so repeated
-	#    runs are incremental; anything else is reset.
-	if ! grep -qs '^CONFIG_UML=y' "$KDIR/.config" ||
-	   ! grep -qs '^CONFIG_AUFSNG_FS=y' "$KDIR/.config"; then
-		if [ -f "$KDIR/.config" ]; then
-			echo "run-tests: existing .config is not a UML+aufs-ng config, resetting the tree"
+	#    the suite relies on (lockdep also implies PROVE_RCU).  A UML
+	#    config with aufs-ng enabled is reused so repeated runs are
+	#    incremental; a UML config without it (an interrupted earlier
+	#    run) is re-generated in place.  A FOREIGN .config is never
+	#    touched - wiping a caller's kernel tree is not this script's
+	#    call.
+	if [ -f "$KDIR/.config" ] && ! grep -qs '^CONFIG_UML=y' "$KDIR/.config"; then
+		echo "run-tests: $KDIR has a non-UML .config; refusing to touch it." >&2
+		echo "run-tests: point KERNEL_SRC at another tree, or clean this one" >&2
+		echo "run-tests: yourself (make mrproper) if you really mean it." >&2
+		exit 2
+	fi
+	if ! grep -qs '^CONFIG_AUFSNG_FS=y' "$KDIR/.config"; then
+		# no .config, but possibly build state from another ARCH:
+		# mrproper is safe here - there is no config to lose
+		[ -f "$KDIR/.config" ] ||
 			make -C "$KDIR" mrproper >/dev/null || exit
-		fi
 		make -C "$KDIR" ARCH=um defconfig >/dev/null || exit
 		"$KDIR/scripts/config" --file "$KDIR/.config" \
 			--enable AUFSNG_FS \
@@ -500,6 +551,14 @@ host_main() {
 			--enable DEBUG_ATOMIC_SLEEP || exit
 	fi
 	make -C "$KDIR" ARCH=um olddefconfig >/dev/null || exit
+	# The integration must have taken effect: otherwise olddefconfig
+	# silently drops the unknown symbol, the kernel builds WITHOUT
+	# aufs-ng, and every check fails with a generic mount error.
+	if ! grep -qs '^CONFIG_AUFSNG_FS=y' "$KDIR/.config"; then
+		echo "run-tests: CONFIG_AUFSNG_FS did not survive configuration -" >&2
+		echo "run-tests: aufs-ng is not wired into $KDIR correctly" >&2
+		exit 1
+	fi
 
 	echo "run-tests: building UML kernel (-j$JOBS)..."
 	make -C "$KDIR" ARCH=um -j"$JOBS" >"$work/build.log" 2>&1 || {
@@ -520,9 +579,14 @@ host_main() {
 	#    so the dispatch takes the guest path.  The full console is
 	#    captured to a log for judging, while the live view is filtered
 	#    to just the section headers, per-check progress, and summary.
+	# panic_on_warn turns ANY kernel warning into a guest death (no
+	# TESTS-COMPLETE -> run fails), catching warning formats the
+	# warnpat grep below could miss; panic=-1 makes the dead guest
+	# exit immediately instead of hanging until the timeout.
 	log="$work/guest.log"
 	echo "run-tests: booting UML guest (timeout ${TIMEOUT}s)..."
 	timeout -k 5 "$TIMEOUT" "$KDIR/linux" mem=1024M rootfstype=hostfs rw \
+		panic_on_warn=1 panic=-1 \
 		init="$work/run-tests.sh" AUFSNG_TEST_GUEST=1 2>&1 \
 		| tee "$log" \
 		| grep --line-buffered -E '^===|^[0-9]+/[0-9]+ |^RESULT:'

@@ -26,10 +26,10 @@ lockdep/RCU/BUG findings. Each check streams to your terminal as it
 runs:
 
 ```
-1/52 - mount... PASSED
-2/52 - merge: l1 wins dir/file... PASSED
+1/55 - mount... PASSED
+2/55 - merge: l1 wins dir/file... PASSED
 ...
-RESULT: PASS=52 FAIL=0
+RESULT: PASS=55 FAIL=0
 run-tests: OK - all checks passed, kernel log clean
 ```
 
@@ -66,7 +66,7 @@ plus this README.
 
 ## What is covered
 
-The suite currently runs **52 checks**:
+The suite currently runs **55 checks**:
 
 - mount, merge order, whiteout semantics (delete/resurrect, readdir
   hiding, opaque directories)
@@ -82,8 +82,9 @@ The suite currently runs **52 checks**:
   victim rolls back
 - copy-up fidelity: a multi-block file's data copied byte-for-byte,
   with mode and owner preserved and `st_ino` stable across the copy-up
-- copy-up of lower hardlink siblings; rmdir when the upper directory
-  vanished out-of-band
+- copy-up of lower hardlink siblings; per-name revalidation of
+  hardlink siblings when a branch add whiteouts only one of them;
+  rmdir when the upper directory vanished out-of-band
 - reading a lower symlink through the union (`get_link`) and copying a
   symlink up (`set_attr_from` skips `ATTR_MODE` for symlinks); merged
   directory link count across branches (`getattr`)
@@ -98,6 +99,6 @@ Append a block to the **guest section** of `run-tests.sh`
 tmpfs branches you create (`$M tmpfs tmpfs <dir>`). Keep each check's
 description unique — a failure's `TEST-FAIL:` marker is grepped
 verbatim by the host judge. Then bump **`TOTAL`** in `guest_main()`
-(and the "42 checks" count above); the suite asserts `TOTAL` matches
-the number of checks actually run, so a stale count fails the run
-loudly rather than silently.
+(and the check count at the top of "What is covered"); the suite
+asserts `TOTAL` matches the number of checks actually run, so a stale
+count fails the run loudly rather than silently.
