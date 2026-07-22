@@ -49,7 +49,7 @@ set -u
 # GUEST SIDE - runs as PID 1 inside UML.  Every check prints one
 # "N/TOTAL - name... PASSED|FAILED" line (green/red); a failure also
 # emits a plain "TEST-FAIL:" marker the host judge greps for.  The
-# suite ends with a RESULT: summary and TESTS-COMPLETE, then powers
+# suite ends with a PASS=/FAIL= summary and TESTS-COMPLETE, then powers
 # off.  TOTAL must match the number of checks on the all-pass path -
 # the tail asserts it, so a stale count fails the suite loudly.
 # ====================================================================
@@ -339,12 +339,12 @@ guest_main() {
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.
 	if [ "$N" != "$TOTAL" ]; then
-		echo "TEST-FAIL: ran $N checks but TOTAL=$TOTAL (update TOTAL and the README count)"
+		echo "TEST-FAIL: ran $N checks but TOTAL=$TOTAL (update TOTAL)"
 		FAIL=$((FAIL+1))
 	fi
 
 	echo "==================================================="
-	echo "RESULT: PASS=$PASS FAIL=$FAIL"
+	echo "PASS=$PASS FAIL=$FAIL"
 	dmesg | grep -iE "BUG|WARN|lockdep|suspicious|circular|use-after-free|KASAN|sleeping function" | head -25
 	echo "TESTS-COMPLETE"
 	$M -o
@@ -589,7 +589,7 @@ host_main() {
 		panic_on_warn=1 panic=-1 \
 		init="$work/run-tests.sh" AUFSNG_TEST_GUEST=1 2>&1 \
 		| tee "$log" \
-		| grep --line-buffered -E '^===|^[0-9]+/[0-9]+ |^RESULT:'
+		| grep --line-buffered -E '^===|^[0-9]+/[0-9]+ |^PASS='
 
 	# 5. Judge: the suite must have completed, with zero failures and a
 	#    kernel log free of lockdep/RCU/BUG findings.
@@ -599,7 +599,7 @@ host_main() {
 		tail -30 "$log" >&2
 		status=1
 	fi
-	fails=$(sed -n 's/.*RESULT: PASS=[0-9]* FAIL=\([0-9]*\).*/\1/p' "$log" | tail -1)
+	fails=$(sed -n 's/^PASS=[0-9]* FAIL=\([0-9]*\).*/\1/p' "$log" | tail -1)
 	if [ "${fails:-1}" != 0 ]; then
 		echo "run-tests: ${fails:-?} check(s) FAILED:" >&2
 		grep "TEST-FAIL:" "$log" | sed 's/^/  /' >&2
@@ -613,10 +613,11 @@ host_main() {
 	fi
 
 	if [ "$status" = 0 ]; then
-		echo "run-tests: OK - all checks passed, kernel log clean"
+		printf 'RESULT: \033[1;32mSUCCESS\033[0m\n'
 	else
 		cp "$log" "$repo/tests-guest.log" 2>/dev/null &&
 			echo "run-tests: full guest log kept at tests-guest.log" >&2
+		printf 'RESULT: \033[1;31mFAILURE\033[0m\n'
 	fi
 	exit $status
 }
