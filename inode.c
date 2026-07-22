@@ -10,6 +10,7 @@
 #include <linux/cred.h>
 #include <linux/xattr.h>
 #include <linux/stat.h>
+#include <linux/rcupdate.h>
 #include "aufsng.h"
 
 static int aufsng_getattr(struct mnt_idmap *idmap, const struct path *path,
@@ -38,15 +39,25 @@ static int aufsng_getattr(struct mnt_idmap *idmap, const struct path *path,
 	 * find-style tools use nlink-2 as the subdirectory count.
 	 */
 	if (S_ISDIR(inode->i_mode)) {
-		struct aufsng_entry *oe = AUFSNG_I_E(inode);
-		unsigned int i = aufsng_upperdentry(inode) ? 0 : 1;
+		struct aufsng_entry *oe;
+		unsigned int i;
 
+		/*
+		 * RCU-protect the walk: the ROOT's superseded entry is
+		 * freed one grace period after a branch change, and
+		 * nothing else pins it for this lockless reader (non-root
+		 * stacks are instead parked on the inode until eviction).
+		 */
+		rcu_read_lock();
+		oe = AUFSNG_I_E(inode);
+		i = aufsng_upperdentry(inode) ? 0 : 1;
 		for (; oe && i < oe->numlower; i++) {
 			unsigned int n =
 				d_inode(oe->lowerstack[i].dentry)->i_nlink;
 
 			stat->nlink += n >= 2 ? n - 2 : 0;
 		}
+		rcu_read_unlock();
 	}
 
 	return 0;

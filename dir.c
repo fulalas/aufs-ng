@@ -167,6 +167,37 @@ struct dentry *aufsng_create_slot(struct dentry *upperdir,
 	return ERR_PTR(-EEXIST);
 }
 
+/*
+ * Best-effort removal of an upper object that a failed or superseded
+ * multi-step operation left behind (a partially created object, a
+ * copy-up temp, a parked whiteout).  Left in place it would leak:
+ * hidden behind a restored whiteout it makes every retry fail with
+ * EEXIST, and visible it shadows lower content with a half-built
+ * object.  A removal failure means the branch fs is in serious
+ * trouble; log it, the leftover stays.
+ */
+void aufsng_remove_object(struct aufsng_fs *pfs, struct dentry *upperdir,
+		       const struct qstr *name, bool is_dir)
+{
+	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	struct qstr q = QSTR_LEN(name->name, name->len);
+	struct dentry *slot;
+	int err;
+
+	slot = start_removing_noperm(upperdir, &q);
+	err = PTR_ERR_OR_ZERO(slot);
+	if (!err) {
+		if (is_dir)
+			err = vfs_rmdir(idmap, d_inode(upperdir), slot, NULL);
+		else
+			err = vfs_unlink(idmap, d_inode(upperdir), slot, NULL);
+		end_dirop(slot);
+	}
+	if (err)
+		pr_err("aufs (aufs-ng): failed to remove leftover '%.*s' (%d)\n",
+		       name->len, name->name, err);
+}
+
 static atomic_t aufsng_whtmp_seq = ATOMIC_INIT(0);
 
 /*
@@ -221,42 +252,36 @@ static void aufsng_unpark_whiteout(struct aufsng_fs *pfs,
 				const struct qstr *name,
 				struct qstr *tmp, bool restore)
 {
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	struct renamedata rd = {};
+	char whbuf[NAME_MAX + 1];
+	struct qstr wh;
 	int err;
 
-	if (restore) {
-		struct renamedata rd = {};
-		char whbuf[NAME_MAX + 1];
-		struct qstr wh;
+	if (!restore) {
+		/* the drop is a plain leftover removal; failure logged there */
+		aufsng_remove_object(pfs, upperdir, tmp, false);
+		return;
+	}
 
-		err = aufsng_wh_name(whbuf, name, &wh);
-		if (!err) {
-			rd.mnt_idmap = idmap;
-			rd.old_parent = upperdir;
-			rd.new_parent = upperdir;
-			err = start_renaming(&rd, 0, tmp, &wh);
-		}
-		if (!err) {
-			err = vfs_rename(&rd);
-			end_renaming(&rd);
-		}
-	} else {
-		struct dentry *slot = start_removing_noperm(upperdir, tmp);
-
-		err = PTR_ERR_OR_ZERO(slot);
-		if (!err) {
-			err = vfs_unlink(idmap, d_inode(upperdir), slot, NULL);
-			end_dirop(slot);
-		}
+	err = aufsng_wh_name(whbuf, name, &wh);
+	if (!err) {
+		rd.mnt_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+		rd.old_parent = upperdir;
+		rd.new_parent = upperdir;
+		err = start_renaming(&rd, 0, tmp, &wh);
+	}
+	if (!err) {
+		err = vfs_rename(&rd);
+		end_renaming(&rd);
 	}
 	/*
-	 * Both directions are metadata-only operations on entries this
-	 * call just manipulated; failure means the branch fs is in
-	 * serious trouble.  The parked name stays hidden either way.
+	 * A metadata-only operation on an entry this call just parked;
+	 * failure means the branch fs is in serious trouble.  The
+	 * parked name stays hidden either way.
 	 */
 	if (err)
-		pr_err("aufs (aufs-ng): failed to %s parked whiteout '%.*s' (%d)\n",
-		       restore ? "restore" : "drop", tmp->len, tmp->name, err);
+		pr_err("aufs (aufs-ng): failed to restore parked whiteout '%.*s' (%d)\n",
+		       tmp->len, tmp->name, err);
 }
 
 struct aufsng_create_args {
@@ -379,7 +404,7 @@ static int aufsng_create_object(struct dentry *dentry,
 		err = aufsng_mark_diropq(pfs, upper);
 		if (err) {
 			dput(upper);
-			goto out_unpark;
+			goto out_remove;
 		}
 	}
 
@@ -387,7 +412,7 @@ static int aufsng_create_object(struct dentry *dentry,
 	if (!oe) {
 		dput(upper);
 		err = -ENOMEM;
-		goto out_unpark;
+		goto out_remove;
 	}
 	if (oe->numlower) {
 		oe->lowerstack[0] = origin;
@@ -396,13 +421,22 @@ static int aufsng_create_object(struct dentry *dentry,
 	inode = aufsng_get_inode(dentry->d_sb, upper, oe);
 	if (IS_ERR(inode)) {
 		err = PTR_ERR(inode);
-		goto out_unpark;
+		goto out_remove;
 	}
 	d_instantiate(dentry, inode);
 
 	atomic64_inc(&AUFSNG_I(dir)->version);
 	aufsng_copyattr(dir);
+	goto out_unpark;
 
+out_remove:
+	/*
+	 * The object was created but the operation failed after it:
+	 * without this removal it stays behind - hidden by the restored
+	 * whiteout it turns every retry into EEXIST, and unhidden it is
+	 * a directory missing its opaque marker.
+	 */
+	aufsng_remove_object(pfs, pupper, &dentry->d_name, is_dir);
 out_unpark:
 	if (parked)
 		aufsng_unpark_whiteout(pfs, pupper, &dentry->d_name, &whtmp,
@@ -616,6 +650,22 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 		slot = start_removing_noperm(pupper, &q);
 		if (IS_ERR(slot)) {
 			err = PTR_ERR(slot);
+			/*
+			 * No upper entry under THIS name: the inode's
+			 * upperdentry is a copied-up lower hardlink
+			 * sibling (lower links share one union inode,
+			 * whose single upperdentry carries whichever
+			 * name was copied up first).  The name itself is
+			 * lower-only, so the whiteout created above is
+			 * the whole removal.  Directories cannot be
+			 * hardlinks, so this never applies to them: a
+			 * dir upper missing its name (out-of-band
+			 * rename in the rw branch) keeps failing, as it
+			 * always did, rather than skipping the
+			 * clear_whiteouts + rmdir it still needs.
+			 */
+			if (err == -ENOENT && !is_dir)
+				err = 0;
 		} else {
 			if (is_dir) {
 				/* union-empty: only whiteouts/opq remain inside */
@@ -713,8 +763,15 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	struct renamedata rd = {};
 	struct aufsng_entry *oe = AUFSNG_I_E(d_inode(old));
 	struct dentry *newupperdir;
-	bool had_victim = d_is_positive(new);
-	bool replace_dir = had_victim && d_is_dir(new);
+	/*
+	 * Rollback safety hinges on whether the underlying upper rename
+	 * destroyed something, not on union visibility: a victim that
+	 * exists only in a lower branch has no upper entry, so the
+	 * rename created the upper name and undoing it is loss-free.
+	 */
+	bool had_victim = d_is_positive(new) &&
+			  aufsng_upperdentry(d_inode(new));
+	bool replace_dir = d_is_positive(new) && d_is_dir(new);
 	char whtmpbuf[NAME_MAX + 1];
 	struct qstr whtmp;
 	int parked = 0;

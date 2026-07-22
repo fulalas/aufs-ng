@@ -81,7 +81,7 @@ struct aufsng_config {
 	char **br_paths;
 	char (*br_perms)[AUFSNG_PERM_LEN];
 	char *xino_path;	/* accepted, not functionally used */
-	unsigned int udba;	/* accepted, not functionally used */
+	unsigned int udba;	/* AUFSNG_UDBA_*; see aufsng_udba_reval() */
 	unsigned int maxbranch;
 };
 
@@ -92,6 +92,13 @@ struct aufsng_fs {
 	unsigned int numlayer_cap;	/* maxbranch + 1, allocated up front */
 	struct aufsng_layer *layers;	/* [0] rw branch, [1..] ro branches */
 	const struct cred *creator_cred;
+	/*
+	 * Bumped once per runtime branch add/remove (AUFS's "sigen"):
+	 * compared against each union inode's origin_gen so positive
+	 * revalidation re-runs the merge decision exactly once per
+	 * branch change (dcache.c), never on ordinary mutations.
+	 */
+	atomic64_t branch_gen;
 	/* excludes lookup/readdir during runtime branch add/remove */
 	struct rw_semaphore dyn_lock;
 	struct backing_file_ctx backing_ctx;
@@ -109,6 +116,14 @@ struct aufsng_inode {
 	struct aufsng_dir_cache *cache;	/* merged readdir cache (dirs) */
 	struct aufsng_dyn_parked *dyn_parked;
 	atomic64_t version;		/* merged readdir cache validity */
+	/*
+	 * pfs->branch_gen value this inode's winning-branch decision was
+	 * last validated against; on mismatch, positive revalidation
+	 * re-runs the origin check (dcache.c).  Kept per-inode (not in
+	 * d_fsdata, which carries the upper-dir stamp) so an ordinary
+	 * write in the parent dir never triggers a branch rescan.
+	 */
+	u64 origin_gen;
 	/* synchronize copy up and more */
 	struct mutex lock;
 	struct inode vfs_inode;
@@ -159,27 +174,45 @@ static inline struct vfsmount *aufsng_upper_mnt(struct aufsng_fs *pfs)
 static inline struct inode *aufsng_inode_real(struct inode *inode)
 {
 	struct dentry *upper = aufsng_upperdentry(inode);
-	struct aufsng_entry *oe;
 
-	if (upper)
-		return d_inode(upper);
-	oe = AUFSNG_I_E(inode);
-	return oe && oe->numlower ? d_inode(oe->lowerstack[0].dentry) : NULL;
+	if (!upper) {
+		struct aufsng_entry *oe = AUFSNG_I_E(inode);
+
+		if (oe && oe->numlower)
+			return d_inode(oe->lowerstack[0].dentry);
+		/* see aufsng_path_real(): a removal raced us, the upper is there */
+		smp_rmb();
+		upper = aufsng_upperdentry(inode);
+	}
+	return upper ? d_inode(upper) : NULL;
 }
 
 static inline void aufsng_path_real(struct inode *inode, struct path *path)
 {
 	struct dentry *upper = aufsng_upperdentry(inode);
 
-	if (upper) {
-		path->mnt = aufsng_upper_mnt(AUFSNG_FS(inode->i_sb));
-		path->dentry = upper;
-	} else {
+	if (!upper) {
 		struct aufsng_entry *oe = AUFSNG_I_E(inode);
 
-		path->mnt = oe->lowerstack[0].layer->mnt;
-		path->dentry = oe->lowerstack[0].dentry;
+		if (oe && oe->numlower) {
+			path->mnt = oe->lowerstack[0].layer->mnt;
+			path->dentry = oe->lowerstack[0].dentry;
+			return;
+		}
+		/*
+		 * NULL upper combined with an empty stack is a torn
+		 * snapshot: a branch removal emptied the stack after
+		 * copying the object up, and it published upperdentry
+		 * before releasing the new stack (same thread), so a
+		 * re-read behind a read barrier must find it.  Pairs
+		 * with the smp_store_release() publishing the stack in
+		 * aufsng_dyn_commit_rebuild().
+		 */
+		smp_rmb();
+		upper = aufsng_upperdentry(inode);
 	}
+	path->mnt = aufsng_upper_mnt(AUFSNG_FS(inode->i_sb));
+	path->dentry = upper;
 }
 
 /*
@@ -197,10 +230,19 @@ static inline bool aufsng_origin_type_ok(struct dentry *origin, umode_t mode)
  * The single definition of "the union inode mirrors the real inode's
  * attributes", shared by first instantiation (aufsng_fill_inode) and
  * every later refresh (aufsng_copyattr).
+ *
+ * i_lock serializes concurrent refreshers: they arrive under different
+ * sleeping locks (oi->lock for copy-up/adopt, i_rwsem for setattr,
+ * none for revalidation and write completion), so without a common
+ * lock two multi-field copies interleave and a permission check can
+ * read a (mode, uid) pair spliced from two generations.  The source
+ * fields are read inside the same section, so the last writer wins
+ * with a coherent snapshot.
  */
 static inline void aufsng_copyattr_from(struct inode *inode,
 					struct inode *realinode)
 {
+	spin_lock(&inode->i_lock);
 	inode->i_uid = realinode->i_uid;
 	inode->i_gid = realinode->i_gid;
 	inode->i_mode = realinode->i_mode;
@@ -209,6 +251,7 @@ static inline void aufsng_copyattr_from(struct inode *inode,
 	inode_set_ctime_to_ts(inode, inode_get_ctime(realinode));
 	i_size_write(inode, i_size_read(realinode));
 	set_nlink(inode, realinode->i_nlink);
+	spin_unlock(&inode->i_lock);
 }
 
 static inline void aufsng_copyattr(struct inode *inode)
@@ -307,6 +350,9 @@ struct aufsng_fs_context {
 	struct path *dyn_del;
 	size_t nr_dyn_del;
 	size_t cap_dyn_del;
+	/* udba= was given explicitly (a replayed remount must not
+	 * reset the mount-time choice to the parser default) */
+	bool udba_set;
 	struct aufsng_config config;
 };
 
@@ -378,6 +424,8 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	       struct dentry *new, unsigned int flags);
 int aufsng_create_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
 			const struct qstr *name);
+void aufsng_remove_object(struct aufsng_fs *pfs, struct dentry *upperdir,
+		       const struct qstr *name, bool is_dir);
 int aufsng_remove_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
 			const struct qstr *name);
 struct dentry *aufsng_create_slot(struct dentry *upperdir,
@@ -385,6 +433,7 @@ struct dentry *aufsng_create_slot(struct dentry *upperdir,
 
 /* dcache.c */
 extern const struct dentry_operations aufsng_dentry_operations;
+unsigned long aufsng_reval_stamp(struct aufsng_fs *pfs, struct inode *dir);
 
 /* dynlayer.c */
 int aufsng_dyn_add_branch(struct super_block *sb, const char *name,

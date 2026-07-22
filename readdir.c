@@ -30,6 +30,7 @@
 #include <linux/cred.h>
 #include <linux/rbtree.h>
 #include <linux/iversion.h>
+#include <linux/rcupdate.h>
 #include "aufsng.h"
 
 struct aufsng_cache_entry {
@@ -436,21 +437,35 @@ static bool aufsng_dir_cache_fresh(struct aufsng_fs *pfs, struct inode *inode,
 	struct dentry *upper;
 	struct aufsng_entry *oe;
 	unsigned int i;
+	bool fresh = true;
 
 	if (!aufsng_udba_reval(pfs))
 		return true;
+	/*
+	 * RCU-protect the branch-stack walk: oi->lock (held by the
+	 * caller) does not cover the ROOT's entry, which the root swap
+	 * replaces under dyn_lock only and frees one grace period later
+	 * (non-root stacks are parked on the inode until eviction).
+	 */
+	rcu_read_lock();
 	upper = aufsng_upperdentry(inode);
 	oe = AUFSNG_I_E(inode);
-	if (cache->nr_stamps != 1 + (oe ? oe->numlower : 0))
-		return false;
-	if (!aufsng_stamp_match(&cache->stamps[0],
-			     upper ? d_inode(upper) : NULL))
-		return false;
-	for (i = 0; oe && i < oe->numlower; i++)
+	if (cache->nr_stamps != 1 + (oe ? oe->numlower : 0) ||
+	    !aufsng_stamp_match(&cache->stamps[0],
+			     upper ? d_inode(upper) : NULL)) {
+		fresh = false;
+		goto out;
+	}
+	for (i = 0; oe && i < oe->numlower; i++) {
 		if (!aufsng_stamp_match(&cache->stamps[1 + i],
-				     d_inode(oe->lowerstack[i].dentry)))
-			return false;
-	return true;
+				     d_inode(oe->lowerstack[i].dentry))) {
+			fresh = false;
+			break;
+		}
+	}
+out:
+	rcu_read_unlock();
+	return fresh;
 }
 
 static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
