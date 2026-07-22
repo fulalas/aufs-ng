@@ -33,10 +33,16 @@ RESULT: PASS=52 FAIL=0
 run-tests: OK - all checks passed, kernel log clean
 ```
 
+The kernel tree is looked for as `linux-*/` first in `tests/`, then in
+the aufs-ng folder above it. If neither has one, the latest stable
+kernel is downloaded from kernel.org (via `curl` or `wget`) into the
+aufs-ng folder — so the very first run on a fresh checkout is
+self-contained, at the cost of a one-time download plus full build.
+
 The first build takes a few minutes; reruns are incremental. Knobs:
-`KERNEL_SRC` (kernel tree), `JOBS` (default `nproc`), `TIMEOUT` (guest
-limit, default 300 s). On failure the full guest log is kept at
-`tests-guest.log` in the repo root.
+`KERNEL_SRC` (skip the search and use this tree), `JOBS` (default
+`nproc`), `TIMEOUT` (guest limit, default 300 s). On failure the full
+guest log is kept at `tests-guest.log` in the repo root.
 
 ## How it works
 

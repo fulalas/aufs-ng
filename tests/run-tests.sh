@@ -4,6 +4,10 @@
 #   tests/run-tests.sh                      # kernel tree autodetected (linux-*/)
 #   KERNEL_SRC=/path/to/linux tests/run-tests.sh
 #
+# The kernel tree is looked for as linux-*/ in tests/ and then in the
+# aufs-ng folder above it; if neither exists, the latest stable kernel
+# is downloaded from kernel.org into the aufs-ng folder.
+#
 # It builds a User-Mode Linux kernel with aufs-ng built in (plus
 # lockdep/RCU/atomic-sleep debugging) and boots it to run the
 # behavioral checks.  No root needed, and the running system is never
@@ -377,6 +381,65 @@ int main(int argc, char **argv)
 EOF
 }
 
+# Download and extract the latest stable kernel from kernel.org into
+# $1, echoing the resulting tree path on stdout (all progress goes to
+# stderr).  Used only when no local linux-*/ tree is found.
+aufsng_fetch_kernel() {
+	local dest=$1 tool latest major url tarball
+
+	if command -v curl >/dev/null 2>&1; then tool=curl
+	elif command -v wget >/dev/null 2>&1; then tool=wget
+	else
+		echo "run-tests: no kernel tree found, and neither curl nor wget is installed to download one" >&2
+		echo "run-tests: install one, or set KERNEL_SRC=/path/to/linux" >&2
+		return 1
+	fi
+
+	# the current stable version, straight from kernel.org's banner
+	if [ "$tool" = curl ]; then
+		latest=$(curl -fsSL https://www.kernel.org/finger_banner)
+	else
+		latest=$(wget -qO- https://www.kernel.org/finger_banner)
+	fi
+	latest=$(printf '%s\n' "$latest" | \
+		 sed -n 's/^The latest stable version of the Linux kernel is:[[:space:]]*//p' | \
+		 head -1 | tr -d '[:space:]')
+	if [ -z "$latest" ]; then
+		echo "run-tests: could not determine the latest stable kernel from kernel.org" >&2
+		return 1
+	fi
+
+	if [ -f "$dest/linux-$latest/Makefile" ]; then	# already downloaded
+		printf '%s\n' "$dest/linux-$latest"
+		return 0
+	fi
+
+	major=${latest%%.*}
+	url="https://cdn.kernel.org/pub/linux/kernel/v$major.x/linux-$latest.tar.xz"
+	tarball="$dest/linux-$latest.tar.xz"
+
+	echo "run-tests: no local kernel tree; downloading Linux $latest from kernel.org..." >&2
+	if [ "$tool" = curl ]; then
+		curl -fL --progress-bar -o "$tarball" "$url" >&2
+	else
+		wget -O "$tarball" "$url" >&2
+	fi || { echo "run-tests: download failed: $url" >&2; rm -f "$tarball"; return 1; }
+
+	echo "run-tests: extracting linux-$latest.tar.xz..." >&2
+	if ! tar -C "$dest" -xf "$tarball"; then
+		echo "run-tests: extraction failed (need tar with xz support)" >&2
+		rm -f "$tarball"
+		return 1
+	fi
+	rm -f "$tarball"
+
+	if [ ! -f "$dest/linux-$latest/Makefile" ]; then
+		echo "run-tests: downloaded kernel tree looks incomplete" >&2
+		return 1
+	fi
+	printf '%s\n' "$dest/linux-$latest"
+}
+
 host_main() {
 	local self here repo JOBS TIMEOUT KDIR work log fails warnpat status d
 
@@ -388,15 +451,21 @@ host_main() {
 
 	KDIR=${KERNEL_SRC:-}
 	if [ -z "$KDIR" ]; then
-		for d in "$repo"/linux-*/; do
+		# look in tests/ first, then the aufs-ng folder above it
+		for d in "$here"/linux-*/ "$repo"/linux-*/; do
 			if [ -f "${d}Makefile" ] && [ -d "${d}fs" ]; then
 				KDIR=${d%/}
 				break
 			fi
 		done
 	fi
-	if [ -z "$KDIR" ] || [ ! -f "$KDIR/Makefile" ]; then
-		echo "run-tests: no kernel source tree found; set KERNEL_SRC=/path/to/linux" >&2
+	if [ -z "$KDIR" ]; then
+		# nothing local: fetch the latest stable kernel into the
+		# aufs-ng folder (gitignored as /linux-*/)
+		KDIR=$(aufsng_fetch_kernel "$repo") || exit 1
+	fi
+	if [ ! -f "$KDIR/Makefile" ]; then
+		echo "run-tests: no kernel source tree at '$KDIR'" >&2
 		exit 2
 	fi
 	echo "run-tests: kernel tree: $KDIR"

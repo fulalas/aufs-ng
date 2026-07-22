@@ -1,4 +1,5 @@
 /linux-*/
+/linux-*.tar.*
 /tests-guest.log
 
 # out-of-tree module build artifacts (see README)
