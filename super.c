@@ -332,7 +332,13 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 				ctx->br[i].name);
 			goto out_free;
 		}
-		if (ctx->br[i].perm != AUFSNG_BR_RW)
+		/*
+		 * Only branch 0 is ever written (see README: "only the
+		 * first branch can be" rw); a lower branch declared rw is
+		 * accepted for AUFS grammar compatibility but its private
+		 * clone is read-only like every other lower.
+		 */
+		if (i > 0 || ctx->br[i].perm != AUFSNG_BR_RW)
 			mnt->mnt_flags |= MNT_READONLY | MNT_NOATIME;
 
 		pfs->layers[i].mnt = mnt;
@@ -373,7 +379,7 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 	root_inode->i_gid = rw_inode->i_gid;
 	root_inode->i_op = &aufsng_dir_inode_operations;
 	root_inode->i_fop = &aufsng_dir_operations;
-	set_nlink(root_inode, 1);
+	set_nlink(root_inode, rw_inode->i_nlink);
 	simple_inode_init_ts(root_inode);
 
 	AUFSNG_I(root_inode)->oe = oe;

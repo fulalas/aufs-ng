@@ -631,9 +631,21 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 		}
 		if (err) {
 			/* roll the pre-created whiteout back */
-			if (covered)
-				aufsng_remove_whiteout(pfs, pupper,
-						    &dentry->d_name);
+			if (covered) {
+				int wherr = aufsng_remove_whiteout(pfs, pupper,
+							&dentry->d_name);
+
+				/*
+				 * Unrecoverable: the whiteout now masks a
+				 * name whose removal just failed, so still-
+				 * live content is hidden until the marker is
+				 * removed from the branch by hand.
+				 */
+				if (wherr)
+					pr_err("aufs (aufs-ng): failed to roll back whiteout '%.*s' (%d), the name stays hidden\n",
+					       dentry->d_name.len,
+					       dentry->d_name.name, wherr);
+			}
 			goto out;
 		}
 	}
@@ -664,6 +676,33 @@ int aufsng_rmdir(struct inode *dir, struct dentry *dentry)
 	return aufsng_do_remove(dentry, true);
 }
 
+/*
+ * Undo a just-committed upper rename: move the (still-locked-out from
+ * the union's point of view) new name back to the old one.  Metadata-
+ * only, needs no space, so it succeeds even on the full branch that
+ * typically made the caller want to undo.
+ */
+static int aufsng_rename_back(struct aufsng_fs *pfs, struct dentry *oldparent,
+			   const struct qstr *oldname,
+			   struct dentry *newparent,
+			   const struct qstr *newname)
+{
+	struct renamedata rd = {};
+	struct qstr oldq = QSTR_LEN(oldname->name, oldname->len);
+	struct qstr newq = QSTR_LEN(newname->name, newname->len);
+	int err;
+
+	rd.mnt_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	rd.old_parent = newparent;
+	rd.new_parent = oldparent;
+	err = start_renaming(&rd, 0, &newq, &oldq);
+	if (!err) {
+		err = vfs_rename(&rd);
+		end_renaming(&rd);
+	}
+	return err;
+}
+
 int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	       struct dentry *old, struct inode *newdir,
 	       struct dentry *new, unsigned int flags)
@@ -674,7 +713,8 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	struct renamedata rd = {};
 	struct aufsng_entry *oe = AUFSNG_I_E(d_inode(old));
 	struct dentry *newupperdir;
-	bool replace_dir = d_is_positive(new) && d_is_dir(new);
+	bool had_victim = d_is_positive(new);
+	bool replace_dir = had_victim && d_is_dir(new);
 	char whtmpbuf[NAME_MAX + 1];
 	struct qstr whtmp;
 	int parked = 0;
@@ -786,11 +826,24 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 		int wherr = aufsng_create_whiteout(pfs, aufsng_upperdentry(olddir),
 						&old->d_name);
 		/*
-		 * The rename already committed; report success either
-		 * way; failing here (e.g. ENOSPC) would tell the VFS a
-		 * rename that in fact happened did not, and it would
-		 * never retry the whiteout on its own.
+		 * Without the whiteout, lower content the old name was
+		 * shadowing resurfaces beside the renamed file.  Undo the
+		 * rename - metadata-only, needs no space even on the ENOSPC
+		 * that typically lands here - and fail cleanly.  Only
+		 * possible when the rename replaced nothing: a replaced
+		 * victim is already destroyed, so undoing would lose the
+		 * new name too; then (or if the undo itself fails) the
+		 * rename stands, is reported as success (the VFS would
+		 * never retry the whiteout on its own), and the resurfacing
+		 * is warned about.
 		 */
+		if (wherr && !had_victim &&
+		    !aufsng_rename_back(pfs, aufsng_upperdentry(olddir),
+				     &old->d_name, newupperdir,
+				     &new->d_name)) {
+			err = wherr;
+			goto out_unpark;
+		}
 		if (wherr)
 			pr_err("aufs (aufs-ng): failed to cover renamed-away '%.*s' (%d), it may resurface\n",
 			       old->d_name.len, old->d_name.name, wherr);
@@ -801,14 +854,34 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	 * provide must be marked opaque, exactly as mkdir over that
 	 * name would be (AUFS's rename DIROPQ): without the marker the
 	 * deleted lower directory's content would merge into - and
-	 * "resurrect" inside - the renamed directory.  The rename
-	 * committed, so a marker failure is reported but cannot fail
-	 * the operation (same rationale as the whiteout above).
+	 * "resurrect" inside - the renamed directory.  A marker failure
+	 * is unwound like a whiteout failure above, one step deeper:
+	 * remove the whiteout just created for the old name, then undo
+	 * the rename (AUFS's rename reverts here too).  If any undo
+	 * step fails, the rename stands and is reported as success with
+	 * a warning.
 	 */
 	if (covered_new) {
 		int opqerr = aufsng_mark_diropq(pfs,
 					aufsng_upperdentry(d_inode(old)));
 
+		if (opqerr && !had_victim) {
+			int backerr = 0;
+
+			if (covered)
+				backerr = aufsng_remove_whiteout(pfs,
+						aufsng_upperdentry(olddir),
+						&old->d_name);
+			if (!backerr)
+				backerr = aufsng_rename_back(pfs,
+						aufsng_upperdentry(olddir),
+						&old->d_name, newupperdir,
+						&new->d_name);
+			if (!backerr) {
+				err = opqerr;
+				goto out_unpark;
+			}
+		}
 		if (opqerr)
 			pr_err("aufs (aufs-ng): failed to mark renamed dir '%.*s' opaque (%d), deleted lower content may show through\n",
 			       new->d_name.len, new->d_name.name, opqerr);
