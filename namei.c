@@ -322,13 +322,6 @@ struct inode *aufsng_get_inode(struct super_block *sb,
 	inode->i_ino = aufsng_map_ino(key->i_ino, key_idx);
 	AUFSNG_I(inode)->oe = oe;
 	AUFSNG_I(inode)->upperdentry = upperdentry;
-	/*
-	 * The stack this inode was just resolved through belongs to the
-	 * current branch generation (dyn_lock is held), so its first
-	 * revalidation need not re-run the origin check.
-	 */
-	AUFSNG_I(inode)->origin_gen =
-		atomic64_read(&AUFSNG_FS(sb)->branch_gen);
 	unlock_new_inode(inode);
 
 	return inode;
@@ -346,6 +339,7 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 	struct inode *inode = NULL;
 	const struct cred *old_cred;
 	unsigned long stamp;
+	u64 gen;
 	unsigned int i;
 	bool stopped = false;
 	int wh, err = 0;
@@ -373,6 +367,7 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 	pupper = aufsng_upperdentry(dir);
 	/* sampled before the branch probes; see the priming below */
 	stamp = aufsng_reval_stamp(pfs, dir);
+	gen = atomic64_read(&pfs->branch_gen);
 
 	if (pupper) {
 		wh = 0;
@@ -518,16 +513,18 @@ out:
 		return ERR_PTR(err);
 
 	/*
-	 * Prime the upper-dir revalidation stamp with the state this
-	 * lookup just resolved against (sampled before the branch
-	 * probes, so a change landing mid-lookup still forces a
-	 * re-check), sparing the dentry's first revalidation a needless
-	 * upper probe against d_fsdata's initial zero.  The
-	 * branch-generation gate is primed per-inode in
-	 * aufsng_get_inode().
+	 * Prime both revalidation stamps with the state this lookup
+	 * just resolved against (sampled before the branch probes, so a
+	 * change landing mid-lookup still forces a re-check): the
+	 * upper-dir stamp in d_fsdata and the branch generation in
+	 * d_time.  Both are per-dentry - the generation deliberately so,
+	 * because lower hardlink siblings share one union inode while
+	 * the winning-branch decision is per-name (dcache.c).
 	 */
-	if (inode)
+	if (inode) {
 		dentry->d_fsdata = (void *)stamp;
+		dentry->d_time = (unsigned long)gen;
+	}
 
 	return d_splice_alias(inode, dentry);
 }

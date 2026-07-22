@@ -109,7 +109,7 @@ bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 	 * cached inode's ops were fixed at its type, so that falls
 	 * through to ESTALE at the caller.
 	 */
-	if ((d_inode(upperdentry)->i_mode ^ inode->i_mode) & S_IFMT)
+	if (!aufsng_origin_type_ok(upperdentry, inode->i_mode))
 		return false;
 	if (is_dir && (!lowerdentry || !d_is_dir(lowerdentry)))
 		return false;
