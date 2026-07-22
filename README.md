@@ -1,4 +1,4 @@
-# `aufs-ng`
+# aufs-ng
 
 `aufs-ng` is a standalone, from-scratch union filesystem, written to be a
 drop-in kernel-side replacement for `aufs`, aimed mainly at live distros.
