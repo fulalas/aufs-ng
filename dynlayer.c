@@ -571,8 +571,12 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 		err = PTR_ERR(mnt);
 		goto out_name;
 	}
-	if (perm != AUFSNG_BR_RW)
-		mnt->mnt_flags |= MNT_READONLY | MNT_NOATIME;
+	/*
+	 * An added branch is always a lower (never branch 0), and only
+	 * branch 0 is ever written: even a "=rw" add gets a read-only
+	 * private clone, as in aufsng_fill_super().
+	 */
+	mnt->mnt_flags |= MNT_READONLY | MNT_NOATIME;
 
 	cur_oe = AUFSNG_I_E(root_inode);
 	n = cur_oe->numlower;
