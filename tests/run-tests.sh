@@ -61,7 +61,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=49; PASS=0; FAIL=0
+	N=0; TOTAL=52; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -283,16 +283,23 @@ guest_main() {
 		&& ok "st_ino stable across copy-up" \
 		|| bad "st_ino stable across copy-up (was $INO1, now $(stat -c %i $U/cu))"
 
-	echo "=== 17. symlink read through the union (get_link) ==="
-	# Guards aufsng_get_link()/aufsng_path_real() resolving a lower-only
-	# symlink (numlower>0, no upper) - the path hardened against a torn
-	# upper/lower snapshot.  (Copying a symlink UP is a separate, known
-	# limitation - aufsng_set_attr_from() rejects ATTR_MODE on a symlink -
-	# so it is deliberately not asserted here.)
+	echo "=== 17. symlink: read (get_link) and copy-up ==="
+	# Reading guards aufsng_get_link()/aufsng_path_real() on a lower-only
+	# symlink (numlower>0, no upper).  Copy-up guards aufsng_set_attr_from()
+	# skipping ATTR_MODE for symlinks: without that, any setattr on a
+	# symlink (here touch -h) fails with EOPNOTSUPP and never copies up.
 	ln -s /some/target/path $L1/sl
 	[ "$(readlink $U/sl)" = /some/target/path ] \
 		&& ok "lower symlink read through union" \
 		|| bad "lower symlink read through union"
+	touch -h $U/sl 2>/dev/null                       # setattr -> in-place copy-up
+	check "symlink copied up (upper is a symlink)"  test -L "$W/sl"
+	[ "$(readlink $W/sl 2>/dev/null)" = /some/target/path ] \
+		&& ok "copied-up symlink target correct" \
+		|| bad "copied-up symlink target correct"
+	[ "$(readlink $U/sl)" = /some/target/path ] \
+		&& ok "symlink target intact after copy-up" \
+		|| bad "symlink target intact after copy-up"
 
 	echo "=== 18. merged directory link count (getattr) ==="
 	# md exists in two lower branches with distinct subdirs; the union's
