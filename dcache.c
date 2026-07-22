@@ -137,9 +137,13 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	 * in the rw branch would shadow or hide it (the upper dir's
 	 * mtime/iversion stamp in d_fsdata, udba=reval only), and a
 	 * runtime branch add can hand the name to a higher-priority
-	 * branch (branch_gen vs. the inode's origin_gen; directories
-	 * are exempt - the splice keeps them right or unhashes them).
-	 * Each probe runs once per observed change, not once per access.
+	 * branch (branch_gen vs. the dentry's d_time; directories are
+	 * exempt - the splice keeps them right or unhashes them).  The
+	 * generation stamp lives on the DENTRY: lower hardlink siblings
+	 * share one union inode, but a branch can whiteout or shadow
+	 * one sibling name and not the other, so each name re-checks
+	 * for itself.  Each probe runs once per observed change, not
+	 * once per access.
 	 */
 	if (!dir)
 		return 1;
@@ -148,7 +152,7 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	gen = atomic64_read(&pfs->branch_gen);
 	stamp_hit = (unsigned long)READ_ONCE(dentry->d_fsdata) == stamp;
 	gen_hit = S_ISDIR(inode->i_mode) ||
-		  READ_ONCE(AUFSNG_I(inode)->origin_gen) == gen;
+		  READ_ONCE(dentry->d_time) == (unsigned long)gen;
 	if (stamp_hit && gen_hit)
 		return 1;
 	if (flags & LOOKUP_RCU)
@@ -174,7 +178,7 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 			 * that a d_invalidate() would detach.  A different type
 			 * means the cached inode is the wrong object: drop it.
 			 */
-			if ((d_inode(this)->i_mode ^ inode->i_mode) & S_IFMT)
+			if (!aufsng_origin_type_ok(this, inode->i_mode))
 				ret = 0;
 			else
 				ret = aufsng_dyn_adopt_upper(inode,
@@ -214,7 +218,7 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 out_stamp:
 	if (ret) {
 		WRITE_ONCE(dentry->d_fsdata, (void *)stamp);
-		WRITE_ONCE(AUFSNG_I(inode)->origin_gen, gen);
+		WRITE_ONCE(dentry->d_time, (unsigned long)gen);
 	}
 out:
 	up_read(&pfs->dyn_lock);

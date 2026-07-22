@@ -64,7 +64,6 @@ static struct inode *aufsng_alloc_inode(struct super_block *sb)
 	oi->upperdentry = NULL;
 	oi->cache = NULL;
 	oi->dyn_parked = NULL;
-	oi->origin_gen = 0;
 	atomic64_set(&oi->version, 0);
 	mutex_init(&oi->lock);
 

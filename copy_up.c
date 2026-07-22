@@ -231,6 +231,10 @@ static struct dentry *aufsng_copy_up_prep_regular(struct aufsng_fs *pfs,
 		if (!mnt_want_write(aufsng_upper_mnt(pfs))) {
 			aufsng_remove_object(pfs, pupper, tmp, false);
 			mnt_drop_write(aufsng_upper_mnt(pfs));
+		} else {
+			/* same trace the commit-side leak gets (out_tmp) */
+			pr_warn("aufs (aufs-ng): read-only rw branch, copy-up temp '%s' left behind\n",
+				tmpbuf);
 		}
 		dput(work);
 		return ERR_PTR(err);
@@ -518,6 +522,10 @@ out_tmp:
  * regular-file data copy must run outside mnt_want_write(), because
  * vfs_copy_file_range() takes the upper sb's own write protection and
  * same-level sb_writers nesting deadlocks against an upper-fs freeze.
+ * The trade is that the walk is no longer atomic against a rw->ro
+ * flip: ancestors copied up before the flip stay - benign, since an
+ * upper dir mirroring its lower is the same state any sibling's
+ * copy-up produces - and the walk still fails cleanly with EROFS.
  * Callers performing their own mutation afterwards take their own
  * mnt_want_write(), sequentially, as before.
  */

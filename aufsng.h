@@ -94,9 +94,12 @@ struct aufsng_fs {
 	const struct cred *creator_cred;
 	/*
 	 * Bumped once per runtime branch add/remove (AUFS's "sigen"):
-	 * compared against each union inode's origin_gen so positive
+	 * compared against each dentry's d_time stamp so positive
 	 * revalidation re-runs the merge decision exactly once per
-	 * branch change (dcache.c), never on ordinary mutations.
+	 * branch change (dcache.c), never on ordinary mutations.  The
+	 * stamp is per-DENTRY, not per-inode: lower hardlink siblings
+	 * share one union inode, but the winning-branch decision is
+	 * per-name, so each name must re-check for itself.
 	 */
 	atomic64_t branch_gen;
 	/* excludes lookup/readdir during runtime branch add/remove */
@@ -116,14 +119,6 @@ struct aufsng_inode {
 	struct aufsng_dir_cache *cache;	/* merged readdir cache (dirs) */
 	struct aufsng_dyn_parked *dyn_parked;
 	atomic64_t version;		/* merged readdir cache validity */
-	/*
-	 * pfs->branch_gen value this inode's winning-branch decision was
-	 * last validated against; on mismatch, positive revalidation
-	 * re-runs the origin check (dcache.c).  Kept per-inode (not in
-	 * d_fsdata, which carries the upper-dir stamp) so an ordinary
-	 * write in the parent dir never triggers a branch rescan.
-	 */
-	u64 origin_gen;
 	/* synchronize copy up and more */
 	struct mutex lock;
 	struct inode vfs_inode;
