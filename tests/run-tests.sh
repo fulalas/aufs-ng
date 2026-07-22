@@ -61,7 +61,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=42; PASS=0; FAIL=0
+	N=0; TOTAL=49; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -262,6 +262,46 @@ guest_main() {
 	test -f $W/.wh.odir && bad "whiteout rolled back on failed rmdir" \
 		|| ok "whiteout rolled back on failed rmdir"
 	mv $W/odir-renamed $W/odir                       # restore
+
+	echo "=== 16. copy-up fidelity: data, mode, owner, st_ino ==="
+	# A multi-block file (~288 KiB) so the copy-up data loop runs many
+	# iterations; mode/owner set on the lower so we can prove they survive.
+	seq 1 50000 > $L1/cu
+	chmod 640 $L1/cu
+	chown 65534:65534 $L1/cu
+	INO1=$(stat -c %i $U/cu)                          # union ino before copy-up
+	exec 4>>"$U/cu"; exec 4>&-                        # append-open (no data) -> copy-up
+	check "copy-up occurred (upper exists)"      test -f $W/cu
+	# compare the UPPER copy against the lower origin (not via the union,
+	# which would be vacuous if copy-up silently did nothing)
+	check "copy-up preserves file data byte-for-byte" cmp -s $W/cu $L1/cu
+	[ "$(stat -c %a $W/cu)" = 640 ] \
+		&& ok "copy-up preserves mode" || bad "copy-up preserves mode"
+	[ "$(stat -c %u $W/cu)" = 65534 ] \
+		&& ok "copy-up preserves owner" || bad "copy-up preserves owner"
+	[ "$(stat -c %i $U/cu)" = "$INO1" ] \
+		&& ok "st_ino stable across copy-up" \
+		|| bad "st_ino stable across copy-up (was $INO1, now $(stat -c %i $U/cu))"
+
+	echo "=== 17. symlink read through the union (get_link) ==="
+	# Guards aufsng_get_link()/aufsng_path_real() resolving a lower-only
+	# symlink (numlower>0, no upper) - the path hardened against a torn
+	# upper/lower snapshot.  (Copying a symlink UP is a separate, known
+	# limitation - aufsng_set_attr_from() rejects ATTR_MODE on a symlink -
+	# so it is deliberately not asserted here.)
+	ln -s /some/target/path $L1/sl
+	[ "$(readlink $U/sl)" = /some/target/path ] \
+		&& ok "lower symlink read through union" \
+		|| bad "lower symlink read through union"
+
+	echo "=== 18. merged directory link count (getattr) ==="
+	# md exists in two lower branches with distinct subdirs; the union's
+	# nlink must fold in every branch, as aufsng_getattr computes it.
+	mkdir -p $L1/md/s1 $L1/md/s2 $L2/md/s3
+	exp=$(( $(stat -c %h $L1/md) + $(stat -c %h $L2/md) - 2 ))
+	[ "$(stat -c %h $U/md)" = "$exp" ] \
+		&& ok "merged dir nlink counts all branches" \
+		|| bad "merged dir nlink counts all branches (got $(stat -c %h $U/md), want $exp)"
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.

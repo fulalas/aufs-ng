@@ -26,10 +26,10 @@ lockdep/RCU/BUG findings. Each check streams to your terminal as it
 runs:
 
 ```
-1/42 - mount... PASSED
-2/42 - merge: l1 wins dir/file... PASSED
+1/49 - mount... PASSED
+2/49 - merge: l1 wins dir/file... PASSED
 ...
-RESULT: PASS=42 FAIL=0
+RESULT: PASS=49 FAIL=0
 run-tests: OK - all checks passed, kernel log clean
 ```
 
@@ -60,7 +60,7 @@ plus this README.
 
 ## What is covered
 
-The suite currently runs **42 checks**:
+The suite currently runs **49 checks**:
 
 - mount, merge order, whiteout semantics (delete/resurrect, readdir
   hiding, opaque directories)
@@ -74,11 +74,20 @@ The suite currently runs **42 checks**:
 - failure-path atomicity under ENOSPC (inode exhaustion): mkdir over
   a whiteout fails cleanly and is retryable; rename onto a lower-only
   victim rolls back
+- copy-up fidelity: a multi-block file's data copied byte-for-byte,
+  with mode and owner preserved and `st_ino` stable across the copy-up
 - copy-up of lower hardlink siblings; rmdir when the upper directory
   vanished out-of-band
+- reading a lower symlink through the union (`get_link`); merged
+  directory link count across branches (`getattr`)
 - an add/del stress loop with a pinned cwd and concurrent
   stat/readdir//proc/mounts readers, as a race regression check
   (meaningful mainly because lockdep and PROVE_RCU are watching)
+
+Not covered: copying a **symlink** up (via chown/touch/rename/link) is
+a known limitation — `aufsng_set_attr_from()` rejects `ATTR_MODE` on a
+symlink, so it fails with `EOPNOTSUPP` — so the suite asserts only
+symlink *reads*, not symlink copy-up.
 
 ## Adding a test
 
