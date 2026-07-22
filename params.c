@@ -305,6 +305,7 @@ static int aufsng_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			ctx->config.udba = AUFSNG_UDBA_REVAL;
 		else
 			ctx->config.udba = AUFSNG_UDBA_NONE;
+		ctx->udba_set = true;
 		return 0;
 	case Opt_dirperm1:
 	case Opt_nowarn_perm:

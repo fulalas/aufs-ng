@@ -129,6 +129,8 @@ bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 
 	if (!oi->upperdentry) {
 		WRITE_ONCE(oi->upperdentry, dget(upperdentry));
+		/* the upper is the authoritative real object now */
+		aufsng_copyattr(inode);
 		ok = true;
 	} else if (d_inode(oi->upperdentry) == d_inode(upperdentry)) {
 		ok = true;
@@ -222,7 +224,15 @@ static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode
 struct aufsng_memo_ent {
 	struct hlist_node node;
 	struct dentry *uniond;	/* key; ref held for the memo's lifetime */
-	struct dentry *branchd;	/* counterpart, ref held; NULL = blocked */
+	struct dentry *branchd;	/* counterpart, ref held; NULL = absent */
+	/*
+	 * The new branch actively HIDES this union object (a whiteout or
+	 * same-named non-directory in the now-top branch, with no upper
+	 * to win over it) - stronger than "absent": the union name is
+	 * gone, and every cached directory at or below it must be
+	 * unhashed rather than kept on its pre-add stack.
+	 */
+	bool blocked;
 };
 
 struct aufsng_splice_memo {
@@ -243,7 +253,8 @@ static struct aufsng_memo_ent *aufsng_memo_find(struct aufsng_splice_memo *memo,
 
 /* best effort: an allocation failure just skips the memoization */
 static void aufsng_memo_store(struct aufsng_splice_memo *memo,
-			   struct dentry *d, struct dentry *branchd)
+			   struct dentry *d, struct dentry *branchd,
+			   bool blocked)
 {
 	struct aufsng_memo_ent *e = kmalloc(sizeof(*e), GFP_KERNEL);
 
@@ -251,6 +262,7 @@ static void aufsng_memo_store(struct aufsng_splice_memo *memo,
 		return;
 	e->uniond = dget(d);
 	e->branchd = branchd ? dget(branchd) : NULL;
+	e->blocked = blocked;
 	hash_add(memo->tbl, &e->node, (unsigned long)d);
 }
 
@@ -273,19 +285,27 @@ static void aufsng_memo_free(struct aufsng_splice_memo *memo)
  * and the already-resolved branch parent @pbase, resolve the union
  * child dentry @d in the new branch, enforcing the same per-level
  * visibility rules a fresh lookup would.  Returns the branch child
- * (ref held) or NULL when the path is blocked: also on transient
+ * (ref held) or NULL when the path is not provided: also on transient
  * errors - skipping is safe, the directory just keeps its pre-add
  * view until evicted, same as one deeper than the replay limit.
+ *
+ * @blocked is set when the new branch actively HIDES the union object
+ * at this level: it carries a whiteout for the name, or provides a
+ * same-named non-directory, and the union object has no upper to win
+ * over the new top lower.  A fresh lookup of that path would no longer
+ * find the cached directory at all, so the caller must unhash it
+ * instead of keeping its pre-add view.
  */
 static struct dentry *aufsng_dyn_resolve_step(struct aufsng_fs *pfs,
 					   struct vfsmount *mnt,
 					   struct inode *punion,
 					   struct dentry *pbase,
-					   struct dentry *d)
+					   struct dentry *d, bool *blocked)
 {
 	struct dentry *pupper = aufsng_upperdentry(punion);
 	struct dentry *child = NULL;
 	struct name_snapshot ns;
+	int wh;
 
 	/*
 	 * Upper-branch masking, exactly as aufsng_lookup() enforces it
@@ -312,14 +332,32 @@ static struct dentry *aufsng_dyn_resolve_step(struct aufsng_fs *pfs,
 	if (pupper &&
 	    aufsng_check_whiteout(aufsng_upper_mnt(pfs), pupper, &ns.name))
 		goto out;
-	/* the new branch's own whiteout blocks the path too */
-	if (aufsng_check_whiteout(mnt, pbase, &ns.name))
+	/*
+	 * The new branch's own whiteout: as the new TOP lower it hides
+	 * the name in every branch below - if no upper provides the
+	 * union object, the object itself is gone from the union.  A
+	 * probe error skips instead (transient: keep the pre-add view).
+	 */
+	wh = aufsng_check_whiteout(mnt, pbase, &ns.name);
+	if (wh) {
+		if (wh == 1)
+			*blocked = !aufsng_upperdentry(d_inode(d));
 		goto out;
+	}
 
 	child = lookup_one_unlocked(mnt_idmap(mnt), &ns.name, pbase);
 	if (IS_ERR(child)) {
 		child = NULL;
-	} else if (d_is_negative(child) || !d_is_dir(child)) {
+	} else if (d_is_negative(child)) {
+		dput(child);
+		child = NULL;
+	} else if (!d_is_dir(child)) {
+		/*
+		 * A same-named non-directory in the new top lower ends
+		 * the merge at itself: a lower-only union directory is
+		 * shadowed by it, exactly as if deleted and replaced.
+		 */
+		*blocked = !aufsng_upperdentry(d_inode(d));
 		dput(child);
 		child = NULL;
 	}
@@ -333,13 +371,17 @@ out:
  * to a cached union directory @inode, by replaying @inode's ancestor
  * chain from the branch root downward through the memo.  Returns a
  * positive directory dentry (ref held) or NULL if the branch does not
- * provide this path as a visible directory.
+ * provide this path as a visible directory.  *@blocked is set when the
+ * new branch actively hides this directory or one of its ancestors
+ * (see aufsng_dyn_resolve_step): the path no longer exists in the
+ * union at all.
  */
 static struct dentry *aufsng_dyn_resolve_lower(struct aufsng_fs *pfs,
 					    struct super_block *sb,
 					    struct inode *inode,
 					    struct vfsmount *mnt,
-					    struct aufsng_splice_memo *memo)
+					    struct aufsng_splice_memo *memo,
+					    bool *blocked)
 {
 	struct dentry *stack[AUFSNG_RESOLVE_MAXDEPTH];
 	struct dentry *da, *cur, *par, *base;
@@ -369,16 +411,23 @@ static struct dentry *aufsng_dyn_resolve_lower(struct aufsng_fs *pfs,
 		struct dentry *pu = (i == n - 1) ? sb->s_root : stack[i + 1];
 		struct aufsng_memo_ent *hit = aufsng_memo_find(memo, stack[i]);
 		struct dentry *child;
+		bool blk = false;
 
 		if (hit) {
 			child = hit->branchd ? dget(hit->branchd) : NULL;
+			blk = hit->blocked;
 		} else {
 			child = aufsng_dyn_resolve_step(pfs, mnt, d_inode(pu),
-						     base, stack[i]);
-			aufsng_memo_store(memo, stack[i], child);
+						     base, stack[i], &blk);
+			aufsng_memo_store(memo, stack[i], child, blk);
 		}
 		dput(base);
 		base = child;
+		if (blk) {
+			/* an ancestor gone hides the whole subtree */
+			*blocked = true;
+			break;
+		}
 		if (!base)
 			break;
 	}
@@ -508,11 +557,33 @@ static void aufsng_dyn_splice_cached(struct aufsng_fs *pfs, struct super_block *
 	hash_init(memo->tbl);
 
 	for (i = 0; i < ndirs; i++) {
-		struct dentry *nd = aufsng_dyn_resolve_lower(pfs, sb, dirs[i],
-							  layer->mnt, memo);
 		struct aufsng_entry *cur, *neu;
 		struct aufsng_dyn_parked *pk;
+		bool blocked = false;
+		struct dentry *nd = aufsng_dyn_resolve_lower(pfs, sb, dirs[i],
+							  layer->mnt, memo,
+							  &blocked);
 
+		if (blocked) {
+			/*
+			 * The new branch hides this directory (a whiteout
+			 * or same-named non-directory in the now-top
+			 * branch, no upper to win over it): the name is
+			 * gone from the union, exactly as if deleted.
+			 * Unhash the alias so fresh lookups re-resolve
+			 * (to the shadowing file, or to ENOENT); pinned
+			 * users keep the old view until they let go, as
+			 * with any deleted-while-open directory.
+			 */
+			struct dentry *alias = d_find_alias(dirs[i]);
+
+			if (alias) {
+				d_drop(alias);
+				dput(alias);
+			}
+			atomic64_inc(&AUFSNG_I(dirs[i])->version);
+			continue;
+		}
 		if (!nd)
 			continue;
 		neu = aufsng_dyn_prep_splice(pfs, dirs[i], nd, layer);
@@ -622,6 +693,8 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	old_oe = aufsng_dyn_swap_root(sb, new_oe);
 	aufsng_dyn_drop_neg_children(root_inode);
 	aufsng_dyn_splice_cached(pfs, sb, layer, root_inode);
+	/* one re-check of every cached lower-only dentry (dcache.c) */
+	atomic64_inc(&pfs->branch_gen);
 
 	up_write(&pfs->dyn_lock);
 	inode_unlock(root_inode);
@@ -824,6 +897,13 @@ static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode
 	smp_store_release(&oi->oe, new_oe);
 	atomic64_inc(&oi->version);
 	aufsng_dyn_rekey_inode(inode, new_oe);
+	/*
+	 * The top real object may have changed (a spliced-in branch's
+	 * directory, or the surviving top after a removal); the union
+	 * inode's attributes - directory permissions above all - must
+	 * follow it, exactly as a fresh lookup of the same path would.
+	 */
+	aufsng_copyattr(inode);
 
 	parked->oe = old_oe;
 	parked->upper = NULL;
@@ -1016,15 +1096,24 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
 
 	/* the busy-scan skips the root; refresh its negatives too */
 	aufsng_dyn_drop_neg_children(root_inode);
+	/* one re-check of every cached lower-only dentry (dcache.c) */
+	atomic64_inc(&pfs->branch_gen);
 
 	pr_info("aufs (aufs-ng): branch '%pd' removed\n", path->dentry);
-	aufsng_dyn_release_branch(pfs, layer);
 
 	up_write(&pfs->dyn_lock);
 	inode_unlock(root_inode);
 
 	synchronize_rcu();
 	aufsng_free_entry(old_root_oe);
+	/*
+	 * Only after the grace period: an RCU show_options snapshot of
+	 * the superseded root stack may still be printing this branch's
+	 * config strings.  Slot reuse by a later add is safe for the
+	 * same reason - it cannot begin before this removal (and its
+	 * grace period) completes.
+	 */
+	aufsng_dyn_release_branch(pfs, layer);
 
 	return 0;
 
@@ -1063,6 +1152,15 @@ int aufsng_dyn_reconfigure(struct fs_context *fc)
 	bool dcache_fresh = false;
 	size_t i;
 	int err = 0;
+
+	/*
+	 * udba= may be changed on remount, as on real AUFS.  Only an
+	 * explicitly given value is applied: legacy remounts replay the
+	 * current options, and a remount without udba= must not reset
+	 * the mount-time choice to the parser default.
+	 */
+	if (ctx->udba_set)
+		AUFSNG_FS(sb)->config.udba = ctx->config.udba;
 
 	for (i = 0; !err && i < ctx->nr_dyn_add; i++) {
 		struct aufsng_ctx_branch *b = &ctx->dyn_add[i];

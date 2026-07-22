@@ -1,5 +1,6 @@
 config AUFSNG_FS
 	tristate "aufs-ng filesystem support (AUFS-compatible union filesystem)"
+	select FS_STACK
 	default n
 	help
 	  aufs-ng is a standalone, from-scratch union filesystem

@@ -141,7 +141,9 @@ which they are written when an operation needs more than one step:
   renamed, losing access to current data. `aufs-ng` does the opposite:
   rename first, marker second. If the marker can't be created — a full
   disk, for example — the rename is undone and the operation fails
-  cleanly.
+  cleanly. (One narrow exception: if the rename also replaced an
+  existing file in the writable branch, undoing it would lose that
+  replacement — the rename is then kept and a warning is logged.)
 
 Helper files named `.wh..wh.*` may briefly appear inside a branch
 during an operation, same as in `aufs`. They are never visible in the

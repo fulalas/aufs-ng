@@ -92,16 +92,27 @@ static int aufsng_set_attr_from(struct aufsng_fs *pfs, struct dentry *upper,
 {
 	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	struct iattr attr = {
-		.ia_valid = ATTR_UID | ATTR_GID | ATTR_MODE |
+		.ia_valid = ATTR_UID | ATTR_GID |
 			    ATTR_ATIME | ATTR_MTIME | ATTR_ATIME_SET |
 			    ATTR_MTIME_SET | ATTR_FORCE,
 		.ia_uid = stat->uid,
 		.ia_gid = stat->gid,
-		.ia_mode = stat->mode,
 		.ia_atime = stat->atime,
 		.ia_mtime = stat->mtime,
 	};
 	int err;
+
+	/*
+	 * A symlink carries no meaningful mode and there is no lchmod:
+	 * notify_change() with ATTR_MODE on one fails (EOPNOTSUPP on the
+	 * branch fs), which would abort the whole copy-up.  Set every
+	 * other attribute and skip the mode for symlinks, exactly as
+	 * overlayfs does on copy-up.
+	 */
+	if (!S_ISLNK(stat->mode)) {
+		attr.ia_valid |= ATTR_MODE;
+		attr.ia_mode = stat->mode;
+	}
 
 	inode_lock(d_inode(upper));
 	err = notify_change(idmap, upper, &attr, NULL);
@@ -161,57 +172,110 @@ static int aufsng_copy_data(struct aufsng_fs *pfs, const struct path *lowerpath,
 }
 
 /*
- * Copy a regular file into a uniquely named temp file inside the
- * SAME directory as the final target, fill in data and metadata,
- * then rename it over the real name.  AUFS has no separate workdir;
- * the temp lives in AUFS's own ".wh..wh." bookkeeping namespace
- * (".wh..wh.pxu<seq>"), so it is invisible to lookup and readdir for
- * the whole duration of the data copy - a plain visible name would
- * show up in any concurrent listing of the directory (and stay there
- * forever after a crash mid-copy).  Leftovers from a crash are
+ * Phase one of a regular-file copy-up, run with NO locks held: create
+ * a uniquely named temp file inside the SAME directory as the final
+ * target and fill in the lower file's data.  AUFS has no separate
+ * workdir; the temp lives in AUFS's own ".wh..wh." bookkeeping
+ * namespace (".wh..wh.pxu<seq>"), so it is invisible to lookup and
+ * readdir for the whole duration of the copy (and a crash leftover is
  * cleaned up like any other stale marker: rmdir's clear_whiteouts
- * sweep removes them with the directory.
+ * sweep removes it with the directory).
+ *
+ * This phase must run outside both oi->lock and mnt_want_write():
+ * vfs_copy_file_range() takes the upper sb's own write protection
+ * (file_start_write), which is the same sb_writers level as
+ * mnt_want_write() - holding it across the copy recurses and
+ * deadlocks against a concurrent freeze of the upper fs - and
+ * sb_writers ranks BEFORE oi->lock everywhere else (mutations take
+ * mnt_want_write, then dyn_lock, then oi->lock).  Nothing is
+ * committed here; publication happens under oi->lock in
+ * aufsng_copy_up_one().
  */
-static struct dentry *aufsng_copy_up_regular(struct aufsng_fs *pfs,
-					  struct dentry *dentry,
-					  const struct path *lowerpath,
-					  struct dentry *pupper,
-					  const struct kstat *stat)
+static struct dentry *aufsng_copy_up_prep_regular(struct aufsng_fs *pfs,
+					       const struct path *lowerpath,
+					       struct dentry *pupper,
+					       loff_t size,
+					       struct qstr *tmp, char *tmpbuf)
 {
 	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
-	struct renamedata rd = {};
 	struct dentry *work;
-	struct qstr nameq = QSTR_LEN(dentry->d_name.name, dentry->d_name.len);
-	char tmpname[32];
-	struct qstr tmpq;
 	int err;
 
-	snprintf(tmpname, sizeof(tmpname), ".wh..wh.pxu%u",
+	snprintf(tmpbuf, 32, ".wh..wh.pxu%u",
 		 atomic_inc_return(&aufsng_tmpfile_seq));
-	tmpq = QSTR(tmpname);
+	*tmp = QSTR(tmpbuf);
 
-	work = start_creating_noperm(pupper, &tmpq);
+	err = mnt_want_write(aufsng_upper_mnt(pfs));
+	if (err)
+		return ERR_PTR(err);
+	work = start_creating_noperm(pupper, tmp);
 	if (IS_ERR(work))
-		return work;
+		goto out_drop;
 	if (d_is_positive(work)) {
 		end_dirop(work);
-		return ERR_PTR(-EEXIST);
+		work = ERR_PTR(-EEXIST);
+		goto out_drop;
 	}
 	err = vfs_create(idmap, work, S_IFREG | 0600, NULL);
 	if (err) {
 		end_dirop(work);
-		return ERR_PTR(err);
+		work = ERR_PTR(err);
+		goto out_drop;
 	}
 	dget(work);
 	end_dirop(work);
+	mnt_drop_write(aufsng_upper_mnt(pfs));
 
-	err = aufsng_copy_data(pfs, lowerpath, work, stat->size);
+	err = aufsng_copy_data(pfs, lowerpath, work, size);
+	if (err) {
+		if (!mnt_want_write(aufsng_upper_mnt(pfs))) {
+			aufsng_remove_object(pfs, pupper, tmp, false);
+			mnt_drop_write(aufsng_upper_mnt(pfs));
+		}
+		dput(work);
+		return ERR_PTR(err);
+	}
+	return work;
+
+out_drop:
+	mnt_drop_write(aufsng_upper_mnt(pfs));
+	return work;
+}
+
+/*
+ * Phase two, under mnt_want_write() + oi->lock: dress the temp in the
+ * lower's metadata and rename it over the real name - the commit
+ * point.  On success @work is hashed under the final name and is the
+ * live upper.
+ */
+static int aufsng_copy_up_commit_regular(struct aufsng_fs *pfs,
+				      struct dentry *dentry,
+				      const struct path *lowerpath,
+				      struct dentry *pupper,
+				      struct dentry *work)
+{
+	struct renamedata rd = {};
+	struct qstr nameq = QSTR_LEN(dentry->d_name.name, dentry->d_name.len);
+	struct kstat stat;
+	int err;
+
+	/*
+	 * Re-stat the lower NOW so ownership/mode/times land from the
+	 * same point in time as the xattrs read below - one coherent
+	 * commit-era metadata snapshot.  The prep-era stat served only
+	 * to size the data copy; if the lower was mutated out-of-band
+	 * mid-copy-up the data is stale either way (a window as old as
+	 * the unlocked data copy itself), but the metadata should not
+	 * additionally be stitched from a third instant.
+	 */
+	err = vfs_getattr(lowerpath, &stat,
+			  STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT);
 	if (!err)
 		err = aufsng_copy_xattr(pfs, lowerpath, work);
 	if (!err)
-		err = aufsng_set_attr_from(pfs, work, stat);
+		err = aufsng_set_attr_from(pfs, work, &stat);
 	if (err)
-		goto out_cleanup;
+		return err;
 
 	/*
 	 * No whiteout can sit at the target: the name was visible to
@@ -220,38 +284,20 @@ static struct dentry *aufsng_copy_up_regular(struct aufsng_fs *pfs,
 	 * unlink - aufsng_copy_up_one() re-checks for that under
 	 * oi->lock before calling here, and aufsng_do_remove() holds
 	 * the same lock for its whole whiteout + unlink sequence.
+	 *
+	 * vfs_rename() moves the file onto @work (the source dentry)
+	 * via d_move() and leaves rd.new_dentry negative -
+	 * end_renaming() drops the helper's own refs.
 	 */
-	rd.mnt_idmap = idmap;
+	rd.mnt_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	rd.old_parent = pupper;
 	rd.new_parent = pupper;
 	err = start_renaming_dentry(&rd, 0, work, &nameq);
 	if (err)
-		goto out_cleanup;
+		return err;
 	err = vfs_rename(&rd);
 	end_renaming(&rd);
-	if (err)
-		goto out_cleanup;
-
-	/*
-	 * vfs_rename() moves the file onto @work (the source dentry) via
-	 * d_move() and leaves rd.new_dentry negative - end_renaming() drops
-	 * the helper's own refs.  @work, now hashed under the final name and
-	 * carrying the inode, is the live upper; hand it the ref taken above.
-	 */
-	return work;
-
-out_cleanup:
-	/* best effort removal of the temporary file */
-	{
-		struct dentry *w = start_removing_noperm(pupper, &tmpq);
-
-		if (!IS_ERR(w)) {
-			vfs_unlink(idmap, d_inode(pupper), w, NULL);
-			end_dirop(w);
-		}
-	}
-	dput(work);
-	return ERR_PTR(err);
+	return err;
 }
 
 /*
@@ -317,7 +363,15 @@ static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 	if (!err)
 		err = aufsng_set_attr_from(pfs, upper, stat);
 	if (err) {
+		/*
+		 * Same cleanup duty the regular-file path gets from its
+		 * temp+rename scheme: a half-attributed object left
+		 * under the real name would be adopted with wrong
+		 * metadata and make every retry fail with EEXIST.
+		 */
 		dput(upper);
+		aufsng_remove_object(pfs, pupper, &dentry->d_name,
+				  S_ISDIR(stat->mode));
 		return ERR_PTR(err);
 	}
 	return upper;
@@ -339,14 +393,56 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 	struct path lowerpath;
 	struct kstat stat;
 	struct dentry *upper;
-	int err = 0;
+	struct dentry *work = NULL;
+	char tmpbuf[32];
+	struct qstr tmpq;
+	int err;
 
 	if (WARN_ON(!pupper))
 		return -ENOENT;
+	if (READ_ONCE(oi->upperdentry))
+		return 0;
+	/*
+	 * Best-effort early out for a name already dead (concurrent
+	 * unlink/rename won): purely advisory - the same checks re-run
+	 * authoritatively under oi->lock below - but it spares building
+	 * and copying a full temp that the commit would only discard.
+	 */
+	if (d_unhashed(dentry) || !inode->i_nlink)
+		return -ENOENT;
+
+	/*
+	 * The lower source is stable without oi->lock: a non-directory's
+	 * stack never changes after creation, and a directory's
+	 * superseded stacks stay parked on the inode until eviction.
+	 */
+	oe = AUFSNG_I_E(inode);
+	if (!oe || !oe->numlower)
+		return -ENOENT;
+	lowerpath.mnt = oe->lowerstack[0].layer->mnt;
+	lowerpath.dentry = oe->lowerstack[0].dentry;
+
+	err = vfs_getattr(&lowerpath, &stat,
+			  STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT);
+	if (err)
+		return err;
+
+	/* the data-filled temp is built before any lock (see prep_regular) */
+	if (S_ISREG(stat.mode)) {
+		work = aufsng_copy_up_prep_regular(pfs, &lowerpath, pupper,
+						stat.size, &tmpq, tmpbuf);
+		if (IS_ERR(work))
+			return PTR_ERR(work);
+	}
+
+	/* sb_writers ranks before oi->lock, as in every mutation path */
+	err = mnt_want_write(aufsng_upper_mnt(pfs));
+	if (err)
+		goto out_tmp;
 
 	mutex_lock(&oi->lock);
 	if (oi->upperdentry)
-		goto out;
+		goto out;	/* lost the race: another copy-up committed */
 
 	/*
 	 * The lookup that led here saw the name alive, but an unlink or
@@ -367,53 +463,69 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 		goto out;
 	}
 
-	oe = AUFSNG_I_E(inode);
-	if (!oe || !oe->numlower) {
-		err = -ENOENT;
-		goto out;
-	}
-	lowerpath.mnt = oe->lowerstack[0].layer->mnt;
-	lowerpath.dentry = oe->lowerstack[0].dentry;
-
-	err = vfs_getattr(&lowerpath, &stat,
-			  STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT);
-	if (err)
-		goto out;
-
-	if (S_ISREG(stat.mode))
-		upper = aufsng_copy_up_regular(pfs, dentry, &lowerpath, pupper,
-					    &stat);
-	else
+	if (work) {
+		err = aufsng_copy_up_commit_regular(pfs, dentry, &lowerpath,
+						 pupper, work);
+		if (err)
+			goto out;
+		upper = work;
+		work = NULL;	/* committed: live under the real name now */
+	} else {
 		upper = aufsng_copy_up_inplace(pfs, dentry, &lowerpath, pupper,
 					    &stat);
-	if (IS_ERR(upper)) {
-		err = PTR_ERR(upper);
-		goto out;
+		if (IS_ERR(upper)) {
+			err = PTR_ERR(upper);
+			goto out;
+		}
 	}
 
 	WRITE_ONCE(oi->upperdentry, upper);
 	aufsng_copyattr(inode);
 out:
 	mutex_unlock(&oi->lock);
+	/* a temp that was not committed (failure or lost race) goes away */
+	if (work) {
+		aufsng_remove_object(pfs, pupper, &tmpq, false);
+		dput(work);
+		work = NULL;
+	}
+	mnt_drop_write(aufsng_upper_mnt(pfs));
+out_tmp:
+	if (work) {
+		/*
+		 * No write access (the rw branch went read-only between
+		 * prep and commit).  One retry covers a flapping fs; if
+		 * the branch is persistently ro no removal is possible -
+		 * the invisible temp then stays until a clear_whiteouts
+		 * sweep of its directory, so leave a trace for the admin.
+		 */
+		if (!mnt_want_write(aufsng_upper_mnt(pfs))) {
+			aufsng_remove_object(pfs, pupper, &tmpq, false);
+			mnt_drop_write(aufsng_upper_mnt(pfs));
+		} else {
+			pr_warn("aufs (aufs-ng): read-only rw branch, copy-up temp '%s' left behind\n",
+				tmpbuf);
+		}
+		dput(work);
+	}
 	return err;
 }
 
 /*
  * Make sure @dentry has an upper copy, copying up any ancestors that
- * lack one first (top-down).  Takes write access on the rw branch
- * itself: callers that go on to perform their own mutation there
- * (create, rename, setattr, ...) additionally bracket that with their
- * own mnt_want_write(), which nests safely on top of this one.
+ * lack one first (top-down).  Write access on the rw branch is taken
+ * inside the per-object helpers, NOT here for the whole walk: the
+ * regular-file data copy must run outside mnt_want_write(), because
+ * vfs_copy_file_range() takes the upper sb's own write protection and
+ * same-level sb_writers nesting deadlocks against an upper-fs freeze.
+ * Callers performing their own mutation afterwards take their own
+ * mnt_want_write(), sequentially, as before.
  */
 int aufsng_copy_up(struct dentry *dentry)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
 	const struct cred *old_cred;
-	int err;
-
-	err = mnt_want_write(aufsng_upper_mnt(pfs));
-	if (err)
-		return err;
+	int err = 0;
 
 	old_cred = override_creds(pfs->creator_cred);
 
@@ -434,6 +546,5 @@ int aufsng_copy_up(struct dentry *dentry)
 	}
 
 	revert_creds(old_cred);
-	mnt_drop_write(aufsng_upper_mnt(pfs));
 	return err;
 }

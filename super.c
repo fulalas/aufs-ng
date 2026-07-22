@@ -64,6 +64,7 @@ static struct inode *aufsng_alloc_inode(struct super_block *sb)
 	oi->upperdentry = NULL;
 	oi->cache = NULL;
 	oi->dyn_parked = NULL;
+	oi->origin_gen = 0;
 	atomic64_set(&oi->version, 0);
 	mutex_init(&oi->lock);
 
@@ -140,8 +141,18 @@ static int aufsng_show_options(struct seq_file *m, struct dentry *dentry)
 	 * REPLAY, but the parse ignores a replayed br: on remount, so
 	 * even a manual `busybox mount -o remount` in an initrd rescue
 	 * shell cannot feed a truncated branch list back in.)
+	 *
+	 * RCU, not dyn_lock: the /proc/mounts reader already holds
+	 * namespace_sem, and dyn_lock ranks before the branch dirs'
+	 * i_rwsem (lookup), which ranks before namespace_sem
+	 * (lock_mount) - taking dyn_lock here would close that cycle
+	 * into a deadlock.  RCU is sufficient: a superseded root stack
+	 * is freed only after a grace period, and branch removal
+	 * releases the config strings after that same grace period
+	 * (aufsng_dyn_release_branch ordering in aufsng_dyn_del_branch),
+	 * so whichever stack this snapshot sees, its slots are intact.
 	 */
-	down_read(&pfs->dyn_lock);
+	rcu_read_lock();
 	seq_puts(m, ",br:");
 	seq_escape(m, pfs->config.br_paths[0], " \t\n\\");
 	seq_printf(m, "=%s", pfs->config.br_perms[0]);
@@ -153,7 +164,7 @@ static int aufsng_show_options(struct seq_file *m, struct dentry *dentry)
 		seq_escape(m, pfs->config.br_paths[idx], " \t\n\\");
 		seq_printf(m, "=%s", pfs->config.br_perms[idx]);
 	}
-	up_read(&pfs->dyn_lock);
+	rcu_read_unlock();
 	if (pfs->config.xino_path)
 		seq_show_option(m, "xino", pfs->config.xino_path);
 	switch (pfs->config.udba) {
@@ -275,6 +286,17 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		errorfc(fc, "the first branch (index 0) must be 'rw'");
 		return -EINVAL;
 	}
+	/*
+	 * Declaring branch 0 'rw' is not enough - it must actually be
+	 * writable, or every create/copy-up/whiteout would fail with
+	 * EROFS long after the mount reported success.
+	 */
+	if (sb_rdonly(ctx->br[0].path.mnt->mnt_sb) ||
+	    (ctx->br[0].path.mnt->mnt_flags & MNT_READONLY)) {
+		errorfc(fc, "the rw branch '%s' is on a read-only filesystem or mount",
+			ctx->br[0].name);
+		return -EROFS;
+	}
 
 	err = -ENOMEM;
 	pfs = kzalloc(sizeof(*pfs), GFP_KERNEL);
@@ -282,6 +304,7 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		return err;
 	sb->s_fs_info = pfs;
 	init_rwsem(&pfs->dyn_lock);
+	atomic64_set(&pfs->branch_gen, 0);
 	pfs->config.maxbranch = max_t(size_t, ctx->nr, AUFSNG_MAXBRANCH_DEF);
 	pfs->config.xino_path = ctx->config.xino_path;
 	ctx->config.xino_path = NULL;
