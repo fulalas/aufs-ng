@@ -106,12 +106,15 @@ static int aufsng_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct path path;
 	int err;
 
-	/* branch 0 (rw) may be swapped by a runtime add/remove */
-	down_read(&pfs->dyn_lock);
+	/*
+	 * No lock: branch 0 is written exactly once, in
+	 * aufsng_fill_super() - runtime add/remove only ever touch
+	 * slots >= 1 - and every other aufsng_upper_mnt() reader is
+	 * already lockless on the same grounds.
+	 */
 	path.mnt = aufsng_upper_mnt(pfs);
 	path.dentry = path.mnt->mnt_root;
 	err = vfs_statfs(&path, buf);
-	up_read(&pfs->dyn_lock);
 
 	if (!err) {
 		buf->f_namelen = pfs->namelen;
@@ -157,7 +160,8 @@ static int aufsng_show_options(struct seq_file *m, struct dentry *dentry)
 	seq_printf(m, "=%s", pfs->config.br_perms[0]);
 	oe = AUFSNG_E(dentry);
 	for (i = 0; oe && i < oe->numlower; i++) {
-		unsigned int idx = oe->lowerstack[i].layer->idx;
+		unsigned int idx = aufsng_layer_idx(pfs,
+						    oe->lowerstack[i].layer);
 
 		seq_putc(m, ':');
 		seq_escape(m, pfs->config.br_paths[idx], " \t\n\\");
@@ -244,6 +248,32 @@ int aufsng_check_layer(struct super_block *sb, const struct path *path,
 }
 
 /*
+ * A branch must not be the same directory as - or nest inside - any
+ * other branch (real AUFS's test_overlap): with nesting, a whiteout
+ * created in one branch's directory tree is simultaneously a live
+ * marker inside the other branch, so deleting one union path silently
+ * hides an unrelated one.  is_subdir() answers ancestry within one sb
+ * (it also matches equal dentries); branches on different filesystems
+ * cannot overlap on disk and need no check.
+ */
+int aufsng_check_overlap(struct aufsng_fs *pfs, struct dentry *dentry,
+		      const char *name)
+{
+	unsigned int i;
+
+	for (i = 0; i < pfs->numlayer; i++) {
+		struct vfsmount *mnt = pfs->layers[i].mnt;
+
+		if (mnt && (is_subdir(dentry, mnt->mnt_root) ||
+			    is_subdir(mnt->mnt_root, dentry))) {
+			pr_err("aufs: %s overlaps an existing branch\n", name);
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+/*
  * The whiteout probe for a name turns it into ".wh.<name>" in the
  * same branch directory (see aufsng_wh_name()), so the advertised name
  * limit must leave room for that prefix, and must be the SMALLEST
@@ -251,7 +281,7 @@ int aufsng_check_layer(struct super_block *sb, const struct path *path,
  * cannot even store must not be accepted just because a deeper one
  * could.
  */
-static int aufsng_get_namelen(struct aufsng_fs *pfs, const struct path *path)
+int aufsng_get_namelen(struct aufsng_fs *pfs, const struct path *path)
 {
 	struct kstatfs statfs;
 	long namelen;
@@ -304,12 +334,11 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_fs_info = pfs;
 	init_rwsem(&pfs->dyn_lock);
 	atomic64_set(&pfs->branch_gen, 0);
-	pfs->config.maxbranch = max_t(size_t, ctx->nr, AUFSNG_MAXBRANCH_DEF);
 	pfs->config.xino_path = ctx->config.xino_path;
 	ctx->config.xino_path = NULL;
 	pfs->config.udba = ctx->config.udba;
 
-	pfs->numlayer_cap = pfs->config.maxbranch + 1;
+	pfs->numlayer_cap = max_t(size_t, ctx->nr, AUFSNG_MAXBRANCH_DEF) + 1;
 	pfs->layers = kcalloc(pfs->numlayer_cap, sizeof(*pfs->layers),
 			      GFP_KERNEL);
 	if (!pfs->layers)
@@ -343,6 +372,11 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		err = aufsng_check_layer(sb, &ctx->br[i].path, ctx->br[i].name);
 		if (err)
 			goto out_free;
+		/* against the branches already cloned into layers[0..i-1] */
+		err = aufsng_check_overlap(pfs, ctx->br[i].path.dentry,
+					ctx->br[i].name);
+		if (err)
+			goto out_free;
 		err = aufsng_get_namelen(pfs, &ctx->br[i].path);
 		if (err)
 			goto out_free;
@@ -364,7 +398,6 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 			mnt->mnt_flags |= MNT_READONLY | MNT_NOATIME;
 
 		pfs->layers[i].mnt = mnt;
-		pfs->layers[i].idx = i;
 		pfs->config.br_paths[i] = ctx->br[i].name;
 		ctx->br[i].name = NULL;
 		strscpy(pfs->config.br_perms[i], ctx->br[i].permstr,

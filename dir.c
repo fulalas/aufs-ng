@@ -52,31 +52,6 @@ static const struct cred *aufsng_override_create_creds(struct aufsng_fs *pfs,
 	return old;
 }
 
-/*
- * Does any lower branch of @dir still visibly provide @name?  Decides
- * whether removing @name from the rw branch must leave a whiteout
- * behind.  Returns 1/0, negative errno on error - an error must never
- * be treated as "not covered", or the delete silently skips the
- * whiteout and the lower file resurrects later.
- *
- * The caller must hold pfs->dyn_lock across BOTH this check and the
- * mutation it guards: a branch spliced in or out between the two
- * would make the verdict stale (a deleted name would resurrect
- * uncovered, or a stray whiteout would mask nothing), and must run
- * under credentials able to search the branch dirs (creator creds).
- */
-static int aufsng_lower_covers(struct aufsng_fs *pfs, struct inode *dir,
-			    const struct qstr *name)
-{
-	struct aufsng_path origin;
-	int found;
-
-	found = aufsng_find_origin(AUFSNG_I_E(dir), name, &origin);
-	if (found > 0)
-		dput(origin.dentry);
-	return found;
-}
-
 /* create one 0444 marker file (matching real AUFS's WH_MASK) */
 static int aufsng_create_marker(struct aufsng_fs *pfs, struct dentry *upperdir,
 			     struct qstr *wh)
@@ -187,15 +162,59 @@ void aufsng_remove_object(struct aufsng_fs *pfs, struct dentry *upperdir,
 	slot = start_removing_noperm(upperdir, &q);
 	err = PTR_ERR_OR_ZERO(slot);
 	if (!err) {
-		if (is_dir)
-			err = vfs_rmdir(idmap, d_inode(upperdir), slot, NULL);
-		else
+		if (is_dir) {
+			/*
+			 * A leftover directory may already carry its own
+			 * bookkeeping - a failed mkdir-over-lower dies
+			 * AFTER its ".wh..wh..opq" marker was created -
+			 * and vfs_rmdir() on a physically non-empty dir
+			 * is ENOTEMPTY, which would leak the leftover
+			 * behind the restored whiteout as a permanent
+			 * EEXIST.  Sweep the markers first, exactly as
+			 * the rmdir path does.
+			 */
+			err = aufsng_clear_whiteouts(pfs, slot);
+			if (!err)
+				err = vfs_rmdir(idmap, d_inode(upperdir), slot,
+						NULL);
+		} else {
 			err = vfs_unlink(idmap, d_inode(upperdir), slot, NULL);
+		}
 		end_dirop(slot);
 	}
 	if (err)
 		pr_err("aufs (aufs-ng): failed to remove leftover '%.*s' (%d)\n",
 		       name->len, name->name, err);
+}
+
+/*
+ * Rename one entry inside the rw branch: @src (under @src_parent) to
+ * @dst (under @dst_parent).  The single home of the renamedata +
+ * start_renaming()/vfs_rename()/end_renaming() convention, shared by
+ * whiteout parking and the rename-undo paths.  Metadata-only, needs no
+ * space, so it works on the full branch that typically made an undo
+ * caller want it.
+ */
+static int aufsng_branch_rename(struct aufsng_fs *pfs,
+			     struct dentry *src_parent,
+			     const struct qstr *src,
+			     struct dentry *dst_parent,
+			     const struct qstr *dst)
+{
+	struct renamedata rd = {};
+	struct qstr srcq = QSTR_LEN(src->name, src->len);
+	struct qstr dstq = QSTR_LEN(dst->name, dst->len);
+	int err;
+
+	rd.mnt_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	rd.old_parent = src_parent;
+	rd.new_parent = dst_parent;
+	err = start_renaming(&rd, 0, &srcq, &dstq);
+	if (!err) {
+		err = vfs_rename(&rd);
+		end_renaming(&rd);
+	}
+	return err;
 }
 
 static atomic_t aufsng_whtmp_seq = ATOMIC_INIT(0);
@@ -219,7 +238,6 @@ static int aufsng_park_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
 			     const struct qstr *name, struct qstr *tmp,
 			     char *tmpbuf)
 {
-	struct renamedata rd = {};
 	char whbuf[NAME_MAX + 1];
 	struct qstr wh;
 	int present;
@@ -235,14 +253,7 @@ static int aufsng_park_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
 	*tmp = QSTR_LEN(tmpbuf, snprintf(tmpbuf, NAME_MAX + 1, ".wh..wh.tmp.%u",
 					 atomic_inc_return(&aufsng_whtmp_seq)));
 
-	rd.mnt_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
-	rd.old_parent = upperdir;
-	rd.new_parent = upperdir;
-	err = start_renaming(&rd, 0, &wh, tmp);
-	if (err)
-		return err;
-	err = vfs_rename(&rd);
-	end_renaming(&rd);
+	err = aufsng_branch_rename(pfs, upperdir, &wh, upperdir, tmp);
 	return err ? err : 1;
 }
 
@@ -252,7 +263,6 @@ static void aufsng_unpark_whiteout(struct aufsng_fs *pfs,
 				const struct qstr *name,
 				struct qstr *tmp, bool restore)
 {
-	struct renamedata rd = {};
 	char whbuf[NAME_MAX + 1];
 	struct qstr wh;
 	int err;
@@ -264,16 +274,8 @@ static void aufsng_unpark_whiteout(struct aufsng_fs *pfs,
 	}
 
 	err = aufsng_wh_name(whbuf, name, &wh);
-	if (!err) {
-		rd.mnt_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
-		rd.old_parent = upperdir;
-		rd.new_parent = upperdir;
-		err = start_renaming(&rd, 0, tmp, &wh);
-	}
-	if (!err) {
-		err = vfs_rename(&rd);
-		end_renaming(&rd);
-	}
+	if (!err)
+		err = aufsng_branch_rename(pfs, upperdir, tmp, upperdir, &wh);
 	/*
 	 * A metadata-only operation on an entry this call just parked;
 	 * failure means the branch fs is in serious trouble.  The
@@ -579,6 +581,7 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	const struct cred *old_cred;
 	struct dentry *pupper, *upper;
+	bool real_removed = false;
 	int covered;
 	int err;
 
@@ -606,7 +609,7 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	 * the delete returns.
 	 */
 	down_read(&pfs->dyn_lock);
-	covered = aufsng_lower_covers(pfs, dir, &dentry->d_name);
+	covered = aufsng_lower_covers(dir, &dentry->d_name);
 	if (covered < 0) {
 		err = covered;
 		goto out_dyn;
@@ -677,6 +680,8 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 				err = vfs_unlink(idmap, d_inode(pupper), slot,
 						 NULL);
 			}
+			if (!err)
+				real_removed = true;
 			end_dirop(slot);
 		}
 		if (err) {
@@ -700,10 +705,23 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 		}
 	}
 
-	if (is_dir)
-		clear_nlink(inode);
-	else
+	/*
+	 * The union inode mirrors the real inode's attributes, so its
+	 * link count only moves when a real link was actually removed.
+	 * A whiteout-only removal (lower-only name, or a copied-up
+	 * hardlink sibling's other name) changed no real inode: an
+	 * unconditional drop would push a live shared union inode
+	 * (lower hardlink siblings share one) to nlink 0 while the other
+	 * name is still linked - and wrap to UINT_MAX with a WARN when
+	 * that name is removed later.  Directories cannot be hardlinked,
+	 * so a really-removed dir is simply dead.
+	 */
+	if (is_dir) {
+		if (real_removed || !upper)
+			clear_nlink(inode);
+	} else if (real_removed) {
 		drop_nlink(inode);
+	}
 	atomic64_inc(&AUFSNG_I(dir)->version);
 	aufsng_copyattr(dir);
 
@@ -726,33 +744,6 @@ int aufsng_rmdir(struct inode *dir, struct dentry *dentry)
 	return aufsng_do_remove(dentry, true);
 }
 
-/*
- * Undo a just-committed upper rename: move the (still-locked-out from
- * the union's point of view) new name back to the old one.  Metadata-
- * only, needs no space, so it succeeds even on the full branch that
- * typically made the caller want to undo.
- */
-static int aufsng_rename_back(struct aufsng_fs *pfs, struct dentry *oldparent,
-			   const struct qstr *oldname,
-			   struct dentry *newparent,
-			   const struct qstr *newname)
-{
-	struct renamedata rd = {};
-	struct qstr oldq = QSTR_LEN(oldname->name, oldname->len);
-	struct qstr newq = QSTR_LEN(newname->name, newname->len);
-	int err;
-
-	rd.mnt_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
-	rd.old_parent = newparent;
-	rd.new_parent = oldparent;
-	err = start_renaming(&rd, 0, &newq, &oldq);
-	if (!err) {
-		err = vfs_rename(&rd);
-		end_renaming(&rd);
-	}
-	return err;
-}
-
 int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	       struct dentry *old, struct inode *newdir,
 	       struct dentry *new, unsigned int flags)
@@ -768,9 +759,14 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	 * destroyed something, not on union visibility: a victim that
 	 * exists only in a lower branch has no upper entry, so the
 	 * rename created the upper name and undoing it is loss-free.
+	 * Decided from the branch rename's own target lookup, under the
+	 * branch parent locks, right before vfs_rename() - not sampled
+	 * at entry: the union inode's upperdentry is a per-inode proxy
+	 * that lies for lower hardlink siblings (the shared inode holds
+	 * the OTHER name's upper), and a copy-up racing the long window
+	 * before the locks could create or reuse an upper meanwhile.
 	 */
-	bool had_victim = d_is_positive(new) &&
-			  aufsng_upperdentry(d_inode(new));
+	bool had_victim = false;
 	bool replace_dir = d_is_positive(new) && d_is_dir(new);
 	char whtmpbuf[NAME_MAX + 1];
 	struct qstr whtmp;
@@ -819,17 +815,42 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	 * concurrent branch add/remove cannot make either stale.
 	 */
 	down_read(&pfs->dyn_lock);
-	covered = aufsng_lower_covers(pfs, olddir, &old->d_name);
+
+	/*
+	 * Re-derive the merged-directory -EXDEV verdicts now that
+	 * dyn_lock is held: the entry checks above ran before the
+	 * copy-ups, and a runtime branch add in that window can splice
+	 * a lower into either directory's stack
+	 * (aufsng_dyn_splice_cached mutates exactly oe->numlower under
+	 * dyn_lock for writing, taking no i_rwsem this rename holds).
+	 * Renaming such a directory would detach it from freshly merged
+	 * lower content and then mark it opaque - hiding the just-added
+	 * branch's subtree for good.
+	 */
+	err = -EXDEV;
+	if (d_is_dir(old)) {
+		oe = AUFSNG_I_E(d_inode(old));
+		if (oe && oe->numlower)
+			goto out;
+	}
+	if (replace_dir) {
+		oe = AUFSNG_I_E(d_inode(new));
+		if (oe && oe->numlower)
+			goto out;
+	}
+
+	covered = aufsng_lower_covers(olddir, &old->d_name);
 	if (covered < 0) {
 		err = covered;
 		goto out;
 	}
 	covered_new = d_is_dir(old) ?
-		aufsng_lower_covers(pfs, newdir, &new->d_name) : 0;
+		aufsng_lower_covers(newdir, &new->d_name) : 0;
 	if (covered_new < 0) {
 		err = covered_new;
 		goto out;
 	}
+	err = 0;
 
 	newupperdir = aufsng_upperdentry(newdir);
 
@@ -873,6 +894,7 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 		err = start_renaming(&rd, 0, &oldq, &newq);
 	}
 	if (!err) {
+		had_victim = d_is_positive(rd.new_dentry);
 		err = vfs_rename(&rd);
 		end_renaming(&rd);
 	}
@@ -895,9 +917,9 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 		 * is warned about.
 		 */
 		if (wherr && !had_victim &&
-		    !aufsng_rename_back(pfs, aufsng_upperdentry(olddir),
-				     &old->d_name, newupperdir,
-				     &new->d_name)) {
+		    !aufsng_branch_rename(pfs, newupperdir, &new->d_name,
+				       aufsng_upperdentry(olddir),
+				       &old->d_name)) {
 			err = wherr;
 			goto out_unpark;
 		}
@@ -930,10 +952,10 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 						aufsng_upperdentry(olddir),
 						&old->d_name);
 			if (!backerr)
-				backerr = aufsng_rename_back(pfs,
+				backerr = aufsng_branch_rename(pfs,
+						newupperdir, &new->d_name,
 						aufsng_upperdentry(olddir),
-						&old->d_name, newupperdir,
-						&new->d_name);
+						&old->d_name);
 			if (!backerr) {
 				err = opqerr;
 				goto out_unpark;

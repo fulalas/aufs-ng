@@ -96,7 +96,11 @@ mount -t aufs -o remount,del=/path/to/module aufs /  # remove the layer
 ```
 
 `add=1:` inserts the new branch right below the writable one, so the
-newest layer wins over older ones — the `aufs` convention.
+newest layer wins over older ones — the `aufs` convention. It is also
+the only insert position `aufs-ng` implements: any other index is
+rejected at mount time rather than silently merged in the wrong order.
+Branches must not overlap — a branch that is the same directory as, or
+nested inside, another branch is rejected, as original `aufs` does.
 
 Each branch gets a mode: `rw` (writable — only the first branch can be)
 or `ro` (read-only). For compatibility, `aufs-ng` also accepts `aufs`'s
@@ -106,7 +110,10 @@ simply mean read-only here.
 
 - `udba=` — `reval` (the default) shows changes made directly inside a
   branch; `none` skips that detection (faster and safe if branches are
-  never modified directly); `notify` is accepted but behaves as `reval`.
+  never modified directly); `notify` (and its `fsnotify` spelling) is
+  accepted but behaves as `reval`. Any other value is rejected, as
+  original `aufs` rejects it — a typo must not silently disable
+  revalidation.
 - `xino=` — where original `aufs` writes its inode-number table; `aufs-ng`
   keeps inode numbers stable without a table, so this is ignored.
 - `dirperm1` — makes original `aufs` check only the topmost branch's

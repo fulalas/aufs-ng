@@ -221,6 +221,19 @@ static int aufsng_parse_add(struct fs_context *fc, char *value)
 	*colon = '\0';
 	if (kstrtouint(value, 10, &pos))
 		return invalfc(fc, "add= index must be numeric");
+	/*
+	 * Only "add=1:" (insert immediately below the writable branch,
+	 * i.e. as the new TOP lower) is implemented: the in-place splice
+	 * into cached directories has no notion of a deeper insert
+	 * position, so accepting another index would honor it in the
+	 * root stack only and leave cached directories merged in a
+	 * different priority order (and "0" would mean outranking the
+	 * writable branch, which a single-rw design cannot do).  Reject
+	 * rather than silently misplace.
+	 */
+	if (pos != 1)
+		return invalfc(fc, "add=%u: is not supported, only add=1: (top of the read-only stack)",
+			       pos);
 
 	err = aufsng_ctx_realloc((void **)&ctx->dyn_add, &ctx->cap_dyn_add,
 			      ctx->nr_dyn_add + 1, sizeof(*ctx->dyn_add));
@@ -230,7 +243,6 @@ static int aufsng_parse_add(struct fs_context *fc, char *value)
 				    &ctx->dyn_add[ctx->nr_dyn_add]);
 	if (err)
 		return err;
-	ctx->dyn_add[ctx->nr_dyn_add].pos = pos;
 	ctx->nr_dyn_add++;
 	return 0;
 }
@@ -299,12 +311,23 @@ static int aufsng_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	case Opt_noxino:
 		return 0;
 	case Opt_udba:
-		if (!strcmp(param->string, "notify"))
+		/*
+		 * The value set real AUFS accepts (au_udba_val); anything
+		 * else is rejected, as AUFS rejects it - a typo silently
+		 * mapping to "none" would disable revalidation while the
+		 * user believes it is on (worse on remount, where the
+		 * explicit value overrides the mount-time choice).
+		 */
+		if (!strcmp(param->string, "notify") ||
+		    !strcmp(param->string, "fsnotify"))
 			ctx->config.udba = AUFSNG_UDBA_NOTIFY;
 		else if (!strcmp(param->string, "reval"))
 			ctx->config.udba = AUFSNG_UDBA_REVAL;
-		else
+		else if (!strcmp(param->string, "none"))
 			ctx->config.udba = AUFSNG_UDBA_NONE;
+		else
+			return invalfc(fc, "unknown udba value '%s'",
+				       param->string);
 		ctx->udba_set = true;
 		return 0;
 	case Opt_dirperm1:

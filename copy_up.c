@@ -53,8 +53,14 @@ retry:
 		if (size == -ERANGE || (size > 0 && !value)) {
 			void *new_value;
 
-			size = vfs_getxattr(old_idmap, oldpath->dentry, name,
-					    NULL, 0);
+			/*
+			 * With no buffer yet the call above was already
+			 * the size probe; only -ERANGE (the value grew
+			 * past the buffer) needs a fresh one.
+			 */
+			if (size == -ERANGE)
+				size = vfs_getxattr(old_idmap, oldpath->dentry,
+						    name, NULL, 0);
 			if (size < 0)
 				goto next;
 			new_value = kvmalloc(size, GFP_KERNEL);
@@ -299,6 +305,20 @@ static int aufsng_copy_up_commit_regular(struct aufsng_fs *pfs,
 	err = start_renaming_dentry(&rd, 0, work, &nameq);
 	if (err)
 		return err;
+	/*
+	 * A POSITIVE target is a foreign object that claimed the name
+	 * while the copy-up ran: rename(2) moving another file onto it
+	 * is the one mutation oi->lock cannot see coming (the rename
+	 * serializes on the VICTIM's locks, not this inode's).  Renaming
+	 * the temp over it would replace that freshly renamed file with
+	 * this inode's stale lower content - silent data loss reported
+	 * as success.  Abort instead; the caller cleans up the temp and
+	 * the opener retries against the new state of the name.
+	 */
+	if (d_is_positive(rd.new_dentry)) {
+		end_renaming(&rd);
+		return -ESTALE;
+	}
 	err = vfs_rename(&rd);
 	end_renaming(&rd);
 	return err;

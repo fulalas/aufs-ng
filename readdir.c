@@ -62,8 +62,12 @@ struct aufsng_dir_cache {
 	 * lower branch through its source mount - invalidate the cache
 	 * without re-reading every branch on each open; those edits are
 	 * the only way the merged view can change without bumping
-	 * @version, and lookup's own revalidation already honors them,
-	 * so readdir must too or the two permanently disagree.
+	 * @version.  Lookup's revalidation honors the same signals for
+	 * positive names (and negatives under an upper-backed parent;
+	 * a cached negative whose parent has NO upper deliberately
+	 * skips the lower rescan - see aufsng_lookup_negative_valid() -
+	 * so readdir may show an out-of-band lower addition before a
+	 * cached miss for it expires).
 	 * i_version is the tick-independent signal where the branch fs
 	 * supports it; mtime is the always-present fallback.
 	 */
@@ -89,12 +93,21 @@ struct aufsng_dir_file {
 	loff_t cursor_pos;
 };
 
-struct aufsng_readdir_data {
+/*
+ * Common head for actors fed through aufsng_dir_drain(): the drain
+ * loop needs the per-call progress count and the actor's sticky error.
+ * Must be the first member of the embedding struct.
+ */
+struct aufsng_dir_drain {
 	struct dir_context ctx;
-	struct aufsng_dir_cache *cache;
-	unsigned int idx;	/* branch slot of the layer being read */
 	int count;
 	int err;
+};
+
+struct aufsng_readdir_data {
+	struct aufsng_dir_drain dd;
+	struct aufsng_dir_cache *cache;
+	unsigned int idx;	/* branch slot of the layer being read */
 };
 
 /* ".wh..wh." double-prefix: opaque marker + AUFS bookkeeping names */
@@ -220,11 +233,10 @@ static bool aufsng_fill_merge(struct dir_context *ctx, const char *name,
 			   unsigned int d_type)
 {
 	struct aufsng_readdir_data *rdd =
-		container_of(ctx, struct aufsng_readdir_data, ctx);
+		container_of(ctx, struct aufsng_readdir_data, dd.ctx);
 	int err;
 
-	if (name[0] == '.' && (namelen == 1 ||
-			       (namelen == 2 && name[1] == '.')))
+	if (name_is_dot_dotdot(name, namelen))
 		return true;
 
 	if (aufsng_is_wh_bookkeeping(name, namelen))
@@ -253,22 +265,24 @@ static bool aufsng_fill_merge(struct dir_context *ctx, const char *name,
 	}
 
 	if (err) {
-		rdd->err = err;
+		rdd->dd.err = err;
 		return false;
 	}
-	rdd->count++;
+	rdd->dd.count++;
 	return true;
 }
 
-static int aufsng_dir_read_layer(struct aufsng_fs *pfs, const struct path *realpath,
-			      struct aufsng_dir_cache *cache, unsigned int idx)
+/*
+ * Open the real directory @realpath with the creator credentials and
+ * feed every entry through @dd's actor.  A single iterate_dir() call
+ * is not guaranteed to reach the end of the directory, so it is called
+ * again until a call adds nothing (the actor counts its accepted
+ * entries in dd->count); the actor's own sticky error (dd->err) is
+ * honored only when the call itself succeeded.
+ */
+static int aufsng_dir_drain(struct aufsng_fs *pfs, const struct path *realpath,
+			 struct aufsng_dir_drain *dd)
 {
-	struct aufsng_readdir_data rdd = {
-		.ctx.actor = aufsng_fill_merge,
-		.ctx.count = INT_MAX,
-		.cache = cache,
-		.idx = idx,
-	};
 	struct file *realfile;
 	int err;
 
@@ -277,20 +291,29 @@ static int aufsng_dir_read_layer(struct aufsng_fs *pfs, const struct path *realp
 	if (IS_ERR(realfile))
 		return PTR_ERR(realfile);
 
-	/*
-	 * A single iterate_dir() call is not guaranteed to reach the
-	 * end of the directory; keep calling until a call adds nothing.
-	 */
 	do {
-		rdd.count = 0;
-		rdd.err = 0;
-		err = iterate_dir(realfile, &rdd.ctx);
+		dd->count = 0;
+		dd->err = 0;
+		err = iterate_dir(realfile, &dd->ctx);
 		if (!err)
-			err = rdd.err;
-	} while (!err && rdd.count);
+			err = dd->err;
+	} while (!err && dd->count);
 
 	fput(realfile);
 	return err;
+}
+
+static int aufsng_dir_read_layer(struct aufsng_fs *pfs, const struct path *realpath,
+			      struct aufsng_dir_cache *cache, unsigned int idx)
+{
+	struct aufsng_readdir_data rdd = {
+		.dd.ctx.actor = aufsng_fill_merge,
+		.dd.ctx.count = INT_MAX,
+		.cache = cache,
+		.idx = idx,
+	};
+
+	return aufsng_dir_drain(pfs, realpath, &rdd.dd);
 }
 
 static void aufsng_cache_free(struct aufsng_dir_cache *cache)
@@ -408,7 +431,8 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
 		realpath.mnt = oe->lowerstack[i].layer->mnt;
 		realpath.dentry = oe->lowerstack[i].dentry;
 		err = aufsng_dir_read_layer(pfs, &realpath, cache,
-					 oe->lowerstack[i].layer->idx);
+					 aufsng_layer_idx(pfs,
+							  oe->lowerstack[i].layer));
 	}
 
 out:
@@ -627,10 +651,8 @@ struct aufsng_wh_sweep_name {
 };
 
 struct aufsng_wh_sweep {
-	struct dir_context ctx;
+	struct aufsng_dir_drain dd;
 	struct list_head names;
-	int count;
-	int err;
 };
 
 static bool aufsng_wh_sweep_actor(struct dir_context *ctx, const char *name,
@@ -638,7 +660,7 @@ static bool aufsng_wh_sweep_actor(struct dir_context *ctx, const char *name,
 			       unsigned int d_type)
 {
 	struct aufsng_wh_sweep *sw =
-		container_of(ctx, struct aufsng_wh_sweep, ctx);
+		container_of(ctx, struct aufsng_wh_sweep, dd.ctx);
 	struct aufsng_wh_sweep_name *p;
 
 	if (!aufsng_is_wh_name(name, namelen))
@@ -646,14 +668,14 @@ static bool aufsng_wh_sweep_actor(struct dir_context *ctx, const char *name,
 
 	p = kmalloc(sizeof(*p) + namelen + 1, GFP_KERNEL);
 	if (!p) {
-		sw->err = -ENOMEM;
+		sw->dd.err = -ENOMEM;
 		return false;
 	}
 	memcpy(p->name, name, namelen);
 	p->name[namelen] = '\0';
 	p->len = namelen;
 	list_add_tail(&p->node, &sw->names);
-	sw->count++;
+	sw->dd.count++;
 	return true;
 }
 
@@ -674,32 +696,19 @@ int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir)
 {
 	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	struct aufsng_wh_sweep sw = {
-		.ctx.actor = aufsng_wh_sweep_actor,
-		.ctx.count = INT_MAX,
+		.dd.ctx.actor = aufsng_wh_sweep_actor,
+		.dd.ctx.count = INT_MAX,
 	};
 	struct aufsng_wh_sweep_name *p, *n;
 	struct path realpath = {
 		.mnt = aufsng_upper_mnt(pfs),
 		.dentry = upperdir,
 	};
-	struct file *realfile;
 	int err;
 
 	INIT_LIST_HEAD(&sw.names);
 
-	realfile = dentry_open(&realpath, O_RDONLY | O_DIRECTORY | O_LARGEFILE,
-			       pfs->creator_cred);
-	if (IS_ERR(realfile))
-		return PTR_ERR(realfile);
-	/* as in aufsng_dir_read_layer(): iterate until a call adds nothing */
-	do {
-		sw.count = 0;
-		sw.err = 0;
-		err = iterate_dir(realfile, &sw.ctx);
-		if (!err)
-			err = sw.err;
-	} while (!err && sw.count);
-	fput(realfile);
+	err = aufsng_dir_drain(pfs, &realpath, &sw.dd);
 
 	if (!err) {
 		/*
@@ -784,7 +793,34 @@ static int aufsng_dir_release(struct inode *inode, struct file *file)
 static int aufsng_dir_fsync(struct file *file, loff_t start, loff_t end,
 			 int datasync)
 {
-	return 0;
+	struct inode *inode = file_inode(file);
+	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
+	struct dentry *upper = aufsng_upperdentry(inode);
+	struct path realpath;
+	struct file *realfile;
+	int err;
+
+	/*
+	 * Installers fsync a parent directory to make a create/rename
+	 * durable before committing a transaction; only the rw branch
+	 * can hold such dirty state (the lowers are read-only), and a
+	 * directory with no upper has had no union mutations at all.
+	 * The union keeps no long-lived real dir file (aufsng_dir_open
+	 * only builds the merged cache), so the upper dir is opened for
+	 * the sync, as original AUFS's au_do_fsync_dir_no_file does.
+	 */
+	if (!upper)
+		return 0;
+
+	realpath.mnt = aufsng_upper_mnt(pfs);
+	realpath.dentry = upper;
+	realfile = dentry_open(&realpath, O_RDONLY | O_DIRECTORY | O_LARGEFILE,
+			       pfs->creator_cred);
+	if (IS_ERR(realfile))
+		return PTR_ERR(realfile);
+	err = vfs_fsync_range(realfile, start, end, datasync);
+	fput(realfile);
+	return err;
 }
 
 const struct file_operations aufsng_dir_operations = {
