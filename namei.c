@@ -22,6 +22,29 @@
 #include "aufsng.h"
 
 /*
+ * Probe @dir (in @mnt) for the AUFS bookkeeping marker @name.
+ * Returns 1 if present as a regular file, 0 if absent, negative errno
+ * on lookup error.  @strict maps a positive non-regular occupant to
+ * -EIO (a corrupt marker must fail the operation) instead of treating
+ * it as absent.
+ */
+static int aufsng_probe_marker(struct vfsmount *mnt, struct dentry *dir,
+			    struct qstr *name, bool strict)
+{
+	struct dentry *whd;
+	int ret = 0;
+
+	whd = lookup_one_unlocked(mnt_idmap(mnt), name, dir);
+	if (IS_ERR(whd))
+		return PTR_ERR(whd);
+
+	if (d_is_positive(whd))
+		ret = d_is_reg(whd) ? 1 : (strict ? -EIO : 0);
+	dput(whd);
+	return ret;
+}
+
+/*
  * Does @parent (in @mnt) contain a whiteout for @name?  Returns 1 if
  * yes, 0 if no, negative errno on error.  This is a lookup for the
  * SIBLING name ".wh.<name>", not a property of @name's own dentry.
@@ -31,7 +54,6 @@ int aufsng_check_whiteout(struct vfsmount *mnt, struct dentry *parent,
 {
 	char buf[NAME_MAX + 1];
 	struct qstr wh;
-	struct dentry *whd;
 	int ret;
 
 	/*
@@ -46,35 +68,16 @@ int aufsng_check_whiteout(struct vfsmount *mnt, struct dentry *parent,
 	if (ret)
 		return 0;
 
-	whd = lookup_one_unlocked(mnt_idmap(mnt), &wh, parent);
-	if (IS_ERR(whd))
-		return PTR_ERR(whd);
-
-	ret = 0;
-	if (d_is_positive(whd)) {
-		if (d_is_reg(whd))
-			ret = 1;
-		else
-			ret = -EIO;	/* corrupt whiteout entry */
-	}
-	dput(whd);
-	return ret;
+	/* a corrupt (non-regular) whiteout entry is -EIO, not "absent" */
+	return aufsng_probe_marker(mnt, parent, &wh, true);
 }
 
 /* is @dir (in @mnt) marked opaque? */
 int aufsng_check_diropq(struct vfsmount *mnt, struct dentry *dir)
 {
 	struct qstr opq = QSTR(AUFSNG_WH_DIROPQ);
-	struct dentry *whd;
-	int ret;
 
-	whd = lookup_one_unlocked(mnt_idmap(mnt), &opq, dir);
-	if (IS_ERR(whd))
-		return PTR_ERR(whd);
-
-	ret = d_is_positive(whd) && d_is_reg(whd);
-	dput(whd);
-	return ret;
+	return aufsng_probe_marker(mnt, dir, &opq, false);
 }
 
 /*
@@ -144,6 +147,31 @@ int aufsng_find_origin(struct aufsng_entry *poe, const struct qstr *name,
 }
 
 /*
+ * Does any lower branch of @dir still visibly provide @name?  The
+ * boolean form of aufsng_find_origin() for callers that only need the
+ * verdict, not the origin itself.  Returns 1/0, negative errno on
+ * error - each call site decides its own error policy (mutations must
+ * treat an error as fatal, or a delete silently skips its whiteout;
+ * revalidation keeps the dentry instead of thrashing it).
+ *
+ * A caller pairing this verdict with a mutation must hold
+ * pfs->dyn_lock across BOTH: a branch spliced in or out between the
+ * two would make the verdict stale (a deleted name would resurrect
+ * uncovered, or a stray whiteout would mask nothing).  Must run under
+ * credentials able to search the branch dirs (creator creds).
+ */
+int aufsng_lower_covers(struct inode *dir, const struct qstr *name)
+{
+	struct aufsng_path origin;
+	int found;
+
+	found = aufsng_find_origin(AUFSNG_I_E(dir), name, &origin);
+	if (found > 0)
+		dput(origin.dentry);
+	return found;
+}
+
+/*
  * udba=reval negative-dentry revalidation.  A cached negative name may
  * have been resurrected by a direct branch change the union never saw
  * (typically a ".wh.<name>" whiteout removed by hand in the rw branch).
@@ -157,11 +185,9 @@ bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(dir->i_sb);
 	const struct cred *old_cred;
-	struct aufsng_path origin;
 	struct dentry *pupper;
 	struct dentry *this;
 	bool valid = true;
-	int found;
 	int wh;
 
 	old_cred = override_creds(pfs->creator_cred);
@@ -198,11 +224,8 @@ bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name)
 	 * merge itself makes; errors keep the dentry valid rather than
 	 * thrash it.
 	 */
-	found = aufsng_find_origin(AUFSNG_I_E(dir), name, &origin);
-	if (found > 0) {
-		dput(origin.dentry);
+	if (aufsng_lower_covers(dir, name) > 0)
 		valid = false;	/* a lower branch now provides it */
-	}
 
 out:
 	up_read(&pfs->dyn_lock);
@@ -258,6 +281,7 @@ struct inode *aufsng_get_inode(struct super_block *sb,
 			    struct dentry *upperdentry,
 			    struct aufsng_entry *oe)
 {
+	struct aufsng_fs *pfs = AUFSNG_FS(sb);
 	struct inode *realinode;
 	struct inode *key;
 	struct inode *inode;
@@ -267,7 +291,8 @@ struct inode *aufsng_get_inode(struct super_block *sb,
 				  d_inode(oe->lowerstack[0].dentry);
 	key = oe->numlower ? d_inode(oe->lowerstack[0].dentry) :
 			     d_inode(upperdentry);
-	key_idx = oe->numlower ? oe->lowerstack[0].layer->idx : 0;
+	key_idx = oe->numlower ?
+		  aufsng_layer_idx(pfs, oe->lowerstack[0].layer) : 0;
 
 	inode = iget5_locked(sb, (unsigned long)key, aufsng_inode_test,
 			     aufsng_inode_set, key);
@@ -289,20 +314,31 @@ struct inode *aufsng_get_inode(struct super_block *sb,
 		 * the cached inode has one: a copy-up racing this
 		 * lookup, or a lower hardlink sibling of a copied-up
 		 * name - the cached state wins (matching AUFS, where
-		 * pseudo-links keep such names on one inode).  This
-		 * lookup found an upper the cached inode lacks, or a
-		 * different one (an app that saves by writing a temp
-		 * file and renaming it over the name gives the rw copy
-		 * a new inode on every save, and the union inode -
-		 * keyed by the stable lower origin - must follow it
-		 * instead of failing with ESTALE): adopt it via the
-		 * shared adopt-or-park machinery in dynlayer.c, which
-		 * also handles type mismatches (not adopted, fall
+		 * pseudo-links keep such names on one inode), but ONLY
+		 * while the cached upper is still alive.  A dead one
+		 * (unhashed by an out-of-band unlink/rename in the rw
+		 * branch - the exact udba=reval scenario) must be shed
+		 * instead: re-adopting it would serve the deleted upper's
+		 * content forever, and an open for write would skip
+		 * copy-up and write into the unlinked inode.  Shedding
+		 * lets the lower resurface, as the reval contract
+		 * promises.  This lookup found an upper the cached inode
+		 * lacks, or a different one (an app that saves by
+		 * writing a temp file and renaming it over the name
+		 * gives the rw copy a new inode on every save, and the
+		 * union inode - keyed by the stable lower origin - must
+		 * follow it instead of failing with ESTALE): adopt it
+		 * via the shared adopt-or-park machinery in dynlayer.c,
+		 * which also handles type mismatches (not adopted, fall
 		 * through to ESTALE) and parking the superseded upper
 		 * for lockless aufsng_path_real() readers.
 		 */
-		if (!ok && !new_u && oe->numlower)
-			ok = true;
+		if (!ok && !new_u && oe->numlower) {
+			if (!d_unhashed(cached) && !d_is_negative(cached))
+				ok = true;
+			else
+				ok = aufsng_dyn_shed_upper(inode);
+		}
 		if (!ok && new_u)
 			ok = aufsng_dyn_adopt_upper(inode,
 						 oe->numlower ?
@@ -431,13 +467,6 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 		if (found)
 			oe->lowerstack[0] = origin;
 	} else if (!stopped && poe && poe->numlower) {
-		err = -ENOMEM;
-		oe = aufsng_alloc_entry(poe->numlower);
-		if (!oe)
-			goto out;
-		err = 0;
-		oe->numlower = 0;
-
 		for (i = 0; i < poe->numlower; i++) {
 			struct aufsng_path *lower = &poe->lowerstack[i];
 
@@ -453,6 +482,21 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 				break;
 			if (!this)
 				continue;
+			/*
+			 * Allocated on the first hit, not up front, so
+			 * an all-negative lookup (PATH/include probes)
+			 * allocates nothing; the remaining branch count
+			 * still bounds the stack size.
+			 */
+			if (!oe) {
+				oe = aufsng_alloc_entry(poe->numlower - i);
+				if (!oe) {
+					dput(this);
+					err = -ENOMEM;
+					goto out;
+				}
+				oe->numlower = 0;
+			}
 			/*
 			 * Merging continues only through directories: a
 			 * non-directory match is the end of the stack,
@@ -519,12 +563,13 @@ out:
 	 * upper-dir stamp in d_fsdata and the branch generation in
 	 * d_time.  Both are per-dentry - the generation deliberately so,
 	 * because lower hardlink siblings share one union inode while
-	 * the winning-branch decision is per-name (dcache.c).
+	 * the winning-branch decision is per-name (dcache.c).  Negative
+	 * dentries are primed too: their revalidation gates the
+	 * per-branch rescan on the same two stamps, so a cached miss
+	 * costs no branch lookups until something observable changes.
 	 */
-	if (inode) {
-		dentry->d_fsdata = (void *)stamp;
-		dentry->d_time = (unsigned long)gen;
-	}
+	dentry->d_fsdata = (void *)stamp;
+	dentry->d_time = (unsigned long)gen;
 
 	return d_splice_alias(inode, dentry);
 }
@@ -532,19 +577,19 @@ out:
 const char *aufsng_get_link(struct dentry *dentry, struct inode *inode,
 			 struct delayed_call *done)
 {
-	struct aufsng_entry *oe;
-	struct dentry *real;
+	struct path realpath;
 
 	if (!dentry)
 		return ERR_PTR(-ECHILD);
 
-	real = aufsng_upperdentry(inode);
-	if (!real) {
-		oe = AUFSNG_I_E(inode);
-		real = oe->numlower ? oe->lowerstack[0].dentry : NULL;
-	}
-	if (!real)
+	/*
+	 * aufsng_path_real() owns the lockless upper/stack read protocol
+	 * (torn-snapshot re-read behind smp_rmb); open-coding the reads
+	 * here would silently miss any future change to that protocol.
+	 */
+	aufsng_path_real(inode, &realpath);
+	if (!realpath.dentry)
 		return ERR_PTR(-ESTALE);
 
-	return vfs_get_link(real, done);
+	return vfs_get_link(realpath.dentry, done);
 }

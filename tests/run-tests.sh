@@ -65,7 +65,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=55; PASS=0; FAIL=0
+	N=0; TOTAL=70; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -335,6 +335,77 @@ guest_main() {
 	$M aufs aufs $U "del=$L3" 32
 	check "hb returns after branch removal" grep -q hardlinked $U/hb
 	rm -f $L3/.wh.hb
+
+	echo "=== 20. option validation (udba, add index, branch overlap) ==="
+	# Each of these used to be silently accepted: a udba typo mapped to
+	# udba=none (disabling revalidation), add=N with N>1 honored the
+	# position in the root stack only, and overlapping branches made a
+	# whiteout in one branch double as a live marker in the other.
+	U2=/mnt/union2; mkdir -p $U2
+	checkfail "invalid udba value rejected at mount" \
+		$M aufs aufs $U2 "br:$W=rw:$L1=ro,udba=revl"
+	checkfail "nested branch rejected at mount" \
+		$M aufs aufs $U2 "br:$W=rw:$L1=ro:$L1/dir=ro"
+	checkfail "duplicate branch rejected at mount" \
+		$M aufs aufs $U2 "br:$W=rw:$L1=ro:$L1=ro"
+	checkfail "add=2: rejected on remount" \
+		$M aufs aufs $U "add=2:$L3=rr" 32
+	check "union unharmed by rejected options" grep -q l1-file $U/dir/file
+
+	echo "=== 21. fallocate passthrough ==="
+	check "fallocate on a union file succeeds" fallocate -l 65536 $U/falloc
+	[ "$(stat -c %s $U/falloc 2>/dev/null)" = 65536 ] \
+		&& ok "fallocated size visible through union" \
+		|| bad "fallocated size visible through union (got $(stat -c %s $U/falloc))"
+
+	echo "=== 22. remove both hardlink sibling names (nlink fix) ==="
+	# pa is copied up (shared union inode gains pa's upper), pb's
+	# removal is whiteout-only (no real link named pb exists in the rw
+	# branch).  The whiteout-only step used to drop_nlink() the shared
+	# inode to 0 anyway, so the later rm of pa underflowed nlink with a
+	# WARN - which the dmesg judgment below would now catch.
+	echo pairdata > $L1/pa
+	ln $L1/pa $L1/pb
+	chmod 600 $U/pa                                  # trigger copy-up of pa
+	check "sibling pb readable after pa copy-up" grep -q pairdata $U/pb
+	rm $U/pb                                         # whiteout-only removal
+	rm $U/pa                                         # real upper unlink
+	checkfail "pa gone after removing both names" test -e $U/pa
+	checkfail "pb gone after removing both names" test -e $U/pb
+
+	echo "=== 23. copied-up hardlink sibling vs branch add ==="
+	# Same shape as section 19, but ga is COPIED UP first, so the
+	# shared union inode carries an upper (under the name ga).  gb's
+	# revalidation used to trust that per-inode upper and return early,
+	# skipping the per-name gates entirely: the added branch's .wh.gb
+	# was never seen and gb stayed visible, serving ga's upper content.
+	echo genesis > $L1/ga
+	ln $L1/ga $L1/gb
+	chmod 600 $U/ga                                  # shared inode gains ga's upper
+	exec 8<$U/ga 9<$U/gb                             # pin both dentries
+	touch $L3/.wh.gb                                 # new branch hides ONLY gb
+	$M aufs aufs $U "add=1:$L3=rr" 32
+	cat $U/ga >/dev/null 2>&1                        # upper name revalidates first
+	check "copied-up ga still visible after add" grep -q genesis $U/ga
+	checkfail "whiteouted sibling gb hidden despite shared upper" test -e $U/gb
+	exec 8<&- 9<&-
+	$M aufs aufs $U "del=$L3" 32
+	check "gb returns after branch removal" grep -q genesis $U/gb
+	rm -f $L3/.wh.gb
+
+	echo "=== 24. out-of-band unlink of the upper copy (stale-upper heal) ==="
+	# heal0 is copied up with new content, then its upper copy is
+	# removed directly in the rw branch.  udba=reval promises the lower
+	# resurfaces; the lookup heal used to re-adopt the dead upper
+	# forever instead - reads served the deleted content and a write
+	# open skipped copy-up, writing into the unlinked inode.
+	echo v1 > $L1/heal0
+	echo v2 > $U/heal0                               # copy-up + modify
+	grep -q v2 $W/heal0 || bad "precondition"
+	rm $W/heal0                                      # out-of-band upper unlink
+	check "lower resurfaces after out-of-band upper unlink" grep -q v1 $U/heal0
+	echo v3 > $U/heal0                               # must copy up afresh
+	check "write after resurface lands in rw branch" grep -q v3 $W/heal0
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.

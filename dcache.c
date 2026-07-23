@@ -86,6 +86,30 @@ static int aufsng_attrs_valid(struct inode *inode, struct inode *real,
 	return 1;
 }
 
+/*
+ * Does @upper carry @name inside @dir's own upper directory?  Lower
+ * hardlink siblings share one union inode whose single upperdentry
+ * holds whichever name was copied up first, so "the inode has an
+ * upper" is a per-INODE fact while revalidation needs the per-NAME
+ * one.  The reads are unlocked: in RCU walk nothing may block, and a
+ * torn read against a concurrent out-of-band branch rename at worst
+ * fails the match, sending the caller down the slower per-name gates
+ * which re-derive the truth.
+ */
+static bool aufsng_upper_carries_name(struct inode *dir, struct dentry *upper,
+				      const struct qstr *name)
+{
+	struct dentry *pupper = aufsng_upperdentry(dir);
+	const char *upper_name;
+
+	if (!pupper || READ_ONCE(upper->d_parent) != pupper)
+		return false;
+	if (READ_ONCE(upper->d_name.len) != name->len)
+		return false;
+	upper_name = READ_ONCE(upper->d_name.name);
+	return !memcmp(upper_name, name->name, name->len);
+}
+
 static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 			      struct dentry *dentry, unsigned int flags)
 {
@@ -118,9 +142,20 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 			return 1;	/* upper-backed: no branch outranks it */
 		if (d_unhashed(upper) || d_is_negative(upper))
 			return 0;
-		return aufsng_attrs_valid(inode, d_inode(upper), flags);
+		/*
+		 * "No branch outranks the upper" is a per-NAME statement,
+		 * and the shared inode's upper may carry a DIFFERENT name
+		 * (a lower hardlink sibling of a copied-up name).  Only
+		 * the name the upper actually provides may return here;
+		 * a sibling name is still lower-provided and must run
+		 * the per-name whiteout/shadow gates below, or a branch
+		 * change that whites it out is never seen (the bug
+		 * commit acd6308 fixed, reachable again via copy-up).
+		 */
+		if (!dir || aufsng_upper_carries_name(dir, upper, name))
+			return aufsng_attrs_valid(inode, d_inode(upper), flags);
 	}
-	if (reval && oe && oe->numlower) {
+	if (reval && !upper && oe && oe->numlower) {
 		struct dentry *lower = oe->lowerstack[0].dentry;
 
 		if (d_unhashed(lower) || d_is_negative(lower))
@@ -177,15 +212,35 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 			 * directory's merged listing and preserves submounts
 			 * that a d_invalidate() would detach.  A different type
 			 * means the cached inode is the wrong object: drop it.
+			 * An OPAQUE upper directory is never adopted either:
+			 * fresh lookups honor the marker and hide every lower,
+			 * while an adopt would keep this cached dir's lower
+			 * stack (and its lower-only children) alive - a
+			 * per-path split brain until eviction.  Drop the
+			 * dentry so a fresh lookup rebuilds the upper-only
+			 * view, exactly as aufsng_lookup() would resolve it.
 			 */
-			if (!aufsng_origin_type_ok(this, inode->i_mode))
-				ret = 0;
-			else
+			bool adopt = aufsng_origin_type_ok(this, inode->i_mode);
+
+			if (adopt && d_is_dir(this)) {
+				int opq = aufsng_check_diropq(aufsng_upper_mnt(pfs),
+							   this);
+
+				if (opq < 0) {
+					/* error: keep, re-probe later */
+					dput(this);
+					goto out;
+				}
+				adopt = !opq;
+			}
+			if (adopt)
 				ret = aufsng_dyn_adopt_upper(inode,
 							  oe && oe->numlower ?
 							  oe->lowerstack[0].dentry :
 							  NULL,
 							  this);
+			else
+				ret = 0;
 			dput(this);
 			goto out_stamp;
 		}
@@ -243,11 +298,31 @@ static int aufsng_d_revalidate(struct inode *dir, const struct qstr *name,
 		return 1;
 
 	if (d_is_negative(dentry)) {
+		unsigned long stamp;
+		u64 gen;
+
 		if (!aufsng_udba_reval(pfs) || !dir)
+			return 1;
+		/*
+		 * Gate the per-branch rescan on the same two signals the
+		 * positive path uses (both primed by lookup): the upper
+		 * dir's change stamp and the branch generation.  Without
+		 * the gate every access to a cached miss (PATH/include
+		 * probes) pays an upper probe plus a whole-lower-stack
+		 * scan; with it the steady state is two integer compares.
+		 */
+		stamp = aufsng_reval_stamp(pfs, dir);
+		gen = atomic64_read(&pfs->branch_gen);
+		if ((unsigned long)READ_ONCE(dentry->d_fsdata) == stamp &&
+		    READ_ONCE(dentry->d_time) == (unsigned long)gen)
 			return 1;
 		if (flags & LOOKUP_RCU)
 			return -ECHILD;
-		return aufsng_lookup_negative_valid(dir, name) ? 1 : 0;
+		if (!aufsng_lookup_negative_valid(dir, name))
+			return 0;
+		WRITE_ONCE(dentry->d_fsdata, (void *)stamp);
+		WRITE_ONCE(dentry->d_time, (unsigned long)gen);
+		return 1;
 	}
 
 	return aufsng_positive_valid(dir, name, dentry, flags);

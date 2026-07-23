@@ -172,6 +172,31 @@ static int aufsng_flush(struct file *file, fl_owner_t id)
 	return 0;
 }
 
+static long aufsng_fallocate(struct file *file, int mode, loff_t offset,
+			  loff_t len)
+{
+	struct inode *inode = file_inode(file);
+	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
+	const struct cred *old_cred;
+	long ret;
+
+	/*
+	 * The VFS only allows fallocate on a write-opened fd, and a
+	 * write open already copied up (aufsng_open), so the backing
+	 * file is the upper one - a plain passthrough, like original
+	 * AUFS's aufs_fallocate.  The size may change; re-mirror.
+	 */
+	inode_lock(inode);
+	old_cred = override_creds(pfs->creator_cred);
+	ret = vfs_fallocate(file->private_data, mode, offset, len);
+	revert_creds(old_cred);
+	if (!ret)
+		aufsng_copyattr(inode);
+	inode_unlock(inode);
+
+	return ret;
+}
+
 const struct file_operations aufsng_file_operations = {
 	.open		= aufsng_open,
 	.release	= aufsng_release,
@@ -183,6 +208,7 @@ const struct file_operations aufsng_file_operations = {
 	.mmap		= aufsng_mmap,
 	.fsync		= aufsng_fsync,
 	.flush		= aufsng_flush,
+	.fallocate	= aufsng_fallocate,
 };
 
 void aufsng_backing_ctx_init(struct aufsng_fs *pfs)

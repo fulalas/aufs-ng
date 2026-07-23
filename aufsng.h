@@ -49,7 +49,6 @@ enum aufsng_br_perm {
 
 struct aufsng_layer {
 	struct vfsmount *mnt;	/* private clone; NULL marks a free slot */
-	int idx;		/* stable slot number for the layer's lifetime */
 };
 
 struct aufsng_path {
@@ -82,14 +81,13 @@ struct aufsng_config {
 	char (*br_perms)[AUFSNG_PERM_LEN];
 	char *xino_path;	/* accepted, not functionally used */
 	unsigned int udba;	/* AUFSNG_UDBA_*; see aufsng_udba_reval() */
-	unsigned int maxbranch;
 };
 
 enum aufsng_udba { AUFSNG_UDBA_NONE, AUFSNG_UDBA_REVAL, AUFSNG_UDBA_NOTIFY };
 
 struct aufsng_fs {
 	unsigned int numlayer;		/* used slots incl. [0] = branch 0 */
-	unsigned int numlayer_cap;	/* maxbranch + 1, allocated up front */
+	unsigned int numlayer_cap;	/* fixed capacity, allocated up front */
 	struct aufsng_layer *layers;	/* [0] rw branch, [1..] ro branches */
 	const struct cred *creator_cred;
 	/*
@@ -164,6 +162,18 @@ static inline struct dentry *aufsng_upperdentry(struct inode *inode)
 static inline struct vfsmount *aufsng_upper_mnt(struct aufsng_fs *pfs)
 {
 	return pfs->layers[0].mnt;
+}
+
+/*
+ * A layer's stable slot number: layers[] is allocated once at mount
+ * with a fixed capacity and never moved or reallocated (dynlayer.c
+ * relies on the addresses staying stable), so the index is derivable
+ * rather than stored.
+ */
+static inline unsigned int aufsng_layer_idx(const struct aufsng_fs *pfs,
+					    const struct aufsng_layer *layer)
+{
+	return layer - pfs->layers;
 }
 
 static inline struct inode *aufsng_inode_real(struct inode *inode)
@@ -317,10 +327,10 @@ struct aufsng_dyn_parked {
 	 * mount reference while an older parked stack still held
 	 * dentries in that branch's sb would tear the branch down
 	 * under them ("Dentry still in use" panic on umount).  Each
-	 * node pins its own referenced mounts, so nodes are safe to
-	 * release in any order.
+	 * node pins its own referenced mounts (one per @oe lower, so
+	 * the count is oe->numlower), and nodes are safe to release
+	 * in any order.
 	 */
-	unsigned int nr_mnt;
 	struct vfsmount *mnts[];
 };
 
@@ -330,7 +340,6 @@ struct aufsng_ctx_branch {
 	struct path path;
 	enum aufsng_br_perm perm;
 	char permstr[AUFSNG_PERM_LEN];	/* the mode as given, for show_options */
-	unsigned int pos;	/* insert position; only used by dyn_add */
 };
 
 struct aufsng_fs_context {
@@ -362,6 +371,9 @@ void aufsng_free_entry(struct aufsng_entry *oe);
 int aufsng_fill_super(struct super_block *sb, struct fs_context *fc);
 int aufsng_check_layer(struct super_block *sb, const struct path *path,
 		    const char *name);
+int aufsng_check_overlap(struct aufsng_fs *pfs, struct dentry *dentry,
+		      const char *name);
+int aufsng_get_namelen(struct aufsng_fs *pfs, const struct path *path);
 extern const struct super_operations aufsng_super_operations;
 
 /* file.c */
@@ -390,6 +402,7 @@ int aufsng_check_whiteout(struct vfsmount *mnt, struct dentry *parent,
 int aufsng_check_diropq(struct vfsmount *mnt, struct dentry *dir);
 int aufsng_find_origin(struct aufsng_entry *poe, const struct qstr *name,
 		    struct aufsng_path *out);
+int aufsng_lower_covers(struct inode *dir, const struct qstr *name);
 
 /* inode.c */
 extern const struct inode_operations aufsng_dir_inode_operations;
@@ -432,12 +445,12 @@ unsigned long aufsng_reval_stamp(struct aufsng_fs *pfs, struct inode *dir);
 
 /* dynlayer.c */
 int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
-		       const struct path *path, unsigned int pos,
-		       enum aufsng_br_perm perm, const char *permstr);
+		       const struct path *path, const char *permstr);
 int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
 		       bool *dcache_fresh);
 bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 			 struct dentry *upperdentry);
+bool aufsng_dyn_shed_upper(struct inode *inode);
 void aufsng_dyn_put_parked(struct aufsng_inode *oi);
 void aufsng_dyn_free_parked(struct aufsng_inode *oi);
 
