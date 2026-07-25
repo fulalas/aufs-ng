@@ -97,9 +97,12 @@ struct aufsng_fs {
 	 * branch change (dcache.c), never on ordinary mutations.  The
 	 * stamp is per-DENTRY, not per-inode: lower hardlink siblings
 	 * share one union inode, but the winning-branch decision is
-	 * per-name, so each name must re-check for itself.
+	 * per-name, so each name must re-check for itself.  Kept at
+	 * unsigned-long width (the d_time stamp it is compared against,
+	 * see aufsng_store_reval_stamps()) so no bits are silently
+	 * dropped on 32-bit; a false match needs 2^32 branch mutations.
 	 */
-	atomic64_t branch_gen;
+	atomic_long_t branch_gen;
 	/* excludes lookup/readdir during runtime branch add/remove */
 	struct rw_semaphore dyn_lock;
 	struct backing_file_ctx backing_ctx;
@@ -157,6 +160,30 @@ static inline struct aufsng_entry *AUFSNG_E(struct dentry *dentry)
 static inline struct dentry *aufsng_upperdentry(struct inode *inode)
 {
 	return READ_ONCE(AUFSNG_I(inode)->upperdentry);
+}
+
+/*
+ * A dentry's two revalidation stamps: the upper dir's change signal in
+ * d_fsdata (see aufsng_reval_stamp()) and the branch generation in
+ * d_time (see branch_gen).  Stored and compared through this single
+ * pair so the storage convention - both are unsigned-long-wide, the
+ * width of d_time - lives in one place; positive, negative and
+ * fresh-lookup paths all prime and gate through these.
+ */
+static inline void aufsng_store_reval_stamps(struct dentry *dentry,
+					     unsigned long stamp,
+					     unsigned long gen)
+{
+	WRITE_ONCE(dentry->d_fsdata, (void *)stamp);
+	WRITE_ONCE(dentry->d_time, gen);
+}
+
+static inline bool aufsng_reval_stamps_match(struct dentry *dentry,
+					     unsigned long stamp,
+					     unsigned long gen)
+{
+	return (unsigned long)READ_ONCE(dentry->d_fsdata) == stamp &&
+	       READ_ONCE(dentry->d_time) == gen;
 }
 
 static inline struct vfsmount *aufsng_upper_mnt(struct aufsng_fs *pfs)

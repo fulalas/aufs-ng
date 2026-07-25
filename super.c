@@ -333,7 +333,7 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		return err;
 	sb->s_fs_info = pfs;
 	init_rwsem(&pfs->dyn_lock);
-	atomic64_set(&pfs->branch_gen, 0);
+	atomic_long_set(&pfs->branch_gen, 0);
 	pfs->config.xino_path = ctx->config.xino_path;
 	ctx->config.xino_path = NULL;
 	pfs->config.udba = ctx->config.udba;

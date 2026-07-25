@@ -26,7 +26,7 @@
  * dentry cached here.  The third and fourth need real branch lookups,
  * gated by two INDEPENDENT signals so neither triggers the other's
  * probe: d_fsdata carries the upper dir's mtime/iversion stamp (gates
- * the upper probe), and the inode's origin_gen carries the branch
+ * the upper probe), and the dentry's d_time carries the branch
  * generation (gates the winning-branch re-check) - an ordinary write
  * in a directory must not send every cached lower-only sibling on an
  * all-branch rescan.  Each probe runs once per observed change, not
@@ -56,7 +56,7 @@ static unsigned long aufsng_dir_stamp(struct inode *dir)
  * The d_fsdata stamp a child of @dir is revalidated against: the upper
  * dir's change signal (out-of-band creates/whiteouts, udba=reval
  * only).  The branch-change signal is deliberately NOT folded in - it
- * lives in the inode's origin_gen, so the two probes stay
+ * lives in the dentry's d_time, so the two probes stay
  * independently gated.  Also used by lookup to prime a fresh dentry
  * with the state it just resolved against.
  */
@@ -124,7 +124,7 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	struct dentry *this;
 	unsigned long stamp;
 	bool stamp_hit, gen_hit;
-	u64 gen;
+	unsigned long gen;
 	int ret = 1;
 	int found;
 	int wh = 0;
@@ -184,10 +184,10 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 		return 1;
 	pupper = aufsng_upperdentry(dir);
 	stamp = aufsng_reval_stamp(pfs, dir);
-	gen = atomic64_read(&pfs->branch_gen);
+	gen = atomic_long_read(&pfs->branch_gen);
 	stamp_hit = (unsigned long)READ_ONCE(dentry->d_fsdata) == stamp;
 	gen_hit = S_ISDIR(inode->i_mode) ||
-		  READ_ONCE(dentry->d_time) == (unsigned long)gen;
+		  READ_ONCE(dentry->d_time) == gen;
 	if (stamp_hit && gen_hit)
 		return 1;
 	if (flags & LOOKUP_RCU)
@@ -271,10 +271,8 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	}
 
 out_stamp:
-	if (ret) {
-		WRITE_ONCE(dentry->d_fsdata, (void *)stamp);
-		WRITE_ONCE(dentry->d_time, (unsigned long)gen);
-	}
+	if (ret)
+		aufsng_store_reval_stamps(dentry, stamp, gen);
 out:
 	up_read(&pfs->dyn_lock);
 	revert_creds(old_cred);
@@ -299,7 +297,7 @@ static int aufsng_d_revalidate(struct inode *dir, const struct qstr *name,
 
 	if (d_is_negative(dentry)) {
 		unsigned long stamp;
-		u64 gen;
+		unsigned long gen;
 
 		if (!aufsng_udba_reval(pfs) || !dir)
 			return 1;
@@ -312,16 +310,14 @@ static int aufsng_d_revalidate(struct inode *dir, const struct qstr *name,
 		 * scan; with it the steady state is two integer compares.
 		 */
 		stamp = aufsng_reval_stamp(pfs, dir);
-		gen = atomic64_read(&pfs->branch_gen);
-		if ((unsigned long)READ_ONCE(dentry->d_fsdata) == stamp &&
-		    READ_ONCE(dentry->d_time) == (unsigned long)gen)
+		gen = atomic_long_read(&pfs->branch_gen);
+		if (aufsng_reval_stamps_match(dentry, stamp, gen))
 			return 1;
 		if (flags & LOOKUP_RCU)
 			return -ECHILD;
 		if (!aufsng_lookup_negative_valid(dir, name))
 			return 0;
-		WRITE_ONCE(dentry->d_fsdata, (void *)stamp);
-		WRITE_ONCE(dentry->d_time, (unsigned long)gen);
+		aufsng_store_reval_stamps(dentry, stamp, gen);
 		return 1;
 	}
 
