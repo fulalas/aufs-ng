@@ -874,11 +874,14 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 		err = parked;
 		goto out;
 	}
-	if (replace_dir && d_inode(new) && aufsng_upperdentry(d_inode(new))) {
-		err = aufsng_clear_whiteouts(pfs,
-					  aufsng_upperdentry(d_inode(new)));
-		if (err)
-			goto out_unpark;
+	if (replace_dir && d_inode(new)) {
+		struct dentry *new_upper = aufsng_upperdentry(d_inode(new));
+
+		if (new_upper) {
+			err = aufsng_clear_whiteouts(pfs, new_upper);
+			if (err)
+				goto out_unpark;
+		}
 	}
 
 	rd.mnt_idmap = upper_idmap;

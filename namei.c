@@ -375,7 +375,7 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 	struct inode *inode = NULL;
 	const struct cred *old_cred;
 	unsigned long stamp;
-	u64 gen;
+	unsigned long gen;
 	unsigned int i;
 	bool stopped = false;
 	int wh, err = 0;
@@ -403,7 +403,7 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 	pupper = aufsng_upperdentry(dir);
 	/* sampled before the branch probes; see the priming below */
 	stamp = aufsng_reval_stamp(pfs, dir);
-	gen = atomic64_read(&pfs->branch_gen);
+	gen = atomic_long_read(&pfs->branch_gen);
 
 	if (pupper) {
 		wh = 0;
@@ -568,8 +568,7 @@ out:
 	 * per-branch rescan on the same two stamps, so a cached miss
 	 * costs no branch lookups until something observable changes.
 	 */
-	dentry->d_fsdata = (void *)stamp;
-	dentry->d_time = (unsigned long)gen;
+	aufsng_store_reval_stamps(dentry, stamp, gen);
 
 	return d_splice_alias(inode, dentry);
 }

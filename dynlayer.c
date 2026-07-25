@@ -178,6 +178,7 @@ bool aufsng_dyn_shed_upper(struct inode *inode)
 	struct aufsng_inode *oi = AUFSNG_I(inode);
 	struct aufsng_entry *oe;
 	struct aufsng_dyn_parked *pk;
+	bool shed = false;
 	bool ok = false;
 
 	mutex_lock(&oi->lock);
@@ -205,8 +206,19 @@ bool aufsng_dyn_shed_upper(struct inode *inode)
 	pk->next = oi->dyn_parked;
 	oi->dyn_parked = pk;
 	ok = true;
+	shed = true;
 out:
 	mutex_unlock(&oi->lock);
+	/*
+	 * Losing the upper can resurface lower names that a whiteout or
+	 * opaque marker in the just-shed upper directory was hiding.  Cached
+	 * negative children were primed against the has-upper state, and
+	 * aufsng_lookup_negative_valid()'s !pupper shortcut would now keep
+	 * them valid forever - drop them so those names re-resolve, exactly
+	 * as the adopt path does on the reverse transition.
+	 */
+	if (shed && S_ISDIR(inode->i_mode))
+		aufsng_dyn_drop_neg_children(inode);
 	return ok;
 }
 
@@ -766,7 +778,7 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	aufsng_dyn_drop_neg_children(root_inode);
 	aufsng_dyn_splice_cached(pfs, sb, layer, root_inode);
 	/* one re-check of every cached lower-only dentry (dcache.c) */
-	atomic64_inc(&pfs->branch_gen);
+	atomic_long_inc(&pfs->branch_gen);
 
 	up_write(&pfs->dyn_lock);
 	inode_unlock(root_inode);
@@ -1184,7 +1196,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
 	/* the busy-scan skips the root; refresh its negatives too */
 	aufsng_dyn_drop_neg_children(root_inode);
 	/* one re-check of every cached lower-only dentry (dcache.c) */
-	atomic64_inc(&pfs->branch_gen);
+	atomic_long_inc(&pfs->branch_gen);
 
 	pr_info("aufs (aufs-ng): branch '%pd' removed\n", path->dentry);
 
