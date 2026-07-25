@@ -30,30 +30,6 @@ and mount grammar, while providing the following improvements:
   and `OverlayFS` use) instead of taking a filesystem-wide lock on every
   read and write.
 
-## Trade-offs
-
-This is new code, not a driver hardened by two decades of real-world use.
-Also, some `aufs` features are intentionally out of scope:
-
-- **Pseudo-links (`plink`)** — hard-linking (not to be confused with
-  symlinking) a file that comes from a layer (module) still works, just
-  makes a full copy behind the scenes instead of a true link.
-- **Directory-rename metadata (`dirren`)** — renaming a folder that comes
-  from a layer still works, just slower (a copy instead of an instant
-  rename) for large folders.
-- **`shwh`** (flattening layers into one) — no built-in way to merge a
-  stack of read-only layers into one clean image.
-- **RDU** (readdir speed-up helper) — no userspace listing accelerator;
-  only a directory with tens of thousands of entries spread across many
-  layers would notice.
-- **Multiple writable branches** — only one writable location is used at
-  a time; all your changes go there, you can't spread them across
-  several disks.
-- **NFS export** — the union filesystem isn't meant to be shared out to
-  other computers over the network; it's for local use only.
-- **FHSM** (automatic storage tiering) — not needed: `aufs-ng` only ever
-  has one writable location, so there's nothing to move files between.
-
 ## Performance
 
 Estimated from code comparison against the original `aufs`, not from
@@ -125,6 +101,30 @@ simply mean read-only here.
 On remount, unknown options are silently ignored. Unlike original `aufs`,
 there is no `/sys/fs/aufs` tree; the branch list appears directly in
 `/proc/mounts`.
+
+## Trade-offs
+
+This is new code, not a driver hardened by two decades of real-world use.
+Also, some `aufs` features are intentionally out of scope:
+
+- **Pseudo-links (`plink`)** — hard-linking (not to be confused with
+  symlinking) a file that comes from a layer (module) still works, just
+  makes a full copy behind the scenes instead of a true link.
+- **Directory-rename metadata (`dirren`)** — renaming a folder that comes
+  from a layer still works, just slower (a copy instead of an instant
+  rename) for large folders.
+- **`shwh`** (flattening layers into one) — no built-in way to merge a
+  stack of read-only layers into one clean image.
+- **RDU** (readdir speed-up helper) — no userspace listing accelerator;
+  only a directory with tens of thousands of entries spread across many
+  layers would notice.
+- **Multiple writable branches** — only one writable location is used at
+  a time; all your changes go there, you can't spread them across
+  several disks.
+- **NFS export** — the union filesystem isn't meant to be shared out to
+  other computers over the network; it's for local use only.
+- **FHSM** (automatic storage tiering) — not needed: `aufs-ng` only ever
+  has one writable location, so there's nothing to move files between.
 
 ## On-disk format
 
