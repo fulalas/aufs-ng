@@ -102,6 +102,32 @@ On remount, unknown options are silently ignored. Unlike original `aufs`,
 there is no `/sys/fs/aufs` tree; the branch list appears directly in
 `/proc/mounts`.
 
+## On-disk format
+
+The format is identical to original `aufs`: a deleted name still
+provided by a lower branch is masked by a sibling regular file
+`.wh.<name>` (mode `0444`, not a character device); a directory that
+fully shadows lower content carries a `.wh..wh..opq` marker. Verified
+byte-for-byte against original `aufs`, so external tools that read or
+edit a branch directly work unchanged.
+
+The markers themselves are the same; what can differ is the order in
+which they are written when an operation needs more than one step:
+
+- Deleting a file that also exists in a read-only branch below behaves
+  exactly as in `aufs`: no matter what goes wrong — a crash or a full
+  disk — a deleted file can never quietly come back.
+
+- Renaming such a file is where `aufs-ng` differs: it renames first and
+  writes the marker second — the reverse of `aufs` — so a crash can't
+  hide the file mid-rename. If the marker fails, the rename rolls back
+  cleanly (rare edge cases keep it instead, with a warning).
+
+Helper files named `.wh..wh.*` may briefly appear inside a branch
+during an operation, same as in `aufs`. They are never visible in the
+union, and any leftovers after a crash are harmless and get removed
+together with their directory.
+
 ## Trade-offs
 
 This is new code, not a driver hardened by two decades of real-world use.
@@ -125,37 +151,6 @@ Also, some `aufs` features are intentionally out of scope:
   other computers over the network; it's for local use only.
 - **FHSM** (automatic storage tiering) — not needed: `aufs-ng` only ever
   has one writable location, so there's nothing to move files between.
-
-## On-disk format
-
-The format is identical to original `aufs`: a deleted name still
-provided by a lower branch is masked by a sibling regular file
-`.wh.<name>` (mode `0444`, not a character device); a directory that
-fully shadows lower content carries a `.wh..wh..opq` marker. Verified
-byte-for-byte against original `aufs`, so external tools that read or
-edit a branch directly work unchanged.
-
-The markers themselves are the same; what can differ is the order in
-which they are written when an operation needs more than one step:
-
-- Deleting a file that also exists in a read-only branch below behaves
-  exactly as in `aufs`: no matter what goes wrong — a crash or a full
-  disk — a deleted file can never quietly come back.
-
-- Renaming such a file is where `aufs-ng` differs: `aufs` creates the
-  marker for the old name first and renames the file second — which,
-  after a crash between those two steps, can hide the very file being
-  renamed, losing access to current data. `aufs-ng` does the opposite:
-  rename first, marker second. If the marker can't be created — a full
-  disk, for example — the rename is undone and the operation fails
-  cleanly. (One narrow exception: if the rename also replaced an
-  existing file in the writable branch, undoing it would lose that
-  replacement — the rename is then kept and a warning is logged.)
-
-Helper files named `.wh..wh.*` may briefly appear inside a branch
-during an operation, same as in `aufs`. They are never visible in the
-union, and any leftovers after a crash are harmless and get removed
-together with their directory.
 
 ## Building
 
