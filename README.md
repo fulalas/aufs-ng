@@ -19,8 +19,8 @@ modules on an already-running system.
 
 Original [`aufs`](https://github.com/sfjro/aufs-standalone) is ~28,000 lines across `fs/aufs/` plus patches touching ~25
 core kernel files to export internal symbols, and needs its own branch per
-kernel minor version. `aufs-ng` targets the same on-disk format and mount
-grammar with:
+kernel minor version. `aufs-ng` stays compatible with the on-disk format
+and mount grammar, while providing the following improvements:
 
 - **No kernel patches** — every symbol it uses is a standard, currently
   exported kernel API.
