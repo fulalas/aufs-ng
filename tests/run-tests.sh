@@ -1,58 +1,7 @@
 #!/bin/bash
-# aufs-ng test suite - a single command that tests everything.
-#
-#   tests/run-tests.sh                      # kernel tree autodetected (linux-*/)
-#   KERNEL_SRC=/path/to/linux tests/run-tests.sh
-#
-# The kernel tree is looked for as linux-*/ in tests/ and then in the
-# aufs-ng folder above it; if neither exists, the latest stable kernel
-# is downloaded from kernel.org into the aufs-ng folder.
-#
-# It builds a User-Mode Linux kernel with aufs-ng built in (plus
-# lockdep/RCU/atomic-sleep debugging) and boots it to run the
-# behavioral checks.  No root needed, and the running system is never
-# touched: the guest reads the host filesystem through hostfs and
-# writes only to tmpfs it creates itself.
-#
-# Environment:
-#   KERNEL_SRC  kernel source tree to build (an existing non-UML
-#               .config is reset with mrproper)
-#   JOBS        parallel make jobs (default: nproc)
-#   TIMEOUT     guest wall-clock limit in seconds (default: 300)
-#
-# Exit status: 0 only if every check passed, the suite ran to
-# completion, and the kernel log shows no lockdep/RCU/BUG findings.
-#
-# --------------------------------------------------------------------
-# ONE FILE, TWO ROLES.  There is a single entry point on purpose - you
-# never have to wonder what to run.  Internally the script plays two
-# parts, which run in two different worlds:
-#
-#   * HOST side (host_main)  - builds and boots the UML kernel, then
-#                              judges the result.  This is what runs
-#                              when you invoke the script normally.
-#   * GUEST side (guest_main) - the actual checks, run as PID 1 inside
-#                              the throwaway UML kernel.  It mounts and
-#                              deletes freely and powers the guest off
-#                              when done, so it must NEVER run on a
-#                              real system.
-#
-# The host boots the kernel with this same script as init and the
-# sentinel AUFSNG_TEST_GUEST=1 in the environment; the dispatch at the
-# very bottom picks the guest side only when that sentinel is set, so a
-# normal invocation always takes the safe host path.
-# --------------------------------------------------------------------
-
 set -u
 
-# ====================================================================
-# GUEST SIDE - runs as PID 1 inside UML.  Every check prints one
-# "N/TOTAL - name... PASSED|FAILED" line (green/red); a failure also
-# emits a plain "TEST-FAIL:" marker the host judge greps for.  The
-# suite ends with a PASS=/FAIL= summary and TESTS-COMPLETE, then powers
-# off.  TOTAL must match the number of checks on the all-pass path -
-# the tail asserts it, so a stale count fails the suite loudly.
-# ====================================================================
+# GUEST SIDE - runs as PID 1 inside UML
 guest_main() {
 	export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 	# mount/umount/poweroff helper, compiled and staged beside this
@@ -423,14 +372,7 @@ guest_main() {
 	sleep 30
 }
 
-# ====================================================================
-# HOST SIDE - build the UML kernel, boot the guest, judge the output.
-# ====================================================================
-
-# The mount/umount/poweroff helper the guest needs, kept here as a
-# heredoc so tests/ is a single self-contained script.  The host's own
-# mount(8) is unusable inside the guest (often unreadable through
-# hostfs to an unprivileged user), so the guest gets this tiny tool.
+# HOST SIDE
 aufsng_write_helper() {
 	cat > "$1" <<'EOF'
 /* mount/umount/poweroff helper for the UML test guest (see run-tests.sh) */
@@ -694,10 +636,7 @@ host_main() {
 	exit $status
 }
 
-# ====================================================================
-# DISPATCH - guest side only when the UML boot line set the sentinel;
-# every normal invocation takes the host side.
-# ====================================================================
+# DISPATCH - guest side only when the UML boot line set the sentinel
 if [ -n "${AUFSNG_TEST_GUEST:-}" ]; then
 	guest_main
 else
