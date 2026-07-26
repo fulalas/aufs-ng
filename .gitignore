@@ -1,6 +1,7 @@
 /linux-*/
 /linux-*.tar.*
-/tests-guest.log
+/aufs-standalone*/
+/porteux/*
 
 # out-of-tree module build artifacts (see README)
 *.o
