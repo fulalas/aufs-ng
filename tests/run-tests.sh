@@ -671,10 +671,10 @@ host_main() {
 		tail -30 "$log" >&2
 		status=1
 	fi
-	fails=$(sed -n 's/^FAIL=\([0-9]*\).*/\1/p' "$log" | tail -1)
+	fails=$(grep -c "^TEST-FAIL:" "$log")
 	if [ "${fails:-1}" != 0 ]; then
 		echo "run-tests: ${fails:-?} check(s) FAILED:" >&2
-		grep "TEST-FAIL:" "$log" | sed 's/^/  /' >&2
+		grep "^TEST-FAIL:" "$log" | sed 's/^/  /' >&2
 		status=1
 	fi
 	warnpat='possible (recursive|circular) locking|\*\*\* DEADLOCK|BUG:|use-after-free|sleeping function called|suspicious RCU usage|WARNING: .* at .*\.c'
