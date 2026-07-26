@@ -415,7 +415,8 @@ guest_main() {
 	fi
 
 	echo "==================================================="
-	echo "PASS=$PASS FAIL=$FAIL"
+	echo "FAIL=$FAIL"
+	echo "PASS=$PASS"
 	dmesg | grep -iE "BUG|WARN|lockdep|suspicious|circular|use-after-free|KASAN|sleeping function" | head -25
 	echo "TESTS-COMPLETE"
 	$M -o
@@ -660,7 +661,7 @@ host_main() {
 		panic_on_warn=1 panic=-1 \
 		init="$work/run-tests.sh" AUFSNG_TEST_GUEST=1 2>&1 \
 		| tee "$log" \
-		| grep --line-buffered -E '^===|^[0-9]+/[0-9]+ |^PASS='
+		| grep --line-buffered -E '^===|^[0-9]+/[0-9]+ |^PASS=|^FAIL='
 
 	# 5. Judge: the suite must have completed, with zero failures and a
 	#    kernel log free of lockdep/RCU/BUG findings.
@@ -670,7 +671,7 @@ host_main() {
 		tail -30 "$log" >&2
 		status=1
 	fi
-	fails=$(sed -n 's/^PASS=[0-9]* FAIL=\([0-9]*\).*/\1/p' "$log" | tail -1)
+	fails=$(sed -n 's/^FAIL=\([0-9]*\).*/\1/p' "$log" | tail -1)
 	if [ "${fails:-1}" != 0 ]; then
 		echo "run-tests: ${fails:-?} check(s) FAILED:" >&2
 		grep "TEST-FAIL:" "$log" | sed 's/^/  /' >&2
