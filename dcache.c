@@ -172,13 +172,21 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	 * in the rw branch would shadow or hide it (the upper dir's
 	 * mtime/iversion stamp in d_fsdata, udba=reval only), and a
 	 * runtime branch add can hand the name to a higher-priority
-	 * branch (branch_gen vs. the dentry's d_time; directories are
-	 * exempt - the splice keeps them right or unhashes them).  The
-	 * generation stamp lives on the DENTRY: lower hardlink siblings
-	 * share one union inode, but a branch can whiteout or shadow
-	 * one sibling name and not the other, so each name re-checks
-	 * for itself.  Each probe runs once per observed change, not
-	 * once per access.
+	 * branch (branch_gen vs. the dentry's d_time).  Directories run
+	 * the generation re-check too: the in-place splice NORMALLY
+	 * keeps them right (so the re-check simply passes once and
+	 * re-stamps), but the splice legitimately skips a directory on
+	 * its documented fallbacks - resolve deeper than the replay
+	 * limit, a transient probe error, an allocation failure - and
+	 * branch_gen moves regardless.  An exemption made every skip
+	 * PERMANENT: the stale stack answered child lookups and readdir
+	 * forever while a cold-cache walk of the same path saw the new
+	 * branch.  The re-check turns a skip into one dropped dentry and
+	 * a fresh lookup instead.  The generation stamp lives on the
+	 * DENTRY: lower hardlink siblings share one union inode, but a
+	 * branch can whiteout or shadow one sibling name and not the
+	 * other, so each name re-checks for itself.  Each probe runs
+	 * once per observed change, not once per access.
 	 */
 	if (!dir)
 		return 1;
@@ -186,8 +194,7 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	stamp = aufsng_reval_stamp(pfs, dir);
 	gen = atomic_long_read(&pfs->branch_gen);
 	stamp_hit = (unsigned long)READ_ONCE(dentry->d_fsdata) == stamp;
-	gen_hit = S_ISDIR(inode->i_mode) ||
-		  READ_ONCE(dentry->d_time) == gen;
+	gen_hit = READ_ONCE(dentry->d_time) == gen;
 	if (stamp_hit && gen_hit)
 		return 1;
 	if (flags & LOOKUP_RCU)
@@ -247,14 +254,16 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	}
 
 	/*
-	 * No upper claim.  Directory stacks are spliced in place (or the
-	 * dentry unhashed when a new branch hides them) by branch
-	 * changes (dynlayer.c), so a directory dentry stays right; for a
-	 * non-directory whose generation moved, re-run the merge's
+	 * No upper claim, and the generation moved: re-run the merge's
 	 * "which branch wins this name" decision - a branch added above
 	 * the cached origin (or a whiteout it carries) means this dentry
 	 * resolves the wrong object now and must be dropped for a fresh
-	 * lookup.
+	 * lookup.  For a directory the splice normally already updated
+	 * the stack, so the top-lower compare below passes and only
+	 * re-stamps; a mismatch means the splice skipped it (see the
+	 * gen_hit comment above) and dropping is the heal - the cost, a
+	 * detached subtree of cached dentries, is the same one the
+	 * splice's own unhash path pays for a hidden directory.
 	 */
 	if (!gen_hit) {
 		found = aufsng_find_origin(AUFSNG_I_E(dir), name, &origin);

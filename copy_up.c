@@ -436,14 +436,21 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 		return -ENOENT;
 
 	/*
-	 * The lower source is stable without oi->lock: a non-directory's
-	 * stack never changes after creation, and a directory's
-	 * superseded stacks stay parked on the inode until eviction.
+	 * The lower source is sampled without oi->lock - safe to READ
+	 * (a superseded stack stays parked on the inode until eviction,
+	 * its dentries and mounts pinned) but no longer guaranteed
+	 * CURRENT: a branch removal re-points even a non-directory's
+	 * stack to a surviving branch (aufsng_dyn_prep_repoint).  The
+	 * commit below re-reads the stack under oi->lock - which the
+	 * re-point's publisher (aufsng_dyn_commit_rebuild) also takes -
+	 * and aborts with -ESTALE if this sample went stale, so a
+	 * copy-up can never publish content from a branch whose removal
+	 * already reported success.
 	 */
 	oe = AUFSNG_I_E(inode);
 	if (!oe || !oe->numlower)
 		return -ENOENT;
-	lowerpath.mnt = oe->lowerstack[0].layer->mnt;
+	lowerpath.mnt = oe->lowerstack[0].mnt;
 	lowerpath.dentry = oe->lowerstack[0].dentry;
 
 	err = vfs_getattr(&lowerpath, &stat,
@@ -467,6 +474,18 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 	mutex_lock(&oi->lock);
 	if (oi->upperdentry)
 		goto out;	/* lost the race: another copy-up committed */
+
+	/*
+	 * A branch removal re-pointed the stack while the temp was being
+	 * filled: the data (and the metadata snapshot taken at commit)
+	 * would come from the REMOVED branch, moving the file's content
+	 * backwards after the removal reported success.  Abort; the
+	 * caller retries against the new stack.
+	 */
+	if (AUFSNG_I_E(inode) != oe) {
+		err = -ESTALE;
+		goto out;
+	}
 
 	/*
 	 * The lookup that led here saw the name alive, but an unlink or
@@ -553,6 +572,7 @@ int aufsng_copy_up(struct dentry *dentry)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
 	const struct cred *old_cred;
+	int retries = 0;
 	int err = 0;
 
 	old_cred = override_creds(pfs->creator_cred);
@@ -570,6 +590,14 @@ int aufsng_copy_up(struct dentry *dentry)
 		}
 
 		err = aufsng_copy_up_one(next);
+		/*
+		 * -ESTALE: a branch removal re-pointed the source stack
+		 * mid-copy.  The loop re-samples the (new) stack, so a
+		 * retry copies the surviving branch's content; branch
+		 * changes are rare, the cap only guards a livelock.
+		 */
+		if (err == -ESTALE && ++retries <= 3)
+			err = 0;
 		dput(next);
 	}
 

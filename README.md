@@ -81,8 +81,9 @@ nested inside, another branch is rejected, as original `aufs` does.
 Each branch gets a mode: `rw` (writable — only the first branch can be)
 or `ro` (read-only). For compatibility, `aufs-ng` also accepts `aufs`'s
 other read-only spelling `rr` (meant for natively read-only filesystems
-like squashfs) and mode suffixes such as `+wh` or `+nolwh` — they all
-simply mean read-only here.
+like squashfs) and mode suffixes such as `+wh` or `+nolwh` — the
+suffixes are ignored; as in `aufs`, only the base token (`rw` vs
+`ro`/`rr`) decides.
 
 - `udba=` — `reval` (the default) shows changes made directly inside a
   branch; `none` skips that detection (faster and safe if branches are
@@ -98,9 +99,17 @@ simply mean read-only here.
 - `nowarn_perm` — silences original `aufs`'s warnings about branches with
   differing owner/permissions; `aufs-ng` never prints those warnings.
 
-On remount, unknown options are silently ignored. Unlike original `aufs`,
-there is no `/sys/fs/aufs` tree; the branch list appears directly in
-`/proc/mounts`.
+On remount, unknown options are silently ignored; at mount time,
+options outside the list above — including `aufs` options `aufs-ng`
+doesn't implement, such as `dirs=` — are rejected. Unlike original
+`aufs`, there is no `/sys/fs/aufs` tree; the branch list appears
+directly in `/proc/mounts`.
+
+Unlike original `aufs`, removing a branch doesn't fail with `EBUSY`
+just because a file it provides is open (only a memory-mapped one still
+does): an open file keeps working from the removed branch until closed
+— the usual open-files rule — while fresh lookups resolve to a
+surviving branch, if any.
 
 ## On-disk format
 
@@ -123,10 +132,16 @@ which they are written when an operation needs more than one step:
   hide the file mid-rename. If the marker fails, the rename rolls back
   cleanly (rare edge cases keep it instead, with a warning).
 
+- Deleting a directory renames it to a hidden temp name first and
+  cleans it up after — `aufs`'s own ordering — so no failure can bring
+  deleted names back; at worst an invisible leftover stays in the
+  writable branch.
+
 Helper files named `.wh..wh.*` may briefly appear inside a branch
 during an operation, same as in `aufs`. They are never visible in the
 union, and any leftovers after a crash are harmless and get removed
-together with their directory.
+together with their directory (a non-empty leftover directory needs
+removing by hand, as in `aufs`).
 
 ## Trade-offs
 

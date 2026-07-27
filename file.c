@@ -71,6 +71,22 @@ static loff_t aufsng_llseek(struct file *file, loff_t offset, int whence)
 	loff_t ret;
 
 	/*
+	 * Position queries and a plain rewind need neither the real fs
+	 * nor a lock: the union file's f_pos is the master copy (every
+	 * I/O path passes iocb->ki_pos explicitly, and the delegated
+	 * path below resyncs realfile->f_pos from it before seeking).
+	 * Answering them here keeps an exclusive i_rwsem acquire - which
+	 * fallocate/truncate/setattr contend on - off a pure query path,
+	 * exactly as overlayfs's ovl_llseek does.
+	 */
+	if (offset == 0) {
+		if (whence == SEEK_CUR)
+			return file->f_pos;
+		if (whence == SEEK_SET)
+			return vfs_setpos(file, 0, 0);
+	}
+
+	/*
 	 * Delegate to the real fs so SEEK_END/SEEK_DATA/SEEK_HOLE see
 	 * the authoritative file size, keeping the positions in sync.
 	 */

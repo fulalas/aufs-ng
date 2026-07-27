@@ -14,7 +14,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=70; PASS=0; FAIL=0
+	N=0; TOTAL=75; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -355,6 +355,49 @@ guest_main() {
 	check "lower resurfaces after out-of-band upper unlink" grep -q v1 $U/heal0
 	echo v3 > $U/heal0                               # must copy up afresh
 	check "write after resurface lands in rw branch" grep -q v3 $W/heal0
+
+	echo "=== 25. branch removal with a deleted-but-open file ==="
+	# A file provided only by the branch being removed is deleted
+	# through the union while a process still holds it open.  The
+	# removal used to fail the whole remount with EBUSY; now the fd
+	# keeps working (deleted-while-open semantics) and the branch
+	# goes away, with its mount pinned until the inode is evicted.
+	echo delme > $L3/delme
+	$M aufs aufs $U "add=1:$L3=rr" 32 || bad "remount add (deleted-open)"
+	exec 8<$U/delme                          # pin with an open fd
+	rm $U/delme                              # delete through the union
+	$M aufs aufs $U "del=$L3" 32 \
+		&& ok "removal succeeds with deleted-but-open file" \
+		|| bad "removal succeeds with deleted-but-open file"
+	read -r DAT <&8
+	[ "$DAT" = delme ] \
+		&& ok "open fd still reads the deleted file's data" \
+		|| bad "open fd still reads the deleted file's data (got '$DAT')"
+	exec 8<&-
+	rm -f $L3/delme $W/.wh.delme
+
+	echo "=== 26. opaque lower dir removed while pinned ==="
+	# L3/od carries .wh..wh..opq, hiding L1/od's content; the union
+	# dir is pinned across del=L3.  The rebuilt stack used to be a
+	# pure filter (it could only shrink), so the pinned dir kept an
+	# empty merge while a fresh lookup of the same path re-merged
+	# L1/od - two answers for one path until eviction.
+	mkdir -p $L1/od; echo under > $L1/od/l1file
+	mkdir -p $L3/od; touch $L3/od/.wh..wh..opq; echo over > $L3/od/l3file
+	$M aufs aufs $U "add=1:$L3=rr" 32 || bad "remount add (opaque dir)"
+	test -e $U/od/l1file && bad "opaque add hides lower file" \
+		|| ok "opaque add hides lower file"
+	exec 8<$U/od                             # pin the dir
+	cat $U/od/l3file >/dev/null 2>&1
+	$M aufs aufs $U "del=$L3" 32 || bad "remount del with pinned opaque dir"
+	grep -q under $U/od/l1file 2>/dev/null \
+		&& ok "pinned dir re-merges branches the opaque marker hid" \
+		|| bad "pinned dir re-merges branches the opaque marker hid"
+	ls $U/od 2>/dev/null | grep -q l1file \
+		&& ok "readdir of pinned dir shows re-merged content" \
+		|| bad "readdir of pinned dir shows re-merged content"
+	exec 8<&-
+	rm -rf $L3/od
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.

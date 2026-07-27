@@ -75,9 +75,16 @@ static void aufsng_destroy_inode(struct inode *inode)
 	struct aufsng_inode *oi = AUFSNG_I(inode);
 
 	dput(oi->upperdentry);
-	aufsng_dyn_put_parked(oi);
+	/*
+	 * The current stack's dentries must drop BEFORE the parked mount
+	 * pins: a deleted-but-open object whose branch was removed keeps
+	 * its stack in place, pinned only by a pin-only parked node
+	 * (aufsng_dyn_pin_stack) - releasing that node's mounts first
+	 * would tear the branch down under the stack's own dentries.
+	 */
 	if (oi->oe)
 		aufsng_stack_put(oi->oe->lowerstack, oi->oe->numlower);
+	aufsng_dyn_put_parked(oi);
 	if (S_ISDIR(inode->i_mode))
 		aufsng_dir_cache_release(oi);
 }
@@ -420,6 +427,7 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		oe->lowerstack[i - 1].layer = &pfs->layers[i];
 		oe->lowerstack[i - 1].dentry =
 			dget(pfs->layers[i].mnt->mnt_root);
+		oe->lowerstack[i - 1].mnt = pfs->layers[i].mnt;
 	}
 
 	root_inode = new_inode(sb);

@@ -54,6 +54,17 @@ struct aufsng_layer {
 struct aufsng_path {
 	struct aufsng_layer *layer;
 	struct dentry *dentry;
+	/*
+	 * The branch mount, captured when the entry was built.  Lockless
+	 * readers (aufsng_path_real()) must reach the mount through this
+	 * copy, never through layer->mnt: a branch removal blanks
+	 * layer->mnt (and a later add may reuse the slot for a different
+	 * branch) while a superseded-but-parked stack is still being
+	 * dereferenced.  The parked stack pins the vfsmount object
+	 * (aufsng_dyn_parked.mnts), and this pointer stays valid with it
+	 * until the inode is evicted.
+	 */
+	struct vfsmount *mnt;
 };
 
 /*
@@ -66,8 +77,14 @@ struct aufsng_entry {
 	struct aufsng_path lowerstack[];
 };
 
-/* longest AUFS branch mode token is "rw+nolwh" */
-#define AUFSNG_PERM_LEN	12
+/*
+ * Sized to AUFS's own maximum mode-token length (AuBrPermStrSz covers
+ * "rw+coo_reg+fhsm+unpin+icexsec+icexsys+icexusr+icexoth+nolwh"):
+ * aufsng_parse_perm() accepts any '+'-suffix chain a real aufs command
+ * may carry, so the stored token - echoed back verbatim through
+ * /proc/mounts - must never be silently truncated into a malformed one.
+ */
+#define AUFSNG_PERM_LEN	64
 
 struct aufsng_config {
 	/*
@@ -227,7 +244,14 @@ static inline void aufsng_path_real(struct inode *inode, struct path *path)
 		struct aufsng_entry *oe = AUFSNG_I_E(inode);
 
 		if (oe && oe->numlower) {
-			path->mnt = oe->lowerstack[0].layer->mnt;
+			/*
+			 * The entry's own mnt copy, NOT layer->mnt: this read
+			 * is lockless and @oe may be a superseded stack whose
+			 * branch was since removed - its layer->mnt is NULL
+			 * (or reused by a later add), while the entry's copy
+			 * stays pinned with the parked stack until eviction.
+			 */
+			path->mnt = oe->lowerstack[0].mnt;
 			path->dentry = oe->lowerstack[0].dentry;
 			return;
 		}
@@ -331,9 +355,24 @@ static inline int aufsng_wh_name(char *buf, const struct qstr *name,
  */
 #define AUFSNG_XINO_SHIFT	40
 
+/*
+ * The union root's inode number (AUFSNG_ROOT_INO) is invented, not taken
+ * from any branch, so a branch-0 object whose raw number happens to be
+ * the same (a fresh tmpfs rw branch hands out 2 to the very first object
+ * created in it) would otherwise report the root's exact (st_dev,
+ * st_ino) - making find report a filesystem loop and archive tools
+ * hardlink the two.  Move that one number out of the way instead;
+ * bit 62 is above every slot-folded value (idx << 40) and practically
+ * above any raw branch number.
+ */
+#define AUFSNG_ROOT_INO_EVADE	(1ULL << 62)
+
 static inline u64 aufsng_map_ino(u64 ino, unsigned int idx)
 {
-	if (!idx || ino >> AUFSNG_XINO_SHIFT)
+	if (!idx)
+		return ino == AUFSNG_ROOT_INO ? (ino | AUFSNG_ROOT_INO_EVADE) :
+						ino;
+	if (ino >> AUFSNG_XINO_SHIFT)
 		return ino;
 	return ino | ((u64)idx << AUFSNG_XINO_SHIFT);
 }
@@ -354,10 +393,14 @@ struct aufsng_dyn_parked {
 	 * mount reference while an older parked stack still held
 	 * dentries in that branch's sb would tear the branch down
 	 * under them ("Dentry still in use" panic on umount).  Each
-	 * node pins its own referenced mounts (one per @oe lower, so
-	 * the count is oe->numlower), and nodes are safe to release
-	 * in any order.
+	 * node pins its own referenced mounts (@nr_mnts of them - one
+	 * per @oe lower, or, for a pin-only node with no @oe, one per
+	 * lower of the inode's CURRENT stack: a deleted-but-open
+	 * object keeps its stack in place across the removal of the
+	 * branch serving it, see aufsng_dyn_pin_stack()), and nodes
+	 * are safe to release in any order.
 	 */
+	unsigned int nr_mnts;
 	struct vfsmount *mnts[];
 };
 
@@ -427,8 +470,16 @@ const char *aufsng_get_link(struct dentry *dentry, struct inode *inode,
 int aufsng_check_whiteout(struct vfsmount *mnt, struct dentry *parent,
 		       const struct qstr *name);
 int aufsng_check_diropq(struct vfsmount *mnt, struct dentry *dir);
-int aufsng_find_origin(struct aufsng_entry *poe, const struct qstr *name,
-		    struct aufsng_path *out);
+int aufsng_find_origin_ex(struct aufsng_entry *poe, const struct qstr *name,
+		       const struct aufsng_layer *skip_layer, umode_t mode,
+		       struct aufsng_path *out);
+
+static inline int aufsng_find_origin(struct aufsng_entry *poe,
+				  const struct qstr *name,
+				  struct aufsng_path *out)
+{
+	return aufsng_find_origin_ex(poe, name, NULL, 0, out);
+}
 int aufsng_lower_covers(struct inode *dir, const struct qstr *name);
 
 /* inode.c */
