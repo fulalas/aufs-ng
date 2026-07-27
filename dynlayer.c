@@ -41,6 +41,7 @@
 #include <linux/module.h>
 #include <linux/mount.h>
 #include <linux/namei.h>
+#include <linux/cred.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <linux/hashtable.h>
@@ -803,10 +804,11 @@ out_name:
 }
 
 struct aufsng_dyn_scan {
-	struct inode **dirs;
+	struct inode **pinned;
 	unsigned int nr;
 	unsigned int cap;
 	unsigned int nr_busy;
+	u64 busy_ino;
 };
 
 static bool aufsng_entry_has_layer(struct aufsng_entry *oe,
@@ -822,10 +824,140 @@ static bool aufsng_entry_has_layer(struct aufsng_entry *oe,
 }
 
 /*
+ * True when something other than @layer still backs @inode: a live
+ * upper, or a lower entry from another branch.  A dead upper -
+ * unhashed by an out-of-band unlink in the rw branch under udba=reval,
+ * pending the shed-upper heal (aufsng_get_inode) - is not a survivor:
+ * treating it as one would strip the stack the heal needs and serve
+ * the deleted upper forever.
+ */
+static bool aufsng_dyn_has_survivor(struct inode *inode,
+				 const struct aufsng_layer *layer)
+{
+	struct aufsng_entry *oe = AUFSNG_I_E(inode);
+	struct dentry *upper = aufsng_upperdentry(inode);
+	unsigned int i;
+
+	if (upper && !d_unhashed(upper) && !d_is_negative(upper))
+		return true;
+	for (i = 0; oe && i < oe->numlower; i++)
+		if (oe->lowerstack[i].layer != layer)
+			return true;
+	return false;
+}
+
+/*
+ * Is @inode's real object on @layer the target of a live memory
+ * mapping?  Checked on the BACKING inode: aufsng_mmap maps through
+ * backing_file_mmap, which links the vma into the real inode's
+ * address_space - the union inode's own i_mapping never sees a
+ * mapping.  Non-sleeping; called under i_lock.
+ */
+static bool aufsng_dyn_mapped_on_layer(struct inode *inode,
+				    const struct aufsng_layer *layer)
+{
+	struct aufsng_entry *oe = AUFSNG_I_E(inode);
+	unsigned int i;
+
+	for (i = 0; oe && i < oe->numlower; i++)
+		if (oe->lowerstack[i].layer == layer &&
+		    mapping_mapped(d_inode(oe->lowerstack[i].dentry)->i_mapping))
+			return true;
+	return false;
+}
+
+/*
+ * Rebuild a pinned non-directory's stack for the removal of @layer.
+ * A non-directory stack records only the topmost provider (namei.c),
+ * so the survivor cannot be read off the old stack: re-resolve the
+ * name against the surviving branches, exactly as the first fresh
+ * lookup after the removal will, so the rekeyed inode keeps the
+ * identity (hash key, st_ino) a fresh lookup computes.  When no name
+ * is left to resolve (the busy-scan's shrink evicts every alias of an
+ * inode pinned only by a path-less reference, e.g. an fsnotify mark),
+ * a live upper alone carries the object.  Returns the rebuilt entry,
+ * ERR_PTR(-EBUSY) when nothing else provides the object, or another
+ * ERR_PTR on error.  Caller holds the root inode lock and
+ * pfs->dyn_lock for writing (which also keeps d_name stable: union
+ * renames take dyn_lock for reading).
+ */
+static struct aufsng_entry *aufsng_dyn_prep_repoint(struct aufsng_fs *pfs,
+					      struct inode *inode,
+					      const struct aufsng_layer *layer)
+{
+	struct aufsng_path origin = { NULL, NULL };
+	struct aufsng_entry *new_oe;
+	struct dentry *alias, *upper;
+	const struct cred *old_cred;
+	bool upper_alive;
+	int err = 0;
+
+	upper = aufsng_upperdentry(inode);
+	upper_alive = upper && !d_unhashed(upper) && !d_is_negative(upper);
+
+	alias = d_find_alias(inode);
+	if (alias) {
+		struct aufsng_entry *poe = AUFSNG_E(alias->d_parent);
+		unsigned int i;
+
+		old_cred = override_creds(pfs->creator_cred);
+		for (i = 0; poe && i < poe->numlower; i++) {
+			struct aufsng_path *lower = &poe->lowerstack[i];
+			struct dentry *this;
+			int wh = 0;
+
+			if (lower->layer == layer)
+				continue;
+			this = aufsng_lookup_once(lower->layer->mnt,
+					       lower->dentry,
+					       &alias->d_name, &wh);
+			if (IS_ERR(this)) {
+				err = PTR_ERR(this);
+				break;
+			}
+			if (wh)
+				break;
+			if (!this)
+				continue;
+			/*
+			 * A same-named survivor of a different type is an
+			 * independent object, not this one's origin - and
+			 * it hides anything deeper, exactly as in lookup.
+			 */
+			if (!aufsng_origin_type_ok(this, inode->i_mode)) {
+				dput(this);
+				break;
+			}
+			origin.layer = lower->layer;
+			origin.dentry = this;
+			break;
+		}
+		revert_creds(old_cred);
+		dput(alias);
+		if (err)
+			return ERR_PTR(err);
+	}
+
+	if (!origin.dentry && !upper_alive)
+		return ERR_PTR(-EBUSY);
+
+	new_oe = aufsng_alloc_entry(origin.dentry ? 1 : 0);
+	if (!new_oe) {
+		dput(origin.dentry);
+		return ERR_PTR(-ENOMEM);
+	}
+	if (origin.dentry)
+		new_oe->lowerstack[0] = origin;
+	return new_oe;
+}
+
+/*
  * Drop every cache-only reference to @layer and classify what
- * remains: in-use non-directories make the branch busy; in-use
- * directories (ancestors of running binaries, working directories)
- * are collected so their stacks can be rebuilt without the branch.
+ * remains: a non-directory whose @layer object is memory-mapped makes
+ * the branch busy (a live mapping cannot have its backing pulled);
+ * every other in-use inode - directories (ancestors of running
+ * binaries, working directories) and re-pointable files alike - is
+ * collected so its stack can be rebuilt without the branch.
  * Caller holds the root inode lock and pfs->dyn_lock for writing, so
  * no new reference can appear while we look.
  */
@@ -846,15 +978,16 @@ static int aufsng_dyn_scan_branch(struct super_block *sb,
 again:
 	/*
 	 * A restart rewalks the whole list, so the previous pass's
-	 * collection must be dropped first: every in-use directory would
+	 * collection must be dropped first: every in-use inode would
 	 * otherwise be collected once more per restart, growing
-	 * scan->dirs (and the allocations later sized by scan->nr) by
-	 * O(in-use dirs) for each cache-only inode evicted below.
+	 * scan->pinned (and the allocations later sized by scan->nr) by
+	 * O(in-use inodes) for each cache-only inode evicted below.
 	 */
 	for (i = 0; i < scan->nr; i++)
-		iput(scan->dirs[i]);
+		iput(scan->pinned[i]);
 	scan->nr = 0;
 	scan->nr_busy = 0;
+	scan->busy_ino = 0;
 	spin_lock(&sb->s_inode_list_lock);
 	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
 		if (inode == aufsng_root_inode(sb))
@@ -866,7 +999,10 @@ again:
 			continue;
 		}
 		if (atomic_read(&inode->i_count)) {
-			if (!S_ISDIR(inode->i_mode)) {
+			if (!S_ISDIR(inode->i_mode) &&
+			    aufsng_dyn_mapped_on_layer(inode, layer)) {
+				if (!scan->nr_busy)
+					scan->busy_ino = inode->i_ino;
 				scan->nr_busy++;
 				spin_unlock(&inode->i_lock);
 				continue;
@@ -875,18 +1011,18 @@ again:
 				unsigned int cap = max(16U, scan->cap * 2);
 				struct inode **d;
 
-				d = krealloc_array(scan->dirs, cap,
+				d = krealloc_array(scan->pinned, cap,
 						   sizeof(*d), GFP_ATOMIC);
 				if (!d) {
 					spin_unlock(&inode->i_lock);
 					spin_unlock(&sb->s_inode_list_lock);
 					return -ENOMEM;
 				}
-				scan->dirs = d;
+				scan->pinned = d;
 				scan->cap = cap;
 			}
 			atomic_inc(&inode->i_count);
-			scan->dirs[scan->nr++] = inode;
+			scan->pinned[scan->nr++] = inode;
 			spin_unlock(&inode->i_lock);
 			continue;
 		}
@@ -909,16 +1045,23 @@ again:
 	return 0;
 }
 
-static int aufsng_dyn_copy_up_dirs(struct aufsng_dyn_scan *scan)
+/*
+ * Copy up the collected directories that would lose their only
+ * backing with @layer; survivor-backed ones keep being served from a
+ * surviving branch and need nothing.
+ */
+static int aufsng_dyn_copy_up_dirs(struct aufsng_dyn_scan *scan,
+				const struct aufsng_layer *layer)
 {
 	unsigned int i;
 	int err = 0;
 
 	for (i = 0; !err && i < scan->nr; i++) {
-		struct inode *inode = scan->dirs[i];
+		struct inode *inode = scan->pinned[i];
 		struct dentry *alias;
 
-		if (aufsng_upperdentry(inode))
+		if (!S_ISDIR(inode->i_mode) ||
+		    aufsng_dyn_has_survivor(inode, layer))
 			continue;
 		alias = d_find_alias(inode);
 		if (!alias)
@@ -1063,12 +1206,21 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
 	struct aufsng_dyn_parked **parked = NULL;
 	struct aufsng_layer *layer;
 	struct aufsng_dyn_scan scan = {};
+	u64 blocker_ino;
+	const char *brname;
 	unsigned int i, tries;
 	int err;
 
 	layer = aufsng_dyn_find_branch(pfs, path->dentry);
 	if (!layer)
 		return -ENOENT;
+	/*
+	 * The branch root dentry is the layer filesystem's own root, so
+	 * '%pd' on it prints "/"; the config string is the path the user
+	 * knows the branch by.  Freed only in aufsng_dyn_release_branch(),
+	 * after the last message below.
+	 */
+	brname = pfs->config.br_paths[aufsng_layer_idx(pfs, layer)];
 
 	if (AUFSNG_I_E(root_inode)->numlower < 1)
 		return -EINVAL;	/* no lower branch to remove */
@@ -1083,15 +1235,24 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
 			goto out_unlock;
 
 		if (scan.nr_busy) {
-			pr_info("aufs (aufs-ng): cannot remove branch '%pd': %u file(s) in use\n",
-				path->dentry, scan.nr_busy);
+			pr_info("aufs (aufs-ng): cannot remove branch '%s': %u file(s) in use (memory-mapped, e.g. inode %llu)\n",
+				brname, scan.nr_busy, scan.busy_ino);
 			err = -EBUSY;
 			goto out_unlock;
 		}
 
+		/*
+		 * A pinned directory only needs a copy-up when the removed
+		 * branch is its sole backing: with a survivor, the rebuilt
+		 * stack keeps serving it from a surviving branch.
+		 */
+		blocker_ino = 0;
 		for (i = 0; i < scan.nr; i++) {
-			if (!aufsng_upperdentry(scan.dirs[i]))
+			if (S_ISDIR(scan.pinned[i]->i_mode) &&
+			    !aufsng_dyn_has_survivor(scan.pinned[i], layer)) {
+				blocker_ino = scan.pinned[i]->i_ino;
 				break;
+			}
 		}
 		if (i == scan.nr)
 			break;
@@ -1100,13 +1261,16 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
 		inode_unlock(root_inode);
 
 		err = -EBUSY;
-		if (tries >= 4)
+		if (tries >= 4) {
+			pr_info("aufs (aufs-ng): cannot remove branch '%s': in-use directory inode %llu has no other provider and its copy-up made no progress\n",
+				brname, blocker_ino);
 			goto out_scan;
-		err = aufsng_dyn_copy_up_dirs(&scan);
+		}
+		err = aufsng_dyn_copy_up_dirs(&scan, layer);
 		if (err)
 			goto out_scan;
 		for (i = 0; i < scan.nr; i++)
-			iput(scan.dirs[i]);
+			iput(scan.pinned[i]);
 		scan.nr = 0;
 	}
 
@@ -1120,20 +1284,32 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
 	for (i = 0; i < scan.nr; i++) {
 		struct aufsng_entry *cur;
 
-		new_oes[i] = aufsng_dyn_prep_rebuild(scan.dirs[i], layer);
+		if (S_ISDIR(scan.pinned[i]->i_mode))
+			new_oes[i] = aufsng_dyn_prep_rebuild(scan.pinned[i],
+							  layer);
+		else
+			new_oes[i] = aufsng_dyn_prep_repoint(pfs,
+							  scan.pinned[i],
+							  layer);
 		if (IS_ERR(new_oes[i])) {
+			err = PTR_ERR(new_oes[i]);
+			if (err == -EBUSY)
+				pr_info("aufs (aufs-ng): cannot remove branch '%s': in-use file inode %llu has no other provider\n",
+					brname, scan.pinned[i]->i_ino);
 			new_oes[i] = NULL;
 			goto out_unlock;
 		}
 		if (!new_oes[i])
 			continue;
 		/* sized to pin every mount the superseded stack references */
-		cur = AUFSNG_I_E(scan.dirs[i]);
+		cur = AUFSNG_I_E(scan.pinned[i]);
 		parked[i] = kmalloc(struct_size(parked[i], mnts,
 						cur ? cur->numlower : 0),
 				    GFP_KERNEL);
-		if (!parked[i])
+		if (!parked[i]) {
+			err = -ENOMEM;
 			goto out_unlock;
+		}
 	}
 
 	/*
@@ -1176,20 +1352,22 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
 	 */
 	for (i = 0; i < scan.nr; i++) {
 		if (new_oes[i]) {
-			aufsng_dyn_commit_rebuild(pfs, scan.dirs[i], new_oes[i],
+			aufsng_dyn_commit_rebuild(pfs, scan.pinned[i], new_oes[i],
 					      parked[i]);
 			/*
 			 * Removing a branch that carried a whiteout reveals the
 			 * name it was hiding in a lower-priority branch, so drop
 			 * cached negative children whose "absent" verdict the
 			 * removal may have overturned - the same refresh the add
-			 * path does after splicing.
+			 * path does after splicing.  Regular files have no
+			 * children to refresh.
 			 */
-			aufsng_dyn_drop_neg_children(scan.dirs[i]);
+			if (S_ISDIR(scan.pinned[i]->i_mode))
+				aufsng_dyn_drop_neg_children(scan.pinned[i]);
 		}
-		iput(scan.dirs[i]);
+		iput(scan.pinned[i]);
 	}
-	kfree(scan.dirs);
+	kfree(scan.pinned);
 	kfree(new_oes);
 	kfree(parked);
 
@@ -1198,7 +1376,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
 	/* one re-check of every cached lower-only dentry (dcache.c) */
 	atomic_long_inc(&pfs->branch_gen);
 
-	pr_info("aufs (aufs-ng): branch '%pd' removed\n", path->dentry);
+	pr_info("aufs (aufs-ng): branch '%s' removed\n", brname);
 
 	up_write(&pfs->dyn_lock);
 	inode_unlock(root_inode);
@@ -1221,8 +1399,8 @@ out_unlock:
 	inode_unlock(root_inode);
 out_scan:
 	for (i = 0; i < scan.nr; i++)
-		iput(scan.dirs[i]);
-	kfree(scan.dirs);
+		iput(scan.pinned[i]);
+	kfree(scan.pinned);
 	if (new_oes) {
 		for (i = 0; i < scan.nr; i++) {
 			if (new_oes[i])
