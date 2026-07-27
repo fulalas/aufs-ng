@@ -22,6 +22,26 @@
 
 static atomic_t aufsng_tmpfile_seq = ATOMIC_INIT(0);
 
+/*
+ * Discard the invisible ".wh..wh.pxu" temp of a failed or superseded
+ * copy-up.  With no write access (the rw branch went read-only between
+ * prep and commit) the temp cannot be removed at all - it then stays
+ * until a clear_whiteouts sweep of its directory, so leave a trace for
+ * the admin.  The one policy for both the prep-side and commit-side
+ * failure paths.
+ */
+static void aufsng_discard_tmp(struct aufsng_fs *pfs, struct dentry *pupper,
+			    const struct qstr *tmp, const char *tmpbuf)
+{
+	if (!mnt_want_write(aufsng_upper_mnt(pfs))) {
+		aufsng_remove_object(pfs, pupper, tmp, false);
+		mnt_drop_write(aufsng_upper_mnt(pfs));
+	} else {
+		pr_warn("aufs (aufs-ng): read-only rw branch, copy-up temp '%s' left behind\n",
+			tmpbuf);
+	}
+}
+
 static int aufsng_copy_xattr(struct aufsng_fs *pfs, const struct path *oldpath,
 			  struct dentry *new)
 {
@@ -62,7 +82,7 @@ retry:
 				size = vfs_getxattr(old_idmap, oldpath->dentry,
 						    name, NULL, 0);
 			if (size < 0)
-				goto next;
+				continue;
 			new_value = kvmalloc(size, GFP_KERNEL);
 			if (!new_value) {
 				err = -ENOMEM;
@@ -74,7 +94,7 @@ retry:
 			goto retry;
 		}
 		if (size < 0)
-			goto next;
+			continue;
 
 		err = vfs_setxattr(new_idmap, new, name, value, size, 0);
 		if (err) {
@@ -83,8 +103,6 @@ retry:
 			else
 				break;
 		}
-next:
-		;
 	}
 
 out:
@@ -234,14 +252,7 @@ static struct dentry *aufsng_copy_up_prep_regular(struct aufsng_fs *pfs,
 
 	err = aufsng_copy_data(pfs, lowerpath, work, size);
 	if (err) {
-		if (!mnt_want_write(aufsng_upper_mnt(pfs))) {
-			aufsng_remove_object(pfs, pupper, tmp, false);
-			mnt_drop_write(aufsng_upper_mnt(pfs));
-		} else {
-			/* same trace the commit-side leak gets (out_tmp) */
-			pr_warn("aufs (aufs-ng): read-only rw branch, copy-up temp '%s' left behind\n",
-				tmpbuf);
-		}
+		aufsng_discard_tmp(pfs, pupper, tmp, tmpbuf);
 		dput(work);
 		return ERR_PTR(err);
 	}
@@ -535,20 +546,7 @@ out:
 	mnt_drop_write(aufsng_upper_mnt(pfs));
 out_tmp:
 	if (work) {
-		/*
-		 * No write access (the rw branch went read-only between
-		 * prep and commit).  One retry covers a flapping fs; if
-		 * the branch is persistently ro no removal is possible -
-		 * the invisible temp then stays until a clear_whiteouts
-		 * sweep of its directory, so leave a trace for the admin.
-		 */
-		if (!mnt_want_write(aufsng_upper_mnt(pfs))) {
-			aufsng_remove_object(pfs, pupper, &tmpq, false);
-			mnt_drop_write(aufsng_upper_mnt(pfs));
-		} else {
-			pr_warn("aufs (aufs-ng): read-only rw branch, copy-up temp '%s' left behind\n",
-				tmpbuf);
-		}
+		aufsng_discard_tmp(pfs, pupper, &tmpq, tmpbuf);
 		dput(work);
 	}
 	return err;

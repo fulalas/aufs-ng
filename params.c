@@ -373,16 +373,11 @@ static void aufsng_free_fs_context(struct fs_context *fc)
 	fc->fs_private = NULL;
 }
 
-static int aufsng_reconfigure(struct fs_context *fc)
-{
-	return aufsng_dyn_reconfigure(fc);
-}
-
 static const struct fs_context_operations aufsng_context_ops = {
 	.parse_param		= aufsng_parse_param,
 	.parse_monolithic	= aufsng_parse_monolithic,
 	.get_tree		= aufsng_get_tree,
-	.reconfigure		= aufsng_reconfigure,
+	.reconfigure		= aufsng_dyn_reconfigure,
 	.free			= aufsng_free_fs_context,
 };
 

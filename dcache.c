@@ -140,7 +140,7 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	if (upper) {
 		if (!reval)
 			return 1;	/* upper-backed: no branch outranks it */
-		if (d_unhashed(upper) || d_is_negative(upper))
+		if (!aufsng_dentry_alive(upper))
 			return 0;
 		/*
 		 * "No branch outranks the upper" is a per-NAME statement,
@@ -158,12 +158,10 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	if (reval && !upper && oe && oe->numlower) {
 		struct dentry *lower = oe->lowerstack[0].dentry;
 
-		if (d_unhashed(lower) || d_is_negative(lower))
+		if (!aufsng_dentry_alive(lower))
 			return 0;
-		ret = aufsng_attrs_valid(inode, d_inode(lower), flags);
-		if (ret < 0)
-			return ret;
-		ret = 1;
+		if (aufsng_attrs_valid(inode, d_inode(lower), flags) < 0)
+			return -ECHILD;
 	}
 
 	/*
