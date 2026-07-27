@@ -645,7 +645,60 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 			goto out;
 	}
 
-	if (upper) {
+	if (upper && is_dir) {
+		char tmpbuf[NAME_MAX + 1];
+		struct qstr tmp;
+		int werr;
+
+		/*
+		 * Rename the victim aside to a hidden whtmp name FIRST -
+		 * the union-level delete commits at this rename, before a
+		 * single marker inside is touched.  Sweeping the markers
+		 * in place and rmdir-ing under the real name (the old
+		 * order) is not restartable: a sweep that fails halfway
+		 * (immutable marker, EIO) has already destroyed some
+		 * ".wh.<child>" entries, so the surviving, still-visible
+		 * directory RESURRECTS every lower name they were hiding -
+		 * and losing ".wh..wh..opq" republishes an opaque dir's
+		 * whole lower subtree.  Parked under ".wh..wh." the dir is
+		 * invisible to lookup and readdir whatever happens next;
+		 * this is AUFS's own renwh_and_rmdir/whtmp ordering.  The
+		 * rename is metadata-only (no new inode, works on a full
+		 * branch); it fails with ENOENT when the upper entry
+		 * vanished out-of-band, exactly as the removal always has.
+		 */
+		tmp = QSTR_LEN(tmpbuf, snprintf(tmpbuf, sizeof(tmpbuf),
+						".wh..wh.tmp.%u",
+						atomic_inc_return(&aufsng_whtmp_seq)));
+		err = aufsng_branch_rename(pfs, pupper, &dentry->d_name,
+					pupper, &tmp);
+		if (!err) {
+			real_removed = true;
+			/*
+			 * Best-effort teardown of the parked dir, exactly
+			 * as AUFS ignores its whtmp rmdir failures: the
+			 * delete is already committed, a leftover is
+			 * invisible and only costs branch space (a later
+			 * clear_whiteouts sweep of the parent removes an
+			 * EMPTY leftover; a non-empty one needs the admin).
+			 */
+			werr = aufsng_clear_whiteouts(pfs, upper);
+			if (!werr) {
+				struct dentry *slot =
+					start_removing_noperm(pupper, &tmp);
+
+				werr = PTR_ERR_OR_ZERO(slot);
+				if (!werr) {
+					werr = vfs_rmdir(idmap, d_inode(pupper),
+							 slot, NULL);
+					end_dirop(slot);
+				}
+			}
+			if (werr)
+				pr_warn("aufs (aufs-ng): rmdir left parked dir '%s' in the rw branch (%d)\n",
+					tmpbuf, werr);
+		}
+	} else if (upper) {
 		struct qstr q = QSTR_LEN(dentry->d_name.name,
 					 dentry->d_name.len);
 		struct dentry *slot;
@@ -660,49 +713,35 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 			 * whose single upperdentry carries whichever
 			 * name was copied up first).  The name itself is
 			 * lower-only, so the whiteout created above is
-			 * the whole removal.  Directories cannot be
-			 * hardlinks, so this never applies to them: a
-			 * dir upper missing its name (out-of-band
-			 * rename in the rw branch) keeps failing, as it
-			 * always did, rather than skipping the
-			 * clear_whiteouts + rmdir it still needs.
+			 * the whole removal.
 			 */
-			if (err == -ENOENT && !is_dir)
+			if (err == -ENOENT)
 				err = 0;
 		} else {
-			if (is_dir) {
-				/* union-empty: only whiteouts/opq remain inside */
-				err = aufsng_clear_whiteouts(pfs, upper);
-				if (!err)
-					err = vfs_rmdir(idmap, d_inode(pupper),
-							slot, NULL);
-			} else {
-				err = vfs_unlink(idmap, d_inode(pupper), slot,
-						 NULL);
-			}
+			err = vfs_unlink(idmap, d_inode(pupper), slot, NULL);
 			if (!err)
 				real_removed = true;
 			end_dirop(slot);
 		}
-		if (err) {
-			/* roll the pre-created whiteout back */
-			if (covered) {
-				int wherr = aufsng_remove_whiteout(pfs, pupper,
-							&dentry->d_name);
+	}
+	if (upper && err) {
+		/* roll the pre-created whiteout back */
+		if (covered) {
+			int wherr = aufsng_remove_whiteout(pfs, pupper,
+						&dentry->d_name);
 
-				/*
-				 * Unrecoverable: the whiteout now masks a
-				 * name whose removal just failed, so still-
-				 * live content is hidden until the marker is
-				 * removed from the branch by hand.
-				 */
-				if (wherr)
-					pr_err("aufs (aufs-ng): failed to roll back whiteout '%.*s' (%d), the name stays hidden\n",
-					       dentry->d_name.len,
-					       dentry->d_name.name, wherr);
-			}
-			goto out;
+			/*
+			 * Unrecoverable: the whiteout now masks a
+			 * name whose removal just failed, so still-
+			 * live content is hidden until the marker is
+			 * removed from the branch by hand.
+			 */
+			if (wherr)
+				pr_err("aufs (aufs-ng): failed to roll back whiteout '%.*s' (%d), the name stays hidden\n",
+				       dentry->d_name.len,
+				       dentry->d_name.name, wherr);
 		}
+		goto out;
 	}
 
 	/*

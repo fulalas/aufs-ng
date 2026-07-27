@@ -117,6 +117,21 @@ static bool aufsng_is_wh_bookkeeping(const char *name, int len)
 	       !memcmp(name, AUFSNG_WH_PFX AUFSNG_WH_PFX, 2 * AUFSNG_WH_PFX_LEN);
 }
 
+/*
+ * The single definition of the cache's key order, shared by find and
+ * insert: two independent copies of the comparison would let them
+ * drift apart, after which an insert lands where find no longer looks
+ * - duplicate emitted names, and a higher branch's whiteout tombstone
+ * silently failing to suppress a lower branch's occurrence.
+ */
+static int aufsng_cache_entry_cmp(const char *name, int len,
+			       const struct aufsng_cache_entry *p)
+{
+	int cmp = strncmp(name, p->name, len);
+
+	return cmp ? cmp : len - p->len;
+}
+
 static struct aufsng_cache_entry *aufsng_cache_entry_find(struct rb_root *root,
 						    const char *name, int len)
 {
@@ -127,9 +142,7 @@ static struct aufsng_cache_entry *aufsng_cache_entry_find(struct rb_root *root,
 		struct aufsng_cache_entry *p =
 			rb_entry(node, struct aufsng_cache_entry, node);
 
-		cmp = strncmp(name, p->name, len);
-		if (!cmp)
-			cmp = len - p->len;
+		cmp = aufsng_cache_entry_cmp(name, len, p);
 		if (cmp > 0)
 			node = node->rb_right;
 		else if (cmp < 0)
@@ -152,9 +165,7 @@ static void aufsng_cache_entry_insert(struct rb_root *root,
 			rb_entry(*newp, struct aufsng_cache_entry, node);
 
 		parent = *newp;
-		cmp = strncmp(n->name, p->name, n->len);
-		if (!cmp)
-			cmp = n->len - p->len;
+		cmp = aufsng_cache_entry_cmp(n->name, n->len, p);
 		if (cmp > 0)
 			newp = &(*newp)->rb_right;
 		else
@@ -428,7 +439,7 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
 
 	for (i = 0; !err && oe && i < oe->numlower &&
 		    !(stop_when_visible && cache->nr_visible); i++) {
-		realpath.mnt = oe->lowerstack[i].layer->mnt;
+		realpath.mnt = oe->lowerstack[i].mnt;
 		realpath.dentry = oe->lowerstack[i].dentry;
 		err = aufsng_dir_read_layer(pfs, &realpath, cache,
 					 aufsng_layer_idx(pfs,
@@ -492,6 +503,22 @@ out:
 	return fresh;
 }
 
+/*
+ * Is @cache still the directory's current listing?  Version-valid (no
+ * in-union mutation since it was built) AND, under udba=reval, no
+ * branch directory edited out-of-band (aufsng_dir_cache_fresh) - the
+ * ONE definition of "reusable", shared by open, rewinddir and the
+ * rmdir emptiness probe, so a future invalidation signal cannot be
+ * added to one copy and missed by another.  Caller holds oi->lock.
+ */
+static bool aufsng_cache_usable(struct aufsng_fs *pfs, struct inode *inode,
+			     struct aufsng_dir_cache *cache)
+{
+	return cache &&
+	       cache->version == atomic64_read(&AUFSNG_I(inode)->version) &&
+	       aufsng_dir_cache_fresh(pfs, inode, cache);
+}
+
 static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
 {
 	struct inode *inode = file_inode(file);
@@ -506,13 +533,11 @@ static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
 	mutex_lock(&oi->lock);
 	cache = oi->cache;
 	/*
-	 * Reuse the cached listing while it is version-valid (no in-union
-	 * mutation since it was built) and, under udba=reval, the rw branch
-	 * has not been edited out-of-band.  This makes the common "nothing
-	 * changed" open O(1) instead of re-reading every branch each time.
+	 * Reuse the cached listing while it is still usable.  This makes
+	 * the common "nothing changed" open O(1) instead of re-reading
+	 * every branch each time.
 	 */
-	if (cache && cache->version == atomic64_read(&oi->version) &&
-	    aufsng_dir_cache_fresh(pfs, inode, cache)) {
+	if (aufsng_cache_usable(pfs, inode, cache)) {
 		cache->refcount++;
 	} else {
 		mutex_unlock(&oi->lock);
@@ -549,8 +574,7 @@ static void aufsng_dir_reset(struct file *file)
 	 * listing an out-of-band branch edit already invalidated.
 	 */
 	mutex_lock(&oi->lock);
-	stale = od->cache->version != atomic64_read(&oi->version) ||
-		!aufsng_dir_cache_fresh(pfs, inode, od->cache);
+	stale = !aufsng_cache_usable(pfs, inode, od->cache);
 	if (stale)
 		aufsng_cache_put(od->cache);
 	mutex_unlock(&oi->lock);
@@ -621,8 +645,7 @@ int aufsng_check_empty_dir(struct dentry *dentry)
 	 * rebuild (aborting at the first visible entry) without one.
 	 */
 	mutex_lock(&oi->lock);
-	if (oi->cache && oi->cache->version == atomic64_read(&oi->version) &&
-	    aufsng_dir_cache_fresh(pfs, inode, oi->cache)) {
+	if (aufsng_cache_usable(pfs, inode, oi->cache)) {
 		cache = oi->cache;
 		cache->refcount++;
 	}
@@ -721,16 +744,21 @@ int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir)
 		 * itself is fine (this mirrors the VFS's own
 		 * parent-PARENT/victim-plain convention in vfs_rmdir()).
 		 */
+		int sweep_err = 0;
+
 		inode_lock_nested(d_inode(upperdir), I_MUTEX_CHILD);
 		list_for_each_entry(p, &sw.names, node) {
 			struct qstr q = QSTR_LEN(p->name, p->len);
 			struct dentry *whd;
+			int e;
 
 			whd = lookup_one(idmap, &q, upperdir);
 			if (IS_ERR(whd)) {
-				err = PTR_ERR(whd);
+				if (!sweep_err)
+					sweep_err = PTR_ERR(whd);
 				continue;
 			}
+			e = 0;
 			if (d_is_positive(whd)) {
 				/*
 				 * ".wh..wh.plnk"/".wh..wh.orph" style
@@ -740,17 +768,29 @@ int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir)
 				 * union-empty dir; sweep them too.
 				 */
 				if (d_is_dir(whd))
-					err = vfs_rmdir(idmap,
-							d_inode(upperdir),
-							whd, NULL);
+					e = vfs_rmdir(idmap,
+						      d_inode(upperdir),
+						      whd, NULL);
 				else
-					err = vfs_unlink(idmap,
-							 d_inode(upperdir),
-							 whd, NULL);
+					e = vfs_unlink(idmap,
+						       d_inode(upperdir),
+						       whd, NULL);
 			}
 			dput(whd);
+			/*
+			 * The FIRST failure is the sweep's result - a later
+			 * success must not overwrite it, or the caller sees
+			 * 0 with markers still on disk and the true cause
+			 * (EPERM from an immutable marker, EIO, ENOSPC) is
+			 * replaced by whatever the follow-up vfs op reports.
+			 * The sweep still continues: every marker removed
+			 * is one less to block the retry.
+			 */
+			if (e && !sweep_err)
+				sweep_err = e;
 		}
 		inode_unlock(d_inode(upperdir));
+		err = sweep_err;
 	}
 
 	list_for_each_entry_safe(p, n, &sw.names, node)

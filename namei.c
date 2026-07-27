@@ -120,9 +120,20 @@ struct dentry *aufsng_lookup_once(struct vfsmount *mnt,
  * Returns 1 with a reference in @out, 0 if no lower provides the name
  * (absent or whited out), negative errno on error.  Caller must hold
  * pfs->dyn_lock (any mode).
+ *
+ * @skip_layer, when set, is ignored during the walk (branch removal
+ * re-resolves a name against the surviving branches only).  @mode,
+ * when non-zero, requires the first positive hit to be of the same
+ * file type: a same-named lower of a different type is an independent
+ * object, not this one's origin - and, exactly as in lookup, it hides
+ * anything deeper, so the walk STOPS there rather than continuing (all
+ * callers historically stopped at the first positive; keeping that
+ * single behavior here prevents the merge rule from drifting apart
+ * between lookup, mutation and branch removal).
  */
-int aufsng_find_origin(struct aufsng_entry *poe, const struct qstr *name,
-		    struct aufsng_path *out)
+int aufsng_find_origin_ex(struct aufsng_entry *poe, const struct qstr *name,
+		       const struct aufsng_layer *skip_layer, umode_t mode,
+		       struct aufsng_path *out)
 {
 	unsigned int i;
 
@@ -131,15 +142,22 @@ int aufsng_find_origin(struct aufsng_entry *poe, const struct qstr *name,
 		struct dentry *this;
 		int wh = 0;
 
-		this = aufsng_lookup_once(lower->layer->mnt, lower->dentry,
+		if (skip_layer && lower->layer == skip_layer)
+			continue;
+		this = aufsng_lookup_once(lower->mnt, lower->dentry,
 				       name, &wh);
 		if (IS_ERR(this))
 			return PTR_ERR(this);
 		if (wh)
 			return 0;
 		if (this) {
+			if (mode && !aufsng_origin_type_ok(this, mode)) {
+				dput(this);
+				return 0;
+			}
 			out->layer = lower->layer;
 			out->dentry = this;
+			out->mnt = lower->mnt;
 			return 1;
 		}
 	}
@@ -417,7 +435,13 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 			stopped = true;
 		} else if (this) {
 			upper = this;
-			if (d_is_dir(upper)) {
+			/*
+			 * @stopped is only ever consumed when a lower stack
+			 * exists to stop: with no parent lowers the marker
+			 * probe would be a wasted branch lookup whose result
+			 * nothing reads.
+			 */
+			if (d_is_dir(upper) && poe && poe->numlower) {
 				int opq = aufsng_check_diropq(aufsng_upper_mnt(pfs),
 							   upper);
 				if (opq < 0) {
@@ -446,16 +470,11 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 		struct aufsng_path origin = { NULL, NULL };
 		int found;
 
-		found = aufsng_find_origin(poe, &dentry->d_name, &origin);
+		found = aufsng_find_origin_ex(poe, &dentry->d_name, NULL,
+					   d_inode(upper)->i_mode, &origin);
 		if (found < 0) {
 			err = found;
 			goto out;
-		}
-		if (found && !aufsng_origin_type_ok(origin.dentry,
-						    d_inode(upper)->i_mode)) {
-			dput(origin.dentry);
-			origin.dentry = NULL;
-			found = 0;
 		}
 		err = -ENOMEM;
 		oe = aufsng_alloc_entry(found);
@@ -471,7 +490,7 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 			struct aufsng_path *lower = &poe->lowerstack[i];
 
 			wh = 0;
-			this = aufsng_lookup_once(lower->layer->mnt,
+			this = aufsng_lookup_once(lower->mnt,
 					       lower->dentry, &dentry->d_name,
 					       &wh);
 			if (IS_ERR(this)) {
@@ -506,6 +525,7 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 				if (!upper && !oe->numlower) {
 					oe->lowerstack[0].layer = lower->layer;
 					oe->lowerstack[0].dentry = this;
+					oe->lowerstack[0].mnt = lower->mnt;
 					oe->numlower = 1;
 				} else {
 					dput(this);
@@ -514,10 +534,16 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 			}
 			oe->lowerstack[oe->numlower].layer = lower->layer;
 			oe->lowerstack[oe->numlower].dentry = this;
+			oe->lowerstack[oe->numlower].mnt = lower->mnt;
 			oe->numlower++;
 
-			{
-				int opq = aufsng_check_diropq(lower->layer->mnt,
+			/*
+			 * On the last branch the opaque verdict changes
+			 * nothing (break == falling out of the loop), so
+			 * don't pay a branch lookup for it.
+			 */
+			if (i + 1 < poe->numlower) {
+				int opq = aufsng_check_diropq(lower->mnt,
 							   this);
 				if (opq < 0) {
 					err = opq;
