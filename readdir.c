@@ -29,6 +29,7 @@
 #include <linux/mount.h>
 #include <linux/cred.h>
 #include <linux/rbtree.h>
+#include <linux/refcount.h>
 #include <linux/iversion.h>
 #include <linux/rcupdate.h>
 #include "aufsng.h"
@@ -52,7 +53,13 @@ struct aufsng_dir_stamp {
 };
 
 struct aufsng_dir_cache {
-	long refcount;
+	/*
+	 * Lock-free: oi->cache itself holds a reference while the
+	 * pointer is set (getters take theirs under oi->lock, which
+	 * guards the pointer), so a put - every closedir pays one -
+	 * never needs the mutex.
+	 */
+	refcount_t refcount;
 	u64 version;
 	/*
 	 * Every branch directory's change stamp when this listing was
@@ -117,13 +124,7 @@ static bool aufsng_is_wh_bookkeeping(const char *name, int len)
 	       !memcmp(name, AUFSNG_WH_PFX AUFSNG_WH_PFX, 2 * AUFSNG_WH_PFX_LEN);
 }
 
-/*
- * The single definition of the cache's key order, shared by find and
- * insert: two independent copies of the comparison would let them
- * drift apart, after which an insert lands where find no longer looks
- * - duplicate emitted names, and a higher branch's whiteout tombstone
- * silently failing to suppress a lower branch's occurrence.
- */
+/* the single definition of the cache's key order */
 static int aufsng_cache_entry_cmp(const char *name, int len,
 			       const struct aufsng_cache_entry *p)
 {
@@ -132,54 +133,12 @@ static int aufsng_cache_entry_cmp(const char *name, int len,
 	return cmp ? cmp : len - p->len;
 }
 
-static struct aufsng_cache_entry *aufsng_cache_entry_find(struct rb_root *root,
-						    const char *name, int len)
-{
-	struct rb_node *node = root->rb_node;
-	int cmp;
-
-	while (node) {
-		struct aufsng_cache_entry *p =
-			rb_entry(node, struct aufsng_cache_entry, node);
-
-		cmp = aufsng_cache_entry_cmp(name, len, p);
-		if (cmp > 0)
-			node = node->rb_right;
-		else if (cmp < 0)
-			node = node->rb_left;
-		else
-			return p;
-	}
-	return NULL;
-}
-
-static void aufsng_cache_entry_insert(struct rb_root *root,
-				   struct aufsng_cache_entry *n)
-{
-	struct rb_node **newp = &root->rb_node;
-	struct rb_node *parent = NULL;
-	int cmp;
-
-	while (*newp) {
-		struct aufsng_cache_entry *p =
-			rb_entry(*newp, struct aufsng_cache_entry, node);
-
-		parent = *newp;
-		cmp = aufsng_cache_entry_cmp(n->name, n->len, p);
-		if (cmp > 0)
-			newp = &(*newp)->rb_right;
-		else
-			newp = &(*newp)->rb_left;
-	}
-
-	rb_link_node(&n->node, parent, newp);
-	rb_insert_color(&n->node, root);
-}
-
 static int aufsng_cache_add(struct aufsng_dir_cache *cache, const char *name,
 			 int namelen, u64 ino, unsigned int d_type,
 			 bool hidden, unsigned int idx)
 {
+	struct rb_node **newp = &cache->root.rb_node;
+	struct rb_node *parent = NULL;
 	struct aufsng_cache_entry *p;
 
 	/*
@@ -202,9 +161,26 @@ static int aufsng_cache_add(struct aufsng_dir_cache *cache, const char *name,
 	 *   unrelated object (the upper keeps its own ino), and a
 	 *   whiteout ends the origin search - both settle the number
 	 *   for all deeper branches.
+	 *
+	 * One rbtree descent serves both the find and, on a miss, the
+	 * insert position: every entry of every branch passes through
+	 * here, so a separate find-then-insert would double the merge's
+	 * tree work.
 	 */
-	p = aufsng_cache_entry_find(&cache->root, name, namelen);
-	if (p) {
+	while (*newp) {
+		int cmp;
+
+		p = rb_entry(*newp, struct aufsng_cache_entry, node);
+		parent = *newp;
+		cmp = aufsng_cache_entry_cmp(name, namelen, p);
+		if (cmp > 0) {
+			newp = &(*newp)->rb_right;
+			continue;
+		}
+		if (cmp < 0) {
+			newp = &(*newp)->rb_left;
+			continue;
+		}
 		if (hidden && !p->hidden && p->idx == idx) {
 			p->hidden = true;
 			cache->nr_visible--;
@@ -234,7 +210,8 @@ static int aufsng_cache_add(struct aufsng_dir_cache *cache, const char *name,
 	if (!hidden)
 		cache->nr_visible++;
 
-	aufsng_cache_entry_insert(&cache->root, p);
+	rb_link_node(&p->node, parent, newp);
+	rb_insert_color(&p->node, &cache->root);
 	list_add_tail(&p->l_node, &cache->entries);
 	return 0;
 }
@@ -360,7 +337,7 @@ static bool aufsng_stamp_match(const struct aufsng_dir_stamp *s,
 
 static void aufsng_cache_put(struct aufsng_dir_cache *cache)
 {
-	if (cache && !--cache->refcount)
+	if (cache && refcount_dec_and_test(&cache->refcount))
 		aufsng_cache_free(cache);
 }
 
@@ -396,7 +373,7 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
 	cache = kzalloc(sizeof(*cache), GFP_KERNEL);
 	if (!cache)
 		return ERR_PTR(-ENOMEM);
-	cache->refcount = 1;
+	refcount_set(&cache->refcount, 1);
 	INIT_LIST_HEAD(&cache->entries);
 	cache->root = RB_ROOT;
 
@@ -417,19 +394,26 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
 	 * concurrent edit lands during the read, the stored stamp stays
 	 * older than the now-current one, so the next reuse check
 	 * rebuilds rather than trust a listing that might have
-	 * half-caught the change.
+	 * half-caught the change.  The stamps feed only udba=reval's
+	 * freshness check (aufsng_dir_cache_fresh); under udba=none
+	 * nothing reads them, so none are taken - a later remount to
+	 * udba=reval then finds nr_stamps == 0, fails the compare and
+	 * rebuilds once, the conservative answer.
 	 */
-	cache->nr_stamps = 1 + (oe ? oe->numlower : 0);
-	cache->stamps = kcalloc(cache->nr_stamps, sizeof(*cache->stamps),
-				GFP_KERNEL);
-	if (!cache->stamps) {
-		err = -ENOMEM;
-		goto out;
+	if (aufsng_udba_reval(pfs)) {
+		cache->nr_stamps = 1 + (oe ? oe->numlower : 0);
+		cache->stamps = kcalloc(cache->nr_stamps,
+					sizeof(*cache->stamps), GFP_KERNEL);
+		if (!cache->stamps) {
+			err = -ENOMEM;
+			goto out;
+		}
+		aufsng_stamp_sample(&cache->stamps[0],
+				 upper ? d_inode(upper) : NULL);
+		for (i = 0; oe && i < oe->numlower; i++)
+			aufsng_stamp_sample(&cache->stamps[1 + i],
+					 d_inode(oe->lowerstack[i].dentry));
 	}
-	aufsng_stamp_sample(&cache->stamps[0], upper ? d_inode(upper) : NULL);
-	for (i = 0; oe && i < oe->numlower; i++)
-		aufsng_stamp_sample(&cache->stamps[1 + i],
-				 d_inode(oe->lowerstack[i].dentry));
 
 	if (upper) {
 		realpath.mnt = aufsng_upper_mnt(pfs);
@@ -538,7 +522,7 @@ static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
 	 * every branch each time.
 	 */
 	if (aufsng_cache_usable(pfs, inode, cache)) {
-		cache->refcount++;
+		refcount_inc(&cache->refcount);
 	} else {
 		mutex_unlock(&oi->lock);
 		cache = aufsng_cache_build(inode, false);
@@ -548,7 +532,7 @@ static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
 		/* attach as the inode's cache, superseding any old one */
 		aufsng_dir_cache_release(oi);
 		oi->cache = cache;
-		cache->refcount++;	/* the inode's reference */
+		refcount_inc(&cache->refcount);	/* the inode's reference */
 	}
 	mutex_unlock(&oi->lock);
 
@@ -575,10 +559,9 @@ static void aufsng_dir_reset(struct file *file)
 	 */
 	mutex_lock(&oi->lock);
 	stale = !aufsng_cache_usable(pfs, inode, od->cache);
-	if (stale)
-		aufsng_cache_put(od->cache);
 	mutex_unlock(&oi->lock);
 	if (stale) {
+		aufsng_cache_put(od->cache);
 		od->cache = NULL;
 		od->cursor = NULL;
 	}
@@ -647,7 +630,7 @@ int aufsng_check_empty_dir(struct dentry *dentry)
 	mutex_lock(&oi->lock);
 	if (aufsng_cache_usable(pfs, inode, oi->cache)) {
 		cache = oi->cache;
-		cache->refcount++;
+		refcount_inc(&cache->refcount);
 	}
 	mutex_unlock(&oi->lock);
 
@@ -661,9 +644,7 @@ int aufsng_check_empty_dir(struct dentry *dentry)
 	}
 
 	err = cache->nr_visible ? -ENOTEMPTY : 0;
-	mutex_lock(&oi->lock);
 	aufsng_cache_put(cache);
-	mutex_unlock(&oi->lock);
 	return err;
 }
 
@@ -819,13 +800,8 @@ static int aufsng_dir_open(struct inode *inode, struct file *file)
 static int aufsng_dir_release(struct inode *inode, struct file *file)
 {
 	struct aufsng_dir_file *od = file->private_data;
-	struct aufsng_inode *oi = AUFSNG_I(inode);
 
-	if (od->cache) {
-		mutex_lock(&oi->lock);
-		aufsng_cache_put(od->cache);
-		mutex_unlock(&oi->lock);
-	}
+	aufsng_cache_put(od->cache);
 	kfree(od);
 	return 0;
 }

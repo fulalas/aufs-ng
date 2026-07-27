@@ -143,6 +143,37 @@ struct dentry *aufsng_create_slot(struct dentry *upperdir,
 }
 
 /*
+ * Remove one upper entry by name, sweeping a directory's own
+ * bookkeeping markers first: a leftover directory may already carry
+ * them - a failed mkdir-over-lower dies AFTER its ".wh..wh..opq"
+ * marker was created - and vfs_rmdir() on a physically non-empty dir
+ * is ENOTEMPTY.  Error policy (log level, message) stays with the
+ * callers.
+ */
+static int aufsng_do_remove_object(struct aufsng_fs *pfs,
+				struct dentry *upperdir,
+				const struct qstr *name, bool is_dir)
+{
+	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	struct qstr q = QSTR_LEN(name->name, name->len);
+	struct dentry *slot;
+	int err;
+
+	slot = start_removing_noperm(upperdir, &q);
+	if (IS_ERR(slot))
+		return PTR_ERR(slot);
+	if (is_dir) {
+		err = aufsng_clear_whiteouts(pfs, slot);
+		if (!err)
+			err = vfs_rmdir(idmap, d_inode(upperdir), slot, NULL);
+	} else {
+		err = vfs_unlink(idmap, d_inode(upperdir), slot, NULL);
+	}
+	end_dirop(slot);
+	return err;
+}
+
+/*
  * Best-effort removal of an upper object that a failed or superseded
  * multi-step operation left behind (a partially created object, a
  * copy-up temp, a parked whiteout).  Left in place it would leak:
@@ -154,34 +185,8 @@ struct dentry *aufsng_create_slot(struct dentry *upperdir,
 void aufsng_remove_object(struct aufsng_fs *pfs, struct dentry *upperdir,
 		       const struct qstr *name, bool is_dir)
 {
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
-	struct qstr q = QSTR_LEN(name->name, name->len);
-	struct dentry *slot;
-	int err;
+	int err = aufsng_do_remove_object(pfs, upperdir, name, is_dir);
 
-	slot = start_removing_noperm(upperdir, &q);
-	err = PTR_ERR_OR_ZERO(slot);
-	if (!err) {
-		if (is_dir) {
-			/*
-			 * A leftover directory may already carry its own
-			 * bookkeeping - a failed mkdir-over-lower dies
-			 * AFTER its ".wh..wh..opq" marker was created -
-			 * and vfs_rmdir() on a physically non-empty dir
-			 * is ENOTEMPTY, which would leak the leftover
-			 * behind the restored whiteout as a permanent
-			 * EEXIST.  Sweep the markers first, exactly as
-			 * the rmdir path does.
-			 */
-			err = aufsng_clear_whiteouts(pfs, slot);
-			if (!err)
-				err = vfs_rmdir(idmap, d_inode(upperdir), slot,
-						NULL);
-		} else {
-			err = vfs_unlink(idmap, d_inode(upperdir), slot, NULL);
-		}
-		end_dirop(slot);
-	}
 	if (err)
 		pr_err("aufs (aufs-ng): failed to remove leftover '%.*s' (%d)\n",
 		       name->len, name->name, err);
@@ -220,6 +225,18 @@ static int aufsng_branch_rename(struct aufsng_fs *pfs,
 static atomic_t aufsng_whtmp_seq = ATOMIC_INIT(0);
 
 /*
+ * Mint a fresh hidden ".wh..wh.tmp.<seq>" name into @buf (NAME_MAX + 1
+ * bytes).  The single definition of the parked-entry temp-name format,
+ * inside AUFS's own ".wh..wh." bookkeeping namespace so readdir and
+ * lookup never show it and clear_whiteouts sweeps a leftover.
+ */
+static void aufsng_whtmp_name(char *buf, struct qstr *tmp)
+{
+	*tmp = QSTR_LEN(buf, snprintf(buf, NAME_MAX + 1, ".wh..wh.tmp.%u",
+				      atomic_inc_return(&aufsng_whtmp_seq)));
+}
+
+/*
  * Move an existing ".wh.<name>" whiteout aside to a hidden temp name
  * (".wh..wh.tmp.<seq>", inside AUFS's own ".wh..wh." bookkeeping
  * namespace, so it is invisible to lookup and readdir) instead of
@@ -250,8 +267,7 @@ static int aufsng_park_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
 	err = aufsng_wh_name(whbuf, name, &wh);
 	if (err)
 		return err;
-	*tmp = QSTR_LEN(tmpbuf, snprintf(tmpbuf, NAME_MAX + 1, ".wh..wh.tmp.%u",
-					 atomic_inc_return(&aufsng_whtmp_seq)));
+	aufsng_whtmp_name(tmpbuf, tmp);
 
 	err = aufsng_branch_rename(pfs, upperdir, &wh, upperdir, tmp);
 	return err ? err : 1;
@@ -667,9 +683,7 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 		 * branch); it fails with ENOENT when the upper entry
 		 * vanished out-of-band, exactly as the removal always has.
 		 */
-		tmp = QSTR_LEN(tmpbuf, snprintf(tmpbuf, sizeof(tmpbuf),
-						".wh..wh.tmp.%u",
-						atomic_inc_return(&aufsng_whtmp_seq)));
+		aufsng_whtmp_name(tmpbuf, &tmp);
 		err = aufsng_branch_rename(pfs, pupper, &dentry->d_name,
 					pupper, &tmp);
 		if (!err) {
@@ -682,18 +696,7 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 			 * clear_whiteouts sweep of the parent removes an
 			 * EMPTY leftover; a non-empty one needs the admin).
 			 */
-			werr = aufsng_clear_whiteouts(pfs, upper);
-			if (!werr) {
-				struct dentry *slot =
-					start_removing_noperm(pupper, &tmp);
-
-				werr = PTR_ERR_OR_ZERO(slot);
-				if (!werr) {
-					werr = vfs_rmdir(idmap, d_inode(pupper),
-							 slot, NULL);
-					end_dirop(slot);
-				}
-			}
+			werr = aufsng_do_remove_object(pfs, pupper, &tmp, true);
 			if (werr)
 				pr_warn("aufs (aufs-ng): rmdir left parked dir '%s' in the rw branch (%d)\n",
 					tmpbuf, werr);
@@ -781,6 +784,31 @@ int aufsng_unlink(struct inode *dir, struct dentry *dentry)
 int aufsng_rmdir(struct inode *dir, struct dentry *dentry)
 {
 	return aufsng_do_remove(dentry, true);
+}
+
+/*
+ * Compensate a committed upper rename whose follow-up marker failed:
+ * drop the whiteout just created for the old name (@drop_whiteout),
+ * then rename the entry back - both metadata-only, so they work on the
+ * full branch that typically brought the caller here.  Returns 0 only
+ * when the rename was fully undone; otherwise it stands and the caller
+ * reports success with a warning (the VFS would never retry the marker
+ * on its own).
+ */
+static int aufsng_rename_undo(struct aufsng_fs *pfs, struct inode *olddir,
+			   struct dentry *old, struct dentry *newupperdir,
+			   struct dentry *new, bool drop_whiteout)
+{
+	int err = 0;
+
+	if (drop_whiteout)
+		err = aufsng_remove_whiteout(pfs, aufsng_upperdentry(olddir),
+					  &old->d_name);
+	if (!err)
+		err = aufsng_branch_rename(pfs, newupperdir, &new->d_name,
+					aufsng_upperdentry(olddir),
+					&old->d_name);
+	return err;
 }
 
 int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
@@ -959,9 +987,8 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 		 * is warned about.
 		 */
 		if (wherr && !had_victim &&
-		    !aufsng_branch_rename(pfs, newupperdir, &new->d_name,
-				       aufsng_upperdentry(olddir),
-				       &old->d_name)) {
+		    !aufsng_rename_undo(pfs, olddir, old, newupperdir, new,
+				     false)) {
 			err = wherr;
 			goto out_unpark;
 		}
@@ -986,22 +1013,11 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 		int opqerr = aufsng_mark_diropq(pfs,
 					aufsng_upperdentry(d_inode(old)));
 
-		if (opqerr && !had_victim) {
-			int backerr = 0;
-
-			if (covered)
-				backerr = aufsng_remove_whiteout(pfs,
-						aufsng_upperdentry(olddir),
-						&old->d_name);
-			if (!backerr)
-				backerr = aufsng_branch_rename(pfs,
-						newupperdir, &new->d_name,
-						aufsng_upperdentry(olddir),
-						&old->d_name);
-			if (!backerr) {
-				err = opqerr;
-				goto out_unpark;
-			}
+		if (opqerr && !had_victim &&
+		    !aufsng_rename_undo(pfs, olddir, old, newupperdir, new,
+				     covered)) {
+			err = opqerr;
+			goto out_unpark;
 		}
 		if (opqerr)
 			pr_err("aufs (aufs-ng): failed to mark renamed dir '%.*s' opaque (%d), deleted lower content may show through\n",

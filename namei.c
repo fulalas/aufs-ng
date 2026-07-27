@@ -32,14 +32,13 @@ static int aufsng_probe_marker(struct vfsmount *mnt, struct dentry *dir,
 			    struct qstr *name, bool strict)
 {
 	struct dentry *whd;
-	int ret = 0;
+	int ret;
 
-	whd = lookup_one_unlocked(mnt_idmap(mnt), name, dir);
+	whd = lookup_one_positive_unlocked(mnt_idmap(mnt), name, dir);
 	if (IS_ERR(whd))
-		return PTR_ERR(whd);
+		return PTR_ERR(whd) == -ENOENT ? 0 : PTR_ERR(whd);
 
-	if (d_is_positive(whd))
-		ret = d_is_reg(whd) ? 1 : (strict ? -EIO : 0);
+	ret = d_is_reg(whd) ? 1 : (strict ? -EIO : 0);
 	dput(whd);
 	return ret;
 }
@@ -103,13 +102,9 @@ struct dentry *aufsng_lookup_once(struct vfsmount *mnt,
 		return NULL;
 	}
 
-	this = lookup_one_unlocked(mnt_idmap(mnt), &q, base);
-	if (IS_ERR(this))
-		return this;
-	if (d_is_negative(this)) {
-		dput(this);
+	this = lookup_one_positive_unlocked(mnt_idmap(mnt), &q, base);
+	if (IS_ERR(this) && PTR_ERR(this) == -ENOENT)
 		return NULL;
-	}
 	return this;
 }
 
@@ -251,7 +246,8 @@ out:
 	return valid;
 }
 
-static int aufsng_inode_test(struct inode *inode, void *data)
+/* the iget5/ilookup5 hash-match rule; shared with dynlayer.c's rekey check */
+int aufsng_inode_test(struct inode *inode, void *data)
 {
 	return inode->i_private == data;
 }
@@ -307,10 +303,7 @@ struct inode *aufsng_get_inode(struct super_block *sb,
 
 	realinode = upperdentry ? d_inode(upperdentry) :
 				  d_inode(oe->lowerstack[0].dentry);
-	key = oe->numlower ? d_inode(oe->lowerstack[0].dentry) :
-			     d_inode(upperdentry);
-	key_idx = oe->numlower ?
-		  aufsng_layer_idx(pfs, oe->lowerstack[0].layer) : 0;
+	key = aufsng_hash_key(pfs, oe, upperdentry, &key_idx);
 
 	inode = iget5_locked(sb, (unsigned long)key, aufsng_inode_test,
 			     aufsng_inode_set, key);
@@ -352,7 +345,7 @@ struct inode *aufsng_get_inode(struct super_block *sb,
 		 * for lockless aufsng_path_real() readers.
 		 */
 		if (!ok && !new_u && oe->numlower) {
-			if (!d_unhashed(cached) && !d_is_negative(cached))
+			if (aufsng_dentry_alive(cached))
 				ok = true;
 			else
 				ok = aufsng_dyn_shed_upper(inode);

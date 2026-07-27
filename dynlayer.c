@@ -80,6 +80,35 @@ static struct aufsng_entry *aufsng_dyn_swap_root(struct super_block *sb,
 static void aufsng_dyn_drop_neg_children(struct inode *inode);
 
 /*
+ * Park the inode's current upper on the dyn_parked list - a lockless
+ * aufsng_path_real() reader may still hold a pointer to it until the
+ * inode is evicted - and publish @new_upper (NULL sheds the upper so
+ * the top lower resurfaces), refreshing the mirrored attributes and
+ * the merged-readdir version to follow the new top real object.  A
+ * pin-only node (no mounts): a bare upper points into branch 0, which
+ * outlives every inode.  Returns false on allocation failure, with
+ * nothing changed.  Caller holds oi->lock.
+ */
+static bool aufsng_dyn_park_upper(struct aufsng_inode *oi, struct inode *inode,
+			       struct dentry *new_upper)
+{
+	struct aufsng_dyn_parked *pk;
+
+	pk = kmalloc(struct_size(pk, mnts, 0), GFP_KERNEL);
+	if (!pk)
+		return false;
+	pk->oe = NULL;
+	pk->nr_mnts = 0;
+	pk->upper = oi->upperdentry;
+	WRITE_ONCE(oi->upperdentry, new_upper ? dget(new_upper) : NULL);
+	aufsng_copyattr(inode);
+	atomic64_inc(&oi->version);
+	pk->next = oi->dyn_parked;
+	oi->dyn_parked = pk;
+	return true;
+}
+
+/*
  * With dynamic branches, an object may be looked up again while an
  * older union inode for it is still cached and pinned: branch changes
  * reorder priorities, so the top lower (the inode hash key) of a
@@ -137,22 +166,9 @@ bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 		ok = true;
 	} else if (d_inode(oi->upperdentry) == d_inode(upperdentry)) {
 		ok = true;
-	} else {
-		struct aufsng_dyn_parked *pk =
-			kmalloc(struct_size(pk, mnts, 0), GFP_KERNEL);
-
-		if (pk) {
-			pk->oe = NULL;
-			pk->nr_mnts = 0;
-			pk->upper = oi->upperdentry;
-			WRITE_ONCE(oi->upperdentry, dget(upperdentry));
-			aufsng_copyattr(inode);
-			atomic64_inc(&oi->version);
-			pk->next = oi->dyn_parked;
-			oi->dyn_parked = pk;
-			ok = true;
-			replaced = true;
-		}
+	} else if (aufsng_dyn_park_upper(oi, inode, upperdentry)) {
+		ok = true;
+		replaced = true;
 	}
 out:
 	mutex_unlock(&oi->lock);
@@ -179,7 +195,6 @@ bool aufsng_dyn_shed_upper(struct inode *inode)
 {
 	struct aufsng_inode *oi = AUFSNG_I(inode);
 	struct aufsng_entry *oe;
-	struct aufsng_dyn_parked *pk;
 	bool shed = false;
 	bool ok = false;
 
@@ -191,23 +206,13 @@ bool aufsng_dyn_shed_upper(struct inode *inode)
 	oe = oi->oe;
 	if (!oe || !oe->numlower)
 		goto out;	/* nothing to resurface: keep the upper */
-	if (!d_unhashed(oi->upperdentry) && !d_is_negative(oi->upperdentry)) {
+	if (aufsng_dentry_alive(oi->upperdentry)) {
 		ok = true;	/* alive after all: cached state wins */
 		goto out;
 	}
 
-	pk = kmalloc(struct_size(pk, mnts, 0), GFP_KERNEL);
-	if (!pk)
+	if (!aufsng_dyn_park_upper(oi, inode, NULL))
 		goto out;
-	pk->oe = NULL;
-	pk->nr_mnts = 0;
-	pk->upper = oi->upperdentry;
-	WRITE_ONCE(oi->upperdentry, NULL);
-	/* the top lower is the authoritative real object again */
-	aufsng_copyattr(inode);
-	atomic64_inc(&oi->version);
-	pk->next = oi->dyn_parked;
-	oi->dyn_parked = pk;
 	ok = true;
 	shed = true;
 out:
@@ -238,12 +243,10 @@ out:
 static void aufsng_dyn_rekey_inode(struct aufsng_fs *pfs, struct inode *inode,
 				struct aufsng_entry *oe)
 {
-	struct inode *key = oe->numlower ?
-			    d_inode(oe->lowerstack[0].dentry) :
-			    d_inode(aufsng_upperdentry(inode));
-	unsigned int key_idx = oe->numlower ?
-			       aufsng_layer_idx(pfs, oe->lowerstack[0].layer) :
-			       0;
+	unsigned int key_idx;
+	struct inode *key = aufsng_hash_key(pfs, oe,
+					    aufsng_upperdentry(inode),
+					    &key_idx);
 
 	if (inode->i_private == key)
 		return;
@@ -293,6 +296,28 @@ static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode
 #define AUFSNG_MEMO_BITS 9
 
 /*
+ * Make room for one more entry in an inode-pointer array, doubling its
+ * capacity.  GFP_ATOMIC: every caller grows it mid-walk under
+ * s_inode_list_lock + i_lock.
+ */
+static int aufsng_dyn_grow(struct inode ***arr, unsigned int *cap,
+			unsigned int nr)
+{
+	unsigned int ncap;
+	struct inode **d;
+
+	if (nr < *cap)
+		return 0;
+	ncap = max(16U, *cap * 2);
+	d = krealloc_array(*arr, ncap, sizeof(*d), GFP_ATOMIC);
+	if (!d)
+		return -ENOMEM;
+	*arr = d;
+	*cap = ncap;
+	return 0;
+}
+
+/*
  * Per-splice-pass memo of "union directory dentry -> its counterpart
  * in the branch being added (NULL = path blocked/absent)".  Cached
  * directories share their ancestor chains, so memoizing each ancestor
@@ -315,8 +340,23 @@ struct aufsng_memo_ent {
 	bool blocked;
 };
 
+/*
+ * The upper diropq verdict is per PARENT, not per child: without its
+ * own memo, k sibling directories under one memo-missed parent would
+ * each probe the same upper directory's ".wh..wh..opq" once, inside
+ * the whole-filesystem stall dyn_lock(write) imposes.
+ */
+struct aufsng_opq_ent {
+	struct hlist_node node;
+	struct dentry *pupper;	/* key; ref held for the memo's lifetime */
+	bool opq;
+};
+
+#define AUFSNG_OPQ_MEMO_BITS 6
+
 struct aufsng_splice_memo {
 	DECLARE_HASHTABLE(tbl, AUFSNG_MEMO_BITS);
+	DECLARE_HASHTABLE(opq_tbl, AUFSNG_OPQ_MEMO_BITS);
 };
 
 static struct aufsng_memo_ent *aufsng_memo_find(struct aufsng_splice_memo *memo,
@@ -346,9 +386,35 @@ static void aufsng_memo_store(struct aufsng_splice_memo *memo,
 	hash_add(memo->tbl, &e->node, (unsigned long)d);
 }
 
+/* memoized "is this upper directory opaque?"; probes on the first miss */
+static int aufsng_memo_diropq(struct aufsng_fs *pfs,
+			   struct aufsng_splice_memo *memo,
+			   struct dentry *pupper)
+{
+	struct aufsng_opq_ent *e;
+	int opq;
+
+	hash_for_each_possible(memo->opq_tbl, e, node, (unsigned long)pupper) {
+		if (e->pupper == pupper)
+			return e->opq;
+	}
+	opq = aufsng_check_diropq(aufsng_upper_mnt(pfs), pupper);
+	if (opq < 0)
+		return opq;	/* transient: let the next child re-probe */
+	/* best effort: an allocation failure just skips the memoization */
+	e = kmalloc(sizeof(*e), GFP_KERNEL);
+	if (e) {
+		e->pupper = dget(pupper);
+		e->opq = opq;
+		hash_add(memo->opq_tbl, &e->node, (unsigned long)pupper);
+	}
+	return opq;
+}
+
 static void aufsng_memo_free(struct aufsng_splice_memo *memo)
 {
 	struct aufsng_memo_ent *e;
+	struct aufsng_opq_ent *oq;
 	struct hlist_node *tmp;
 	unsigned int i;
 
@@ -357,6 +423,11 @@ static void aufsng_memo_free(struct aufsng_splice_memo *memo)
 		dput(e->uniond);
 		dput(e->branchd);
 		kfree(e);
+	}
+	hash_for_each_safe(memo->opq_tbl, i, tmp, oq, node) {
+		hash_del(&oq->node);
+		dput(oq->pupper);
+		kfree(oq);
 	}
 }
 
@@ -380,7 +451,9 @@ static struct dentry *aufsng_dyn_resolve_step(struct aufsng_fs *pfs,
 					   struct vfsmount *mnt,
 					   struct inode *punion,
 					   struct dentry *pbase,
-					   struct dentry *d, bool *blocked)
+					   struct dentry *d,
+					   struct aufsng_splice_memo *memo,
+					   bool *blocked)
 {
 	struct dentry *pupper = aufsng_upperdentry(punion);
 	struct dentry *child = NULL;
@@ -397,8 +470,7 @@ static struct dentry *aufsng_dyn_resolve_step(struct aufsng_fs *pfs,
 	 * module content that a fresh lookup of the same path would
 	 * never merge, which then silently vanishes on dcache eviction.
 	 */
-	if (pupper &&
-	    aufsng_check_diropq(aufsng_upper_mnt(pfs), pupper))
+	if (pupper && aufsng_memo_diropq(pfs, memo, pupper))
 		return NULL;
 
 	/*
@@ -432,11 +504,8 @@ static struct dentry *aufsng_dyn_resolve_step(struct aufsng_fs *pfs,
 		goto out;
 	}
 
-	child = lookup_one_unlocked(mnt_idmap(mnt), &ns.name, pbase);
+	child = lookup_one_positive_unlocked(mnt_idmap(mnt), &ns.name, pbase);
 	if (IS_ERR(child)) {
-		child = NULL;
-	} else if (d_is_negative(child)) {
-		dput(child);
 		child = NULL;
 	} else if (!d_is_dir(child)) {
 		/*
@@ -471,14 +540,12 @@ static struct dentry *aufsng_dyn_resolve_lower(struct aufsng_fs *pfs,
 					    bool *blocked)
 {
 	struct dentry *stack[AUFSNG_RESOLVE_MAXDEPTH];
-	struct dentry *da, *cur, *par, *base;
+	struct dentry *cur, *par, *base;
 	unsigned int n = 0, i;
 
-	da = d_find_alias(inode);
-	if (!da)
+	cur = d_find_alias(inode);
+	if (!cur)
 		return NULL;
-	cur = dget(da);
-	dput(da);
 	while (cur != sb->s_root && !IS_ROOT(cur)) {
 		if (n >= AUFSNG_RESOLVE_MAXDEPTH) {
 			dput(cur);
@@ -505,7 +572,8 @@ static struct dentry *aufsng_dyn_resolve_lower(struct aufsng_fs *pfs,
 			blk = hit->blocked;
 		} else {
 			child = aufsng_dyn_resolve_step(pfs, mnt, d_inode(pu),
-						     base, stack[i], &blk);
+						     base, stack[i], memo,
+						     &blk);
 			aufsng_memo_store(memo, stack[i], child, blk);
 		}
 		dput(base);
@@ -619,17 +687,9 @@ static void aufsng_dyn_splice_cached(struct aufsng_fs *pfs, struct super_block *
 			spin_unlock(&inode->i_lock);
 			continue;
 		}
-		if (ndirs == cap) {
-			unsigned int ncap = max(16U, cap * 2);
-			struct inode **d;
-
-			d = krealloc_array(dirs, ncap, sizeof(*d), GFP_ATOMIC);
-			if (!d) {
-				spin_unlock(&inode->i_lock);
-				break;	/* best effort: skip the remainder */
-			}
-			dirs = d;
-			cap = ncap;
+		if (aufsng_dyn_grow(&dirs, &cap, ndirs)) {
+			spin_unlock(&inode->i_lock);
+			break;	/* best effort: skip the remainder */
 		}
 		atomic_inc(&inode->i_count);
 		dirs[ndirs++] = inode;
@@ -643,6 +703,7 @@ static void aufsng_dyn_splice_cached(struct aufsng_fs *pfs, struct super_block *
 	if (!memo)
 		goto out_iput;	/* best effort, same as a failed dirs[] grow */
 	hash_init(memo->tbl);
+	hash_init(memo->opq_tbl);
 
 	for (i = 0; i < ndirs; i++) {
 		struct aufsng_entry *cur, *neu;
@@ -874,7 +935,7 @@ static bool aufsng_dyn_has_survivor(struct inode *inode,
 	struct dentry *upper = aufsng_upperdentry(inode);
 	unsigned int i;
 
-	if (upper && !d_unhashed(upper) && !d_is_negative(upper))
+	if (upper && aufsng_dentry_alive(upper))
 		return true;
 	for (i = 0; oe && i < oe->numlower; i++)
 		if (oe->lowerstack[i].layer != layer)
@@ -948,7 +1009,7 @@ static struct aufsng_entry *aufsng_dyn_prep_repoint(struct aufsng_fs *pfs,
 
 	*pin_only = false;
 	upper = aufsng_upperdentry(inode);
-	upper_alive = upper && !d_unhashed(upper) && !d_is_negative(upper);
+	upper_alive = upper && aufsng_dentry_alive(upper);
 
 	alias = d_find_alias(inode);
 	if (alias) {
@@ -1020,17 +1081,15 @@ static void aufsng_dyn_pin_stack(struct aufsng_inode *oi,
  */
 static int aufsng_dyn_scan_branch(struct super_block *sb,
 			       const struct aufsng_layer *layer,
-			       struct aufsng_dyn_scan *scan,
-			       bool force_shrink, bool *dcache_fresh)
+			       struct aufsng_dyn_scan *scan, bool shrink)
 {
 	struct inode *inode, **dispose = NULL;
 	unsigned int i, nd = 0, dcap = 0;
 	int err = 0;
 
-	if (force_shrink || !*dcache_fresh) {
+	if (shrink) {
 		shrink_dcache_sb(sb);
 		evict_inodes(sb);
-		*dcache_fresh = true;
 	}
 
 	/* a fresh pass (retry loop): drop the previous one's collection */
@@ -1058,19 +1117,11 @@ static int aufsng_dyn_scan_branch(struct super_block *sb,
 				spin_unlock(&inode->i_lock);
 				continue;
 			}
-			if (scan->nr == scan->cap) {
-				unsigned int cap = max(16U, scan->cap * 2);
-				struct inode **d;
-
-				d = krealloc_array(scan->pinned, cap,
-						   sizeof(*d), GFP_ATOMIC);
-				if (!d) {
-					spin_unlock(&inode->i_lock);
-					err = -ENOMEM;
-					break;
-				}
-				scan->pinned = d;
-				scan->cap = cap;
+			err = aufsng_dyn_grow(&scan->pinned, &scan->cap,
+					   scan->nr);
+			if (err) {
+				spin_unlock(&inode->i_lock);
+				break;
 			}
 			atomic_inc(&inode->i_count);
 			scan->pinned[scan->nr++] = inode;
@@ -1087,19 +1138,10 @@ static int aufsng_dyn_scan_branch(struct super_block *sb,
 		 * for writing.  A single forward pass never revisits an
 		 * inode, so nothing is double-counted.
 		 */
-		if (nd == dcap) {
-			unsigned int cap = max(16U, dcap * 2);
-			struct inode **d;
-
-			d = krealloc_array(dispose, cap, sizeof(*d),
-					   GFP_ATOMIC);
-			if (!d) {
-				spin_unlock(&inode->i_lock);
-				err = -ENOMEM;
-				break;
-			}
-			dispose = d;
-			dcap = cap;
+		err = aufsng_dyn_grow(&dispose, &dcap, nd);
+		if (err) {
+			spin_unlock(&inode->i_lock);
+			break;
 		}
 		inode_state_set(inode, I_DONTCACHE);
 		atomic_inc(&inode->i_count);
@@ -1357,11 +1399,6 @@ void aufsng_dyn_free_parked(struct aufsng_inode *oi)
 	oi->dyn_parked = NULL;
 }
 
-static int aufsng_dyn_inode_test(struct inode *inode, void *data)
-{
-	return inode->i_private == data;
-}
-
 /*
  * A rekey re-hashes @inode under the key its rebuilt stack computes,
  * and __insert_inode_hash() performs no duplicate check - a second
@@ -1381,33 +1418,27 @@ static int aufsng_dyn_check_rekey(struct super_block *sb,
 			       struct aufsng_entry **new_oes, unsigned int i,
 			       const char *brname)
 {
+	struct aufsng_fs *pfs = AUFSNG_FS(sb);
 	struct inode *inode = scan->pinned[i];
 	struct inode *key, *dup = NULL;
-	struct dentry *upper;
 	unsigned int k;
 
-	upper = aufsng_upperdentry(inode);
-	key = new_oes[i]->numlower ?
-	      d_inode(new_oes[i]->lowerstack[0].dentry) :
-	      (upper ? d_inode(upper) : NULL);
+	key = aufsng_hash_key(pfs, new_oes[i], aufsng_upperdentry(inode),
+			      NULL);
 	if (!key || key == inode->i_private)
 		return 0;
 
-	dup = ilookup5(sb, (unsigned long)key, aufsng_dyn_inode_test, key);
+	dup = ilookup5(sb, (unsigned long)key, aufsng_inode_test, key);
 	if (dup) {
 		iput(dup);
 		goto busy;
 	}
 	for (k = 0; k < i; k++) {
-		struct inode *kkey;
-
 		if (!new_oes[k])
 			continue;
-		upper = aufsng_upperdentry(scan->pinned[k]);
-		kkey = new_oes[k]->numlower ?
-		       d_inode(new_oes[k]->lowerstack[0].dentry) :
-		       (upper ? d_inode(upper) : NULL);
-		if (kkey == key)
+		if (aufsng_hash_key(pfs, new_oes[k],
+				    aufsng_upperdentry(scan->pinned[k]),
+				    NULL) == key)
 			goto busy;
 	}
 	return 0;
@@ -1439,8 +1470,7 @@ static void aufsng_dyn_release_branch(struct aufsng_fs *pfs, struct aufsng_layer
 	layer->mnt = NULL;
 }
 
-int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
-		       bool *dcache_fresh)
+int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(sb);
 	struct inode *root_inode = aufsng_root_inode(sb);
@@ -1482,8 +1512,12 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
 		inode_lock(root_inode);
 		down_write(&pfs->dyn_lock);
 
-		err = aufsng_dyn_scan_branch(sb, layer, &scan, tries > 0,
-					  dcache_fresh);
+		/*
+		 * The batch-wide shrink already ran in
+		 * aufsng_dyn_reconfigure(); a retry re-shrinks so the
+		 * scan observes the references its copy-ups released.
+		 */
+		err = aufsng_dyn_scan_branch(sb, layer, &scan, tries > 0);
 		if (err)
 			goto out_unlock;
 
@@ -1701,7 +1735,6 @@ int aufsng_dyn_reconfigure(struct fs_context *fc)
 {
 	struct super_block *sb = fc->root->d_sb;
 	struct aufsng_fs_context *ctx = fc->fs_private;
-	bool dcache_fresh = false;
 	size_t i;
 	int err = 0;
 
@@ -1727,13 +1760,19 @@ int aufsng_dyn_reconfigure(struct fs_context *fc)
 	}
 
 	/*
-	 * dcache_fresh is shared across the whole batch of removals
-	 * below: removing one branch doesn't change another branch's
-	 * reference counts, so only the first removal's first attempt
-	 * needs to shrink/evict the cache.
+	 * One shrink of cache-only dentries/inodes serves the whole
+	 * batch of removals: removing one branch doesn't change another
+	 * branch's reference counts.  It needs none of the removal locks
+	 * - it only reduces the cache, the authoritative busy
+	 * classification runs under them in aufsng_dyn_scan_branch() -
+	 * and each removal re-shrinks on its own retries.
 	 */
+	if (!err && ctx->nr_dyn_del) {
+		shrink_dcache_sb(sb);
+		evict_inodes(sb);
+	}
 	for (i = 0; !err && i < ctx->nr_dyn_del; i++)
-		err = aufsng_dyn_del_branch(sb, &ctx->dyn_del[i], &dcache_fresh);
+		err = aufsng_dyn_del_branch(sb, &ctx->dyn_del[i]);
 
 	return err;
 }

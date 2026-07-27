@@ -220,19 +220,39 @@ static inline unsigned int aufsng_layer_idx(const struct aufsng_fs *pfs,
 	return layer - pfs->layers;
 }
 
-static inline struct inode *aufsng_inode_real(struct inode *inode)
+/*
+ * Is a pinned real dentry still a live entry in its branch?  Unhashed
+ * or turned negative means an out-of-band unlink/rename removed it -
+ * the udba=reval staleness signal, and the survivor test for branch
+ * removal.  One definition so the liveness rule cannot drift between
+ * revalidation, shed-upper and the removal scan.
+ */
+static inline bool aufsng_dentry_alive(const struct dentry *dentry)
 {
-	struct dentry *upper = aufsng_upperdentry(inode);
+	return !d_unhashed(dentry) && !d_is_negative(dentry);
+}
 
-	if (!upper) {
-		struct aufsng_entry *oe = AUFSNG_I_E(inode);
-
-		if (oe && oe->numlower)
-			return d_inode(oe->lowerstack[0].dentry);
-		/* see aufsng_path_real(): a removal raced us, the upper is there */
-		smp_rmb();
-		upper = aufsng_upperdentry(inode);
+/*
+ * The single definition of what keys a union inode in the inode hash:
+ * the top lower inode when a lower exists (stable across copy-up),
+ * else the upper's.  @key_idx (optional) is the providing branch's
+ * slot, folded into i_ino by aufsng_map_ino().  Fresh lookup
+ * (aufsng_get_inode), branch-removal rekey and its duplicate check all
+ * derive the key here - hardlink-aliasing correctness depends on them
+ * never disagreeing.
+ */
+static inline struct inode *aufsng_hash_key(const struct aufsng_fs *pfs,
+					    const struct aufsng_entry *oe,
+					    struct dentry *upper,
+					    unsigned int *key_idx)
+{
+	if (oe->numlower) {
+		if (key_idx)
+			*key_idx = aufsng_layer_idx(pfs, oe->lowerstack[0].layer);
+		return d_inode(oe->lowerstack[0].dentry);
 	}
+	if (key_idx)
+		*key_idx = 0;
 	return upper ? d_inode(upper) : NULL;
 }
 
@@ -269,6 +289,19 @@ static inline void aufsng_path_real(struct inode *inode, struct path *path)
 	}
 	path->mnt = aufsng_upper_mnt(AUFSNG_FS(inode->i_sb));
 	path->dentry = upper;
+}
+
+/*
+ * aufsng_path_real() owns the lockless upper/stack read protocol (the
+ * torn-snapshot re-read behind smp_rmb); a second open-coding here
+ * would silently miss any future change to it.
+ */
+static inline struct inode *aufsng_inode_real(struct inode *inode)
+{
+	struct path path;
+
+	aufsng_path_real(inode, &path);
+	return path.dentry ? d_inode(path.dentry) : NULL;
 }
 
 /*
@@ -457,6 +490,7 @@ int aufsng_check_empty_dir(struct dentry *dentry);
 int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir);
 
 /* namei.c */
+int aufsng_inode_test(struct inode *inode, void *data);
 struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 			  unsigned int flags);
 struct dentry *aufsng_lookup_once(struct vfsmount *mnt, struct dentry *base,
@@ -524,8 +558,7 @@ unsigned long aufsng_reval_stamp(struct aufsng_fs *pfs, struct inode *dir);
 /* dynlayer.c */
 int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 		       const struct path *path, const char *permstr);
-int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path,
-		       bool *dcache_fresh);
+int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path);
 bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 			 struct dentry *upperdentry);
 bool aufsng_dyn_shed_upper(struct inode *inode);
