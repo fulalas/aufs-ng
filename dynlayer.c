@@ -80,6 +80,37 @@ static struct aufsng_entry *aufsng_dyn_swap_root(struct super_block *sb,
 static void aufsng_dyn_drop_neg_children(struct inode *inode);
 
 /*
+ * Fill @pk and link it onto @oi's parked list: @oe is the superseded
+ * stack the node OWNS (freed at eviction; NULL for a pin-only node),
+ * @upper the superseded upper it owns, and @mnt_src the stack whose
+ * branch mounts it must PIN - every mount a parked stack's dentries
+ * point into has to outlive the branch's kern_unmount(), or the branch
+ * is torn down under them ("Dentry still in use" on umount).
+ *
+ * Owned stack and pinned stack are separate parameters on purpose: a
+ * pin-only node leaves the inode's LIVE stack in place and only pins its
+ * mounts, so passing that stack as @oe would have eviction dput and free
+ * a stack still in use.  @pk must have room for @mnt_src's lowers.
+ * Caller holds oi->lock.
+ */
+static void aufsng_dyn_park_fill(struct aufsng_inode *oi,
+			      struct aufsng_dyn_parked *pk,
+			      struct aufsng_entry *oe,
+			      struct dentry *upper,
+			      struct aufsng_entry *mnt_src)
+{
+	unsigned int i;
+
+	pk->oe = oe;
+	pk->upper = upper;
+	pk->nr_mnts = mnt_src ? mnt_src->numlower : 0;
+	for (i = 0; i < pk->nr_mnts; i++)
+		pk->mnts[i] = mntget(mnt_src->lowerstack[i].mnt);
+	pk->next = oi->dyn_parked;
+	oi->dyn_parked = pk;
+}
+
+/*
  * Park the inode's current upper on the dyn_parked list - a lockless
  * aufsng_path_real() reader may still hold a pointer to it until the
  * inode is evicted - and publish @new_upper (NULL sheds the upper so
@@ -97,14 +128,10 @@ static bool aufsng_dyn_park_upper(struct aufsng_inode *oi, struct inode *inode,
 	pk = kmalloc(struct_size(pk, mnts, 0), GFP_KERNEL);
 	if (!pk)
 		return false;
-	pk->oe = NULL;
-	pk->nr_mnts = 0;
-	pk->upper = oi->upperdentry;
+	aufsng_dyn_park_fill(oi, pk, NULL, oi->upperdentry, NULL);
 	WRITE_ONCE(oi->upperdentry, new_upper ? dget(new_upper) : NULL);
 	aufsng_copyattr(inode);
 	atomic64_inc(&oi->version);
-	pk->next = oi->dyn_parked;
-	oi->dyn_parked = pk;
 	return true;
 }
 
@@ -294,28 +321,6 @@ static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode
 
 #define AUFSNG_RESOLVE_MAXDEPTH 64
 #define AUFSNG_MEMO_BITS 9
-
-/*
- * Make room for one more entry in an inode-pointer array, doubling its
- * capacity.  GFP_ATOMIC: every caller grows it mid-walk under
- * s_inode_list_lock + i_lock.
- */
-static int aufsng_dyn_grow(struct inode ***arr, unsigned int *cap,
-			unsigned int nr)
-{
-	unsigned int ncap;
-	struct inode **d;
-
-	if (nr < *cap)
-		return 0;
-	ncap = max(16U, *cap * 2);
-	d = krealloc_array(*arr, ncap, sizeof(*d), GFP_ATOMIC);
-	if (!d)
-		return -ENOMEM;
-	*arr = d;
-	*cap = ncap;
-	return 0;
-}
 
 /*
  * Per-splice-pass memo of "union directory dentry -> its counterpart
@@ -605,7 +610,7 @@ static struct aufsng_entry *aufsng_dyn_prep_splice(struct aufsng_fs *pfs,
 	struct aufsng_entry *cur = AUFSNG_I_E(inode);
 	struct dentry *upper = aufsng_upperdentry(inode);
 	struct aufsng_entry *neu;
-	unsigned int base_n, i;
+	unsigned int base_n;
 	int opq;
 
 	if (upper) {
@@ -624,17 +629,8 @@ static struct aufsng_entry *aufsng_dyn_prep_splice(struct aufsng_fs *pfs,
 
 	/* an opaque new dir hides the existing lowers underneath it */
 	base_n = (opq || !cur) ? 0 : cur->numlower;
-	neu = aufsng_alloc_entry(1 + base_n);
-	if (!neu)
-		return ERR_PTR(-ENOMEM);
-	neu->lowerstack[0].layer = layer;
-	neu->lowerstack[0].dentry = dget(nd);
-	neu->lowerstack[0].mnt = layer->mnt;
-	for (i = 0; i < base_n; i++) {
-		neu->lowerstack[i + 1] = cur->lowerstack[i];
-		dget(neu->lowerstack[i + 1].dentry);
-	}
-	return neu;
+	neu = aufsng_entry_prepend(cur, base_n, layer, nd, layer->mnt);
+	return neu ? neu : ERR_PTR(-ENOMEM);
 }
 
 /*
@@ -673,7 +669,8 @@ static void aufsng_dyn_splice_cached(struct aufsng_fs *pfs, struct super_block *
 				  struct inode *root_inode)
 {
 	struct inode **dirs = NULL;
-	unsigned int ndirs = 0, cap = 0, i;
+	unsigned int ndirs = 0, i;
+	size_t cap = 0;
 	struct inode *inode;
 
 	spin_lock(&sb->s_inode_list_lock);
@@ -687,7 +684,8 @@ static void aufsng_dyn_splice_cached(struct aufsng_fs *pfs, struct super_block *
 			spin_unlock(&inode->i_lock);
 			continue;
 		}
-		if (aufsng_dyn_grow(&dirs, &cap, ndirs)) {
+		if (aufsng_grow_array((void **)&dirs, &cap, ndirs + 1,
+				   sizeof(*dirs), GFP_ATOMIC)) {
 			spin_unlock(&inode->i_lock);
 			break;	/* best effort: skip the remainder */
 		}
@@ -764,11 +762,11 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	struct aufsng_fs *pfs = AUFSNG_FS(sb);
 	struct inode *root_inode = aufsng_root_inode(sb);
 	struct aufsng_entry *old_oe, *new_oe, *cur_oe;
-	struct aufsng_path *nstack, *ostack;
 	struct aufsng_layer *layer;
 	struct vfsmount *mnt;
 	char *dup_name;
-	unsigned int n, idx;
+	unsigned int idx;
+	long namelen;
 	int err;
 
 	idx = aufsng_find_free_slot(pfs);
@@ -784,13 +782,17 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	if (err)
 		return err;
 	/*
-	 * Fold the new branch's name-length limit in, as mount time
-	 * does for every initial branch: the advertised limit must fit
-	 * the SHALLOWEST branch (see aufsng_get_namelen()).  Removal
-	 * never widens it back - conservative, and consistent with the
-	 * limit being a mount-lifetime promise to userspace.
+	 * The new branch's name-length limit, folded in as mount time does
+	 * for every initial branch: the advertised limit must fit the
+	 * SHALLOWEST branch (see aufsng_get_namelen()).  Only PROBED here -
+	 * the clamp is applied under the locks below, once nothing can fail
+	 * anymore: a shrunken limit is never widened back (it is a
+	 * mount-lifetime promise to userspace), so applying it before a
+	 * kstrdup or clone_private_mount failure would leave statfs
+	 * under-reporting f_namelen forever for a branch that was never
+	 * added.
 	 */
-	err = aufsng_get_namelen(pfs, path);
+	err = aufsng_probe_namelen(path, &namelen);
 	if (err)
 		return err;
 
@@ -811,24 +813,18 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	mnt->mnt_flags |= MNT_READONLY | MNT_NOATIME;
 
 	cur_oe = AUFSNG_I_E(root_inode);
-	n = cur_oe->numlower;
 
-	new_oe = aufsng_alloc_entry(n + 1);
+	/*
+	 * The new branch becomes the top lower (add=1, the only mode).  @mnt
+	 * is passed explicitly because layer->mnt is only published below,
+	 * once the locks are held.
+	 */
+	layer = &pfs->layers[idx];
+	new_oe = aufsng_entry_prepend(cur_oe, cur_oe->numlower, layer,
+				  path->dentry, mnt);
 	if (!new_oe) {
 		err = -ENOMEM;
 		goto out_mnt;
-	}
-
-	/* the new branch becomes the top lower (add=1, the only mode) */
-	layer = &pfs->layers[idx];
-	nstack = new_oe->lowerstack;
-	ostack = cur_oe->lowerstack;
-	nstack[0].dentry = dget(path->dentry);
-	nstack[0].layer = layer;
-	nstack[0].mnt = mnt;
-	for (n = 0; n < cur_oe->numlower; n++) {
-		nstack[n + 1] = ostack[n];
-		dget(nstack[n + 1].dentry);
 	}
 
 	/*
@@ -841,9 +837,10 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	 */
 	mutex_lock(&sb->s_vfs_rename_mutex);
 	inode_lock(root_inode);
-	down_write(&pfs->dyn_lock);
+	percpu_down_write(&pfs->dyn_lock);
 
 	layer->mnt = mnt;
+	pfs->namelen = min(pfs->namelen, namelen);
 	pfs->config.br_paths[idx] = dup_name;
 	strscpy(pfs->config.br_perms[idx], permstr, AUFSNG_PERM_LEN);
 	if (idx == pfs->numlayer)
@@ -861,7 +858,7 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	/* one re-check of every cached lower-only dentry (dcache.c) */
 	atomic_long_inc(&pfs->branch_gen);
 
-	up_write(&pfs->dyn_lock);
+	percpu_up_write(&pfs->dyn_lock);
 	inode_unlock(root_inode);
 	mutex_unlock(&sb->s_vfs_rename_mutex);
 
@@ -895,7 +892,7 @@ out_name:
 struct aufsng_dyn_scan {
 	struct inode **pinned;
 	unsigned int nr;
-	unsigned int cap;
+	size_t cap;
 	unsigned int nr_busy;
 	u64 busy_ino;
 };
@@ -918,6 +915,22 @@ static bool aufsng_entry_has_layer(struct aufsng_entry *oe,
 			return true;
 	}
 	return false;
+}
+
+/*
+ * A directory removed through the union but still pinned by a cwd or an
+ * open fd: rmdir cleared its link count, so no fresh lookup can ever
+ * reach it again.  Exactly like a deleted-but-open FILE it must not
+ * block a branch removal - there is nothing to re-point and nothing to
+ * re-point to - so it takes the same pin-only path
+ * (aufsng_dyn_pin_stack): the stack stays, its mounts pinned, until the
+ * last user lets go.  Without this it wedged the removal instead, with
+ * -EBUSY once the whtmp'd upper made aufsng_copy_up() a no-op, or
+ * -ENOENT straight from copy-up's dead-name early-out.
+ */
+static bool aufsng_dyn_dir_gone(struct inode *inode)
+{
+	return S_ISDIR(inode->i_mode) && !inode->i_nlink;
 }
 
 /*
@@ -1002,7 +1015,6 @@ static struct aufsng_entry *aufsng_dyn_prep_repoint(struct aufsng_fs *pfs,
 					      bool *pin_only)
 {
 	struct aufsng_path origin = { NULL, NULL };
-	struct aufsng_entry *new_oe;
 	struct dentry *alias, *upper;
 	bool upper_alive;
 	int found = 0;
@@ -1034,14 +1046,7 @@ static struct aufsng_entry *aufsng_dyn_prep_repoint(struct aufsng_fs *pfs,
 		return NULL;
 	}
 
-	new_oe = aufsng_alloc_entry(found ? 1 : 0);
-	if (!new_oe) {
-		dput(origin.dentry);
-		return ERR_PTR(-ENOMEM);
-	}
-	if (found)
-		new_oe->lowerstack[0] = origin;
-	return new_oe;
+	return aufsng_entry_from_origin(found, &origin);
 }
 
 /*
@@ -1056,16 +1061,9 @@ static void aufsng_dyn_pin_stack(struct aufsng_inode *oi,
 			      struct aufsng_entry *oe,
 			      struct aufsng_dyn_parked *pk)
 {
-	unsigned int i;
-
 	mutex_lock(&oi->lock);
-	pk->oe = NULL;
-	pk->upper = NULL;
-	pk->nr_mnts = oe ? oe->numlower : 0;
-	for (i = 0; i < pk->nr_mnts; i++)
-		pk->mnts[i] = mntget(oe->lowerstack[i].mnt);
-	pk->next = oi->dyn_parked;
-	oi->dyn_parked = pk;
+	/* pin the KEPT stack's mounts; the stack itself stays live */
+	aufsng_dyn_park_fill(oi, pk, NULL, NULL, oe);
 	mutex_unlock(&oi->lock);
 }
 
@@ -1081,16 +1079,25 @@ static void aufsng_dyn_pin_stack(struct aufsng_inode *oi,
  */
 static int aufsng_dyn_scan_branch(struct super_block *sb,
 			       const struct aufsng_layer *layer,
-			       struct aufsng_dyn_scan *scan, bool shrink)
+			       struct aufsng_dyn_scan *scan)
 {
 	struct inode *inode, **dispose = NULL;
-	unsigned int i, nd = 0, dcap = 0;
+	unsigned int i, nd = 0;
+	size_t dcap = 0;
 	int err = 0;
 
-	if (shrink) {
-		shrink_dcache_sb(sb);
-		evict_inodes(sb);
-	}
+	/*
+	 * Shrink INSIDE the removal locks, every pass.  i_count is the only
+	 * thing separating "a process is using this" from "the dcache merely
+	 * remembers it", so a lookup landing between an unlocked shrink and
+	 * this walk leaves a cache-only inode looking exactly like an open
+	 * fd - and a sole-backed directory misclassified that way gets
+	 * physically copied up into the rw branch, or fails the removal
+	 * outright if that copy-up errors.  Holding dyn_lock for writing
+	 * here keeps lookups out for the whole shrink-then-classify window.
+	 */
+	shrink_dcache_sb(sb);
+	evict_inodes(sb);
 
 	/* a fresh pass (retry loop): drop the previous one's collection */
 	for (i = 0; i < scan->nr; i++)
@@ -1117,8 +1124,10 @@ static int aufsng_dyn_scan_branch(struct super_block *sb,
 				spin_unlock(&inode->i_lock);
 				continue;
 			}
-			err = aufsng_dyn_grow(&scan->pinned, &scan->cap,
-					   scan->nr);
+			err = aufsng_grow_array((void **)&scan->pinned,
+					     &scan->cap, scan->nr + 1,
+					     sizeof(*scan->pinned),
+					     GFP_ATOMIC);
 			if (err) {
 				spin_unlock(&inode->i_lock);
 				break;
@@ -1138,7 +1147,8 @@ static int aufsng_dyn_scan_branch(struct super_block *sb,
 		 * for writing.  A single forward pass never revisits an
 		 * inode, so nothing is double-counted.
 		 */
-		err = aufsng_dyn_grow(&dispose, &dcap, nd);
+		err = aufsng_grow_array((void **)&dispose, &dcap, nd + 1,
+				     sizeof(*dispose), GFP_ATOMIC);
 		if (err) {
 			spin_unlock(&inode->i_lock);
 			break;
@@ -1173,6 +1183,7 @@ static int aufsng_dyn_copy_up_dirs(struct aufsng_dyn_scan *scan,
 		struct dentry *alias;
 
 		if (!S_ISDIR(inode->i_mode) ||
+		    aufsng_dyn_dir_gone(inode) ||
 		    aufsng_dyn_has_survivor(inode, layer))
 			continue;
 		alias = d_find_alias(inode);
@@ -1263,43 +1274,13 @@ static struct aufsng_entry *aufsng_dyn_prep_rebuild(struct aufsng_fs *pfs,
 	}
 	if (tail_room) {
 		const struct cred *old_cred = override_creds(pfs->creator_cred);
+		/* append through the shared merge rule (see aufsng_merge_dirs) */
+		struct aufsng_merge m = { .oe = new_oe, .n = j };
 		struct name_snapshot ns;
 
 		take_dentry_name_snapshot(&ns, alias);
-		for (i = tail_from; i < poe->numlower; i++) {
-			struct aufsng_path *lower = &poe->lowerstack[i];
-			struct dentry *this;
-			int wh = 0, opq;
-
-			if (lower->layer == layer)
-				continue;
-			this = aufsng_lookup_once(lower->mnt, lower->dentry,
-					       &ns.name, &wh);
-			if (IS_ERR(this)) {
-				err = PTR_ERR(this);
-				break;
-			}
-			if (wh)
-				break;
-			if (!this)
-				continue;
-			if (!d_is_dir(this)) {
-				/* a non-dir cannot merge into a dir stack */
-				dput(this);
-				break;
-			}
-			nstack[j].layer = lower->layer;
-			nstack[j].dentry = this;
-			nstack[j].mnt = lower->mnt;
-			j++;
-			opq = aufsng_check_diropq(lower->mnt, this);
-			if (opq < 0) {
-				err = opq;
-				break;
-			}
-			if (opq)
-				break;
-		}
+		err = aufsng_merge_dirs(&m, poe, tail_from, &ns.name, layer);
+		j = m.n;
 		release_dentry_name_snapshot(&ns);
 		revert_creds(old_cred);
 	}
@@ -1320,7 +1301,6 @@ static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode
 {
 	struct aufsng_inode *oi = AUFSNG_I(inode);
 	struct aufsng_entry *old_oe;
-	unsigned int i;
 
 	/*
 	 * No inode_lock() here: pfs->dyn_lock (write, held by caller)
@@ -1329,7 +1309,7 @@ static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode
 	 * dyn_lock, not this directory's inode lock).  Taking
 	 * inode_lock() too would deadlock: a concurrent lookup holds
 	 * the parent's i_rwsem (shared) before calling ->lookup(),
-	 * which blocks on down_read(&pfs->dyn_lock) - ABBA with
+	 * which blocks on percpu_down_read(&pfs->dyn_lock) - ABBA with
 	 * inode_lock(inode)+dyn_lock(write) here.
 	 *
 	 * oi->lock IS taken: copy-up never takes dyn_lock (its data
@@ -1360,13 +1340,7 @@ static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode
 	 */
 	aufsng_copyattr(inode);
 
-	parked->oe = old_oe;
-	parked->upper = NULL;
-	parked->nr_mnts = old_oe ? old_oe->numlower : 0;
-	for (i = 0; i < parked->nr_mnts; i++)
-		parked->mnts[i] = mntget(old_oe->lowerstack[i].mnt);
-	parked->next = oi->dyn_parked;
-	oi->dyn_parked = parked;
+	aufsng_dyn_park_fill(oi, parked, old_oe, NULL, old_oe);
 	mutex_unlock(&oi->lock);
 }
 
@@ -1464,9 +1438,13 @@ static void aufsng_dyn_release_branch(struct aufsng_fs *pfs, struct aufsng_layer
 	 * root dentry and the branch superblock's active count forever
 	 * (a deactivated squashfs would keep its loop device attached).
 	 * kern_unmount() makes the mount shortterm first, exactly as
-	 * put_super does for the surviving branches.
+	 * put_super does for the surviving branches.  Its one-element
+	 * _array form is that same teardown behind an EXPEDITED grace
+	 * period instead of a plain one, which is what the add path already
+	 * uses for its own publication - a module deactivation should not
+	 * stall the remount ~10-40ms per branch.
 	 */
-	kern_unmount(layer->mnt);
+	kern_unmount_array(&layer->mnt, 1);
 	layer->mnt = NULL;
 }
 
@@ -1510,14 +1488,12 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 		 */
 		mutex_lock(&sb->s_vfs_rename_mutex);
 		inode_lock(root_inode);
-		down_write(&pfs->dyn_lock);
+		percpu_down_write(&pfs->dyn_lock);
 
-		/*
-		 * The batch-wide shrink already ran in
-		 * aufsng_dyn_reconfigure(); a retry re-shrinks so the
-		 * scan observes the references its copy-ups released.
+		/* shrinks under these locks, so a retry also sees the
+		 * references its copy-ups released
 		 */
-		err = aufsng_dyn_scan_branch(sb, layer, &scan, tries > 0);
+		err = aufsng_dyn_scan_branch(sb, layer, &scan);
 		if (err)
 			goto out_unlock;
 
@@ -1536,6 +1512,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 		blocker_ino = 0;
 		for (i = 0; i < scan.nr; i++) {
 			if (S_ISDIR(scan.pinned[i]->i_mode) &&
+			    !aufsng_dyn_dir_gone(scan.pinned[i]) &&
 			    !aufsng_dyn_has_survivor(scan.pinned[i], layer)) {
 				blocker_ino = scan.pinned[i]->i_ino;
 				break;
@@ -1544,7 +1521,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 		if (i == scan.nr)
 			break;
 
-		up_write(&pfs->dyn_lock);
+		percpu_up_write(&pfs->dyn_lock);
 		inode_unlock(root_inode);
 		mutex_unlock(&sb->s_vfs_rename_mutex);
 
@@ -1573,11 +1550,22 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 		struct aufsng_entry *cur;
 		bool pin_only = false;
 
-		if (S_ISDIR(scan.pinned[i]->i_mode))
-			new_oes[i] = aufsng_dyn_prep_rebuild(pfs,
-							  scan.pinned[i],
-							  layer, true);
-		else
+		if (S_ISDIR(scan.pinned[i]->i_mode)) {
+			/*
+			 * A deleted-but-open directory with no survivor has
+			 * nothing to rebuild onto: keep its stack and pin the
+			 * mounts, as the non-directory path does for the same
+			 * state.  (With a survivor the filter below still
+			 * produces a valid stack, so let it.)
+			 */
+			if (aufsng_dyn_dir_gone(scan.pinned[i]) &&
+			    !aufsng_dyn_has_survivor(scan.pinned[i], layer))
+				pin_only = true;
+			else
+				new_oes[i] = aufsng_dyn_prep_rebuild(pfs,
+								  scan.pinned[i],
+								  layer, true);
+		} else
 			new_oes[i] = aufsng_dyn_prep_repoint(pfs,
 							  scan.pinned[i],
 							  layer, &pin_only);
@@ -1685,11 +1673,12 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 
 	pr_info("aufs (aufs-ng): branch '%s' removed\n", brname);
 
-	up_write(&pfs->dyn_lock);
+	percpu_up_write(&pfs->dyn_lock);
 	inode_unlock(root_inode);
 	mutex_unlock(&sb->s_vfs_rename_mutex);
 
-	synchronize_rcu();
+	/* expedited for the same reason as on the add path (see there) */
+	synchronize_rcu_expedited();
 	aufsng_free_entry(old_root_oe);
 	/*
 	 * Only after the grace period: an RCU show_options snapshot of
@@ -1703,7 +1692,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 	return 0;
 
 out_unlock:
-	up_write(&pfs->dyn_lock);
+	percpu_up_write(&pfs->dyn_lock);
 	inode_unlock(root_inode);
 	mutex_unlock(&sb->s_vfs_rename_mutex);
 out_scan:
@@ -1750,6 +1739,18 @@ int aufsng_dyn_reconfigure(struct fs_context *fc)
 	for (i = 0; !err && i < ctx->nr_dyn_add; i++) {
 		struct aufsng_ctx_branch *b = &ctx->dyn_add[i];
 
+		/*
+		 * An added branch is always a lower, so it is cloned read-only
+		 * whatever the mode says (see aufsng_dyn_add_branch()).  Record
+		 * the mode it will actually have, or /proc/mounts would echo
+		 * back a "=rw" this branch never gets - the same effective-mode
+		 * rule aufsng_fill_super() applies to a lower "=rw".
+		 */
+		if (b->perm == AUFSNG_BR_RW) {
+			pr_warn("aufs (aufs-ng): branch '%s' declared rw but only the first branch is writable; using ro\n",
+				b->name);
+			strscpy(b->permstr, "ro", AUFSNG_PERM_LEN);
+		}
 		err = aufsng_dyn_add_branch(sb, b->name, &b->path, b->permstr);
 		/*
 		 * Tolerate re-adding a present branch: legacy remounts
@@ -1759,18 +1760,6 @@ int aufsng_dyn_reconfigure(struct fs_context *fc)
 			err = 0;
 	}
 
-	/*
-	 * One shrink of cache-only dentries/inodes serves the whole
-	 * batch of removals: removing one branch doesn't change another
-	 * branch's reference counts.  It needs none of the removal locks
-	 * - it only reduces the cache, the authoritative busy
-	 * classification runs under them in aufsng_dyn_scan_branch() -
-	 * and each removal re-shrinks on its own retries.
-	 */
-	if (!err && ctx->nr_dyn_del) {
-		shrink_dcache_sb(sb);
-		evict_inodes(sb);
-	}
 	for (i = 0; !err && i < ctx->nr_dyn_del; i++)
 		err = aufsng_dyn_del_branch(sb, &ctx->dyn_del[i]);
 

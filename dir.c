@@ -73,8 +73,9 @@ static int aufsng_create_marker(struct aufsng_fs *pfs, struct dentry *upperdir,
 }
 
 /* create a whiteout named ".wh.<name>" inside @upperdir */
-int aufsng_create_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
-			const struct qstr *name)
+static int aufsng_create_whiteout(struct aufsng_fs *pfs,
+			       struct dentry *upperdir,
+			       const struct qstr *name)
 {
 	char buf[NAME_MAX + 1];
 	struct qstr wh;
@@ -95,8 +96,9 @@ static int aufsng_mark_diropq(struct aufsng_fs *pfs, struct dentry *dir)
 }
 
 /* remove a ".wh.<name>" whiteout marker from @upperdir, if present */
-int aufsng_remove_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
-			const struct qstr *name)
+static int aufsng_remove_whiteout(struct aufsng_fs *pfs,
+			       struct dentry *upperdir,
+			       const struct qstr *name)
 {
 	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	char buf[NAME_MAX + 1];
@@ -180,9 +182,12 @@ static int aufsng_do_remove_object(struct aufsng_fs *pfs,
  * hidden behind a restored whiteout it makes every retry fail with
  * EEXIST, and visible it shadows lower content with a half-built
  * object.  A removal failure means the branch fs is in serious
- * trouble; log it, the leftover stays.
+ * trouble: it is logged here and the leftover stays, and the errno is
+ * returned for the callers that must escalate rather than report the
+ * original failure as if nothing had been left behind (see
+ * aufsng_copy_up_inplace()); the best-effort callers ignore it.
  */
-void aufsng_remove_object(struct aufsng_fs *pfs, struct dentry *upperdir,
+int aufsng_remove_object(struct aufsng_fs *pfs, struct dentry *upperdir,
 		       const struct qstr *name, bool is_dir)
 {
 	int err = aufsng_do_remove_object(pfs, upperdir, name, is_dir);
@@ -190,6 +195,7 @@ void aufsng_remove_object(struct aufsng_fs *pfs, struct dentry *upperdir,
 	if (err)
 		pr_err("aufs (aufs-ng): failed to remove leftover '%.*s' (%d)\n",
 		       name->len, name->name, err);
+	return err;
 }
 
 /*
@@ -354,7 +360,7 @@ static int aufsng_create_object(struct dentry *dentry,
 	 * branch add/remove cannot invalidate either the opaque/keying
 	 * decision or the origin's branch pinning in between.
 	 */
-	down_read(&pfs->dyn_lock);
+	percpu_down_read(&pfs->dyn_lock);
 	found = aufsng_find_origin(AUFSNG_I_E(dir), &dentry->d_name, &origin);
 	if (found < 0) {
 		err = found;
@@ -426,15 +432,16 @@ static int aufsng_create_object(struct dentry *dentry,
 		}
 	}
 
-	oe = aufsng_alloc_entry(!is_dir && found ? 1 : 0);
-	if (!oe) {
+	/*
+	 * A directory create marks the upper opaque instead of keying it on
+	 * the lower (see above), so it never takes the origin into its
+	 * stack; the reference is dropped at out_origin either way.
+	 */
+	oe = aufsng_entry_from_origin(!is_dir && found, &origin);
+	if (IS_ERR(oe)) {
 		dput(upper);
-		err = -ENOMEM;
+		err = PTR_ERR(oe);
 		goto out_remove;
-	}
-	if (oe->numlower) {
-		oe->lowerstack[0] = origin;
-		origin.dentry = NULL;
 	}
 	inode = aufsng_get_inode(dentry->d_sb, upper, oe);
 	if (IS_ERR(inode)) {
@@ -462,7 +469,7 @@ out_unpark:
 out_origin:
 	dput(origin.dentry);
 out_creds:
-	up_read(&pfs->dyn_lock);
+	percpu_up_read(&pfs->dyn_lock);
 	revert_creds(old_cred);
 	put_cred(create_cred);
 out_write:
@@ -594,7 +601,6 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	struct inode *inode = d_inode(dentry);
 	struct aufsng_inode *oi = AUFSNG_I(inode);
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	const struct cred *old_cred;
 	struct dentry *pupper, *upper;
 	bool real_removed = false;
@@ -624,7 +630,7 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	 * whiteout against the old stack would resurrect it the moment
 	 * the delete returns.
 	 */
-	down_read(&pfs->dyn_lock);
+	percpu_down_read(&pfs->dyn_lock);
 	covered = aufsng_lower_covers(dir, &dentry->d_name);
 	if (covered < 0) {
 		err = covered;
@@ -702,30 +708,20 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 					tmpbuf, werr);
 		}
 	} else if (upper) {
-		struct qstr q = QSTR_LEN(dentry->d_name.name,
-					 dentry->d_name.len);
-		struct dentry *slot;
-
-		slot = start_removing_noperm(pupper, &q);
-		if (IS_ERR(slot)) {
-			err = PTR_ERR(slot);
+		err = aufsng_do_remove_object(pfs, pupper, &dentry->d_name,
+					   false);
+		if (!err)
+			real_removed = true;
+		else if (err == -ENOENT)
 			/*
 			 * No upper entry under THIS name: the inode's
-			 * upperdentry is a copied-up lower hardlink
-			 * sibling (lower links share one union inode,
-			 * whose single upperdentry carries whichever
-			 * name was copied up first).  The name itself is
-			 * lower-only, so the whiteout created above is
-			 * the whole removal.
+			 * upperdentry is a copied-up lower hardlink sibling
+			 * (lower links share one union inode, whose single
+			 * upperdentry carries whichever name was copied up
+			 * first).  The name itself is lower-only, so the
+			 * whiteout created above is the whole removal.
 			 */
-			if (err == -ENOENT)
-				err = 0;
-		} else {
-			err = vfs_unlink(idmap, d_inode(pupper), slot, NULL);
-			if (!err)
-				real_removed = true;
-			end_dirop(slot);
-		}
+			err = 0;
 	}
 	if (upper && err) {
 		/* roll the pre-created whiteout back */
@@ -770,7 +766,7 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 out:
 	mutex_unlock(&oi->lock);
 out_dyn:
-	up_read(&pfs->dyn_lock);
+	percpu_up_read(&pfs->dyn_lock);
 	revert_creds(old_cred);
 	mnt_drop_write(aufsng_upper_mnt(pfs));
 	return err;
@@ -881,7 +877,7 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	 * new name?) through the rename and markers they decide, so a
 	 * concurrent branch add/remove cannot make either stale.
 	 */
-	down_read(&pfs->dyn_lock);
+	percpu_down_read(&pfs->dyn_lock);
 
 	/*
 	 * Re-derive the merged-directory -EXDEV verdicts now that
@@ -1036,7 +1032,7 @@ out_unpark:
 		aufsng_unpark_whiteout(pfs, newupperdir, &new->d_name, &whtmp,
 				    err != 0);
 out:
-	up_read(&pfs->dyn_lock);
+	percpu_up_read(&pfs->dyn_lock);
 	revert_creds(old_cred);
 	mnt_drop_write(aufsng_upper_mnt(pfs));
 	return err;

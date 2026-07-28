@@ -22,7 +22,7 @@
 #include <linux/mount.h>
 #include <linux/dcache.h>
 #include <linux/cred.h>
-#include <linux/rwsem.h>
+#include <linux/percpu-rwsem.h>
 #include <linux/atomic.h>
 #include <linux/mutex.h>
 #include <linux/limits.h>
@@ -120,8 +120,18 @@ struct aufsng_fs {
 	 * dropped on 32-bit; a false match needs 2^32 branch mutations.
 	 */
 	atomic_long_t branch_gen;
-	/* excludes lookup/readdir during runtime branch add/remove */
-	struct rw_semaphore dyn_lock;
+	/*
+	 * Excludes lookup/readdir during runtime branch add/remove.
+	 * Per-cpu: the read side is taken by every uncached lookup, every
+	 * merged-readdir build and every directory mutation, so on a
+	 * live system's parallel path walks a plain rwsem would have all
+	 * CPUs trading one cacheline; percpu_down_read() touches only
+	 * this CPU's counter.  The whole cost moves to the write side -
+	 * an rcu_sync grace period per branch change - which already
+	 * stalls the world for a shrink_dcache_sb() and a
+	 * synchronize_rcu_expedited().
+	 */
+	struct percpu_rw_semaphore dyn_lock;
 	struct backing_file_ctx backing_ctx;
 	struct aufsng_config config;
 	int namelen;
@@ -471,11 +481,21 @@ int aufsng_dyn_reconfigure(struct fs_context *fc);
 /* super.c */
 struct aufsng_entry *aufsng_alloc_entry(unsigned int numlower);
 void aufsng_free_entry(struct aufsng_entry *oe);
+struct aufsng_entry *aufsng_entry_from_origin(int found,
+					struct aufsng_path *origin);
+struct aufsng_entry *aufsng_entry_prepend(struct aufsng_entry *cur,
+				     unsigned int base_n,
+				     struct aufsng_layer *layer,
+				     struct dentry *dentry,
+				     struct vfsmount *mnt);
 int aufsng_fill_super(struct super_block *sb, struct fs_context *fc);
 int aufsng_check_layer(struct super_block *sb, const struct path *path,
 		    const char *name);
 int aufsng_check_overlap(struct aufsng_fs *pfs, struct dentry *dentry,
 		      const char *name);
+int aufsng_grow_array(void **arr, size_t *cap, size_t need, size_t elemsize,
+		   gfp_t gfp);
+int aufsng_probe_namelen(const struct path *path, long *namelen);
 int aufsng_get_namelen(struct aufsng_fs *pfs, const struct path *path);
 extern const struct super_operations aufsng_super_operations;
 
@@ -508,6 +528,17 @@ int aufsng_find_origin_ex(struct aufsng_entry *poe, const struct qstr *name,
 		       const struct aufsng_layer *skip_layer, umode_t mode,
 		       struct aufsng_path *out);
 
+/* in-progress merged stack; see aufsng_merge_dirs() */
+struct aufsng_merge {
+	struct aufsng_entry *oe;	/* lazily allocated when NULL */
+	unsigned int n;			/* entries filled so far */
+	bool allow_top_nondir;
+};
+
+int aufsng_merge_dirs(struct aufsng_merge *m, struct aufsng_entry *poe,
+		   unsigned int from, const struct qstr *name,
+		   const struct aufsng_layer *skip);
+
 static inline int aufsng_find_origin(struct aufsng_entry *poe,
 				  const struct qstr *name,
 				  struct aufsng_path *out)
@@ -522,10 +553,10 @@ extern const struct inode_operations aufsng_file_inode_operations;
 extern const struct inode_operations aufsng_symlink_inode_operations;
 extern const struct inode_operations aufsng_special_inode_operations;
 extern const struct xattr_handler * const aufsng_xattr_handlers[];
-ssize_t aufsng_listxattr(struct dentry *dentry, char *list, size_t size);
 
 /* copy_up.c */
 int aufsng_copy_up(struct dentry *dentry);
+struct dentry *aufsng_copy_up_upper(struct dentry *dentry);
 
 /* dir.c */
 int aufsng_create(struct mnt_idmap *idmap, struct inode *dir,
@@ -542,12 +573,8 @@ int aufsng_rmdir(struct inode *dir, struct dentry *dentry);
 int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	       struct dentry *old, struct inode *newdir,
 	       struct dentry *new, unsigned int flags);
-int aufsng_create_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
-			const struct qstr *name);
-void aufsng_remove_object(struct aufsng_fs *pfs, struct dentry *upperdir,
-		       const struct qstr *name, bool is_dir);
-int aufsng_remove_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
-			const struct qstr *name);
+int aufsng_remove_object(struct aufsng_fs *pfs, struct dentry *upperdir,
+		      const struct qstr *name, bool is_dir);
 struct dentry *aufsng_create_slot(struct dentry *upperdir,
 			       const struct qstr *name);
 

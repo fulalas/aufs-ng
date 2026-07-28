@@ -77,15 +77,17 @@ static int aufsng_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (err)
 		return err;
 
-	err = aufsng_copy_up(dentry);
-	if (err)
-		return err;
+	/* pinned: a concurrent shed-upper heal must not NULL it under us */
+	upper = aufsng_copy_up_upper(dentry);
+	if (IS_ERR(upper))
+		return PTR_ERR(upper);
 
 	err = mnt_want_write(aufsng_upper_mnt(pfs));
-	if (err)
+	if (err) {
+		dput(upper);
 		return err;
+	}
 
-	upper = aufsng_upperdentry(inode);
 	attr->ia_valid &= ~(ATTR_FILE | ATTR_OPEN);
 
 	old_cred = override_creds(pfs->creator_cred);
@@ -95,9 +97,10 @@ static int aufsng_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	revert_creds(old_cred);
 
 	if (!err)
-		aufsng_copyattr(inode);
+		aufsng_copyattr_from(inode, d_inode(upper));
 
 	mnt_drop_write(aufsng_upper_mnt(pfs));
+	dput(upper);
 	return err;
 }
 
@@ -107,7 +110,7 @@ static int aufsng_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  * xattrs - see namei.c/dir.c), so xattr passthrough needs no
  * filtering here.
  */
-ssize_t aufsng_listxattr(struct dentry *dentry, char *list, size_t size)
+static ssize_t aufsng_listxattr(struct dentry *dentry, char *list, size_t size)
 {
 	struct inode *inode = d_inode(dentry);
 	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
@@ -150,15 +153,17 @@ static int aufsng_xattr_set(const struct xattr_handler *handler,
 	struct dentry *upper;
 	int err;
 
-	err = aufsng_copy_up(dentry);
-	if (err)
-		return err;
+	/* pinned: a concurrent shed-upper heal must not NULL it under us */
+	upper = aufsng_copy_up_upper(dentry);
+	if (IS_ERR(upper))
+		return PTR_ERR(upper);
 
 	err = mnt_want_write(aufsng_upper_mnt(pfs));
-	if (err)
+	if (err) {
+		dput(upper);
 		return err;
+	}
 
-	upper = aufsng_upperdentry(inode);
 	old_cred = override_creds(pfs->creator_cred);
 	if (value)
 		err = vfs_setxattr(upper_idmap, upper, name, value, size,
@@ -168,9 +173,10 @@ static int aufsng_xattr_set(const struct xattr_handler *handler,
 	revert_creds(old_cred);
 
 	if (!err)
-		aufsng_copyattr(inode);
+		aufsng_copyattr_from(inode, d_inode(upper));
 
 	mnt_drop_write(aufsng_upper_mnt(pfs));
+	dput(upper);
 	return err;
 }
 

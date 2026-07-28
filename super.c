@@ -51,6 +51,64 @@ void aufsng_free_entry(struct aufsng_entry *oe)
 	kfree(oe);
 }
 
+/*
+ * Wrap a resolved copy-up origin into the 0-or-1-entry stack that keys a
+ * non-directory union inode.  ALWAYS consumes *@origin: the reference
+ * moves into the returned entry, or is dropped if the allocation fails,
+ * and @origin->dentry is left NULL either way.  One owner for that
+ * handoff - lookup, create and the branch-removal re-point each used to
+ * open-code it with a slightly different convention, which is how a
+ * double-dput or a leak gets introduced by editing just one of them.
+ */
+struct aufsng_entry *aufsng_entry_from_origin(int found,
+					struct aufsng_path *origin)
+{
+	struct aufsng_entry *oe = aufsng_alloc_entry(found ? 1 : 0);
+
+	if (!oe) {
+		dput(origin->dentry);
+		origin->dentry = NULL;
+		return ERR_PTR(-ENOMEM);
+	}
+	if (found) {
+		oe->lowerstack[0] = *origin;
+		origin->dentry = NULL;
+	}
+	return oe;
+}
+
+/*
+ * Build a stack that puts @dentry (in @layer, reached through @mnt) on
+ * top of the first @base_n entries of @cur, taking a reference per
+ * copied dentry.  The branch mount is passed in rather than read from
+ * @layer->mnt: the add path builds the new stack BEFORE publishing the
+ * slot.  Deliberately no mntget - a live stack's mounts are pinned by
+ * the layer itself (only a PARKED stack pins its own, see struct
+ * aufsng_dyn_parked).  Shared by the root-stack rebuild of a branch add
+ * and the per-directory splice, so what a lowerstack entry must carry is
+ * defined in exactly one place.
+ */
+struct aufsng_entry *aufsng_entry_prepend(struct aufsng_entry *cur,
+				     unsigned int base_n,
+				     struct aufsng_layer *layer,
+				     struct dentry *dentry,
+				     struct vfsmount *mnt)
+{
+	struct aufsng_entry *neu = aufsng_alloc_entry(1 + base_n);
+	unsigned int i;
+
+	if (!neu)
+		return NULL;
+	neu->lowerstack[0].layer = layer;
+	neu->lowerstack[0].dentry = dget(dentry);
+	neu->lowerstack[0].mnt = mnt;
+	for (i = 0; i < base_n; i++) {
+		neu->lowerstack[i + 1] = cur->lowerstack[i];
+		dget(neu->lowerstack[i + 1].dentry);
+	}
+	return neu;
+}
+
 /* inode lifecycle */
 
 static struct inode *aufsng_alloc_inode(struct super_block *sb)
@@ -204,6 +262,8 @@ static void aufsng_free_fs(struct aufsng_fs *pfs)
 	kfree(pfs->layers);
 	kfree(pfs->config.br_paths);
 	kfree(pfs->config.br_perms);
+	/* safe on a never-initialized (kzalloc'd) lock, by design */
+	percpu_free_rwsem(&pfs->dyn_lock);
 	if (pfs->creator_cred)
 		put_cred(pfs->creator_cred);
 	kfree(pfs->config.xino_path);
@@ -288,16 +348,51 @@ int aufsng_check_overlap(struct aufsng_fs *pfs, struct dentry *dentry,
  * cannot even store must not be accepted just because a deeper one
  * could.
  */
-int aufsng_get_namelen(struct aufsng_fs *pfs, const struct path *path)
+/*
+ * Make room for at least @need elements of @elemsize in *@arr, doubling
+ * the capacity from a floor of 16.  One growth policy for the mount-time
+ * parser's branch arrays and for dynlayer's inode-walk arrays alike;
+ * they differ only in allocation context, which @gfp carries (the walks
+ * grow under s_inode_list_lock + i_lock and must pass GFP_ATOMIC).
+ */
+int aufsng_grow_array(void **arr, size_t *cap, size_t need, size_t elemsize,
+		   gfp_t gfp)
+{
+	size_t nr;
+	void *p;
+
+	if (need <= *cap)
+		return 0;
+	nr = max_t(size_t, 16, *cap * 2);
+	if (nr < need)
+		nr = need;
+	p = krealloc_array(*arr, nr, elemsize, gfp);
+	if (!p)
+		return -ENOMEM;
+	*arr = p;
+	*cap = nr;
+	return 0;
+}
+
+int aufsng_probe_namelen(const struct path *path, long *namelen)
 {
 	struct kstatfs statfs;
-	long namelen;
 	int err = vfs_statfs(path, &statfs);
 
 	if (err)
 		return err;
-	namelen = statfs.f_namelen - AUFSNG_WH_PFX_LEN;
-	pfs->namelen = min(pfs->namelen, max(0L, namelen));
+	*namelen = max(0L, (long)statfs.f_namelen - AUFSNG_WH_PFX_LEN);
+	return 0;
+}
+
+int aufsng_get_namelen(struct aufsng_fs *pfs, const struct path *path)
+{
+	long namelen;
+	int err = aufsng_probe_namelen(path, &namelen);
+
+	if (err)
+		return err;
+	pfs->namelen = min(pfs->namelen, namelen);
 	return 0;
 }
 
@@ -339,7 +434,11 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (!pfs)
 		return err;
 	sb->s_fs_info = pfs;
-	init_rwsem(&pfs->dyn_lock);
+	/* per-cpu, so unlike init_rwsem() this one allocates and can fail */
+	err = percpu_init_rwsem(&pfs->dyn_lock);
+	if (err)
+		goto out_free;
+	err = -ENOMEM;
 	atomic_long_set(&pfs->branch_gen, 0);
 	pfs->config.xino_path = ctx->config.xino_path;
 	ctx->config.xino_path = NULL;
@@ -407,8 +506,22 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		pfs->layers[i].mnt = mnt;
 		pfs->config.br_paths[i] = ctx->br[i].name;
 		ctx->br[i].name = NULL;
-		strscpy(pfs->config.br_perms[i], ctx->br[i].permstr,
-			AUFSNG_PERM_LEN);
+		/*
+		 * Echo back the mode the branch actually HAS, not the one that
+		 * was asked for: a lower "=rw" is accepted but demoted above,
+		 * and /proc/mounts is the only place the branch modes are
+		 * exposed - reporting "=rw" for a branch aufs-ng will never
+		 * write would mislead every script that parses it.  Warn once
+		 * so the demotion is not silent either.
+		 */
+		if (i > 0 && ctx->br[i].perm == AUFSNG_BR_RW) {
+			pr_warn("aufs (aufs-ng): branch '%s' declared rw but only the first branch is writable; using ro\n",
+				pfs->config.br_paths[i]);
+			strscpy(pfs->config.br_perms[i], "ro", AUFSNG_PERM_LEN);
+		} else {
+			strscpy(pfs->config.br_perms[i], ctx->br[i].permstr,
+				AUFSNG_PERM_LEN);
+		}
 		pfs->numlayer++;
 	}
 
@@ -437,13 +550,17 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 	rw_inode = d_inode(aufsng_upper_mnt(pfs)->mnt_root);
 	/* AUFS mounts always have root inode 2; scripts test for it */
 	root_inode->i_ino = AUFSNG_ROOT_INO;
-	root_inode->i_mode = rw_inode->i_mode;
-	root_inode->i_uid = rw_inode->i_uid;
-	root_inode->i_gid = rw_inode->i_gid;
+	/*
+	 * Through the one attribute-mirror helper, like every other inode
+	 * (aufsng_fill_inode): a partial open-coded copy here left the root
+	 * as the single inode reporting mount-time timestamps instead of the
+	 * rw branch's, and would silently miss any field later added to the
+	 * shared mirror.  The merged directory link count is computed at
+	 * stat time (aufsng_getattr), not from the stored i_nlink.
+	 */
+	aufsng_copyattr_from(root_inode, rw_inode);
 	root_inode->i_op = &aufsng_dir_inode_operations;
 	root_inode->i_fop = &aufsng_dir_operations;
-	set_nlink(root_inode, rw_inode->i_nlink);
-	simple_inode_init_ts(root_inode);
 
 	AUFSNG_I(root_inode)->oe = oe;
 	AUFSNG_I(root_inode)->upperdentry = dget(aufsng_upper_mnt(pfs)->mnt_root);

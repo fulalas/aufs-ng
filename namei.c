@@ -160,6 +160,95 @@ int aufsng_find_origin_ex(struct aufsng_entry *poe, const struct qstr *name,
 }
 
 /*
+ * The per-level merge rule, in ONE place: walk @poe's lowers from index
+ * @from looking for @name, appending every visible DIRECTORY to @m's
+ * stack, and stop where the merged view ends - at a whiteout (the name
+ * is deleted from here down), at a same-named non-directory (it shadows
+ * anything deeper), or at an opaque directory (it hides every branch
+ * below it).  @skip, when set, is ignored entirely: branch removal
+ * re-merges against the surviving branches only.
+ *
+ * Both callers that build a directory stack come through here - lookup
+ * and the branch-removal tail merge - so a pinned directory and a fresh
+ * lookup of the same path cannot answer differently, which is the whole
+ * point of the rule having a single owner.  (aufsng_find_origin_ex()
+ * stays separate: it wants the FIRST provider, not a merged stack.)
+ *
+ * @m->oe is allocated lazily - on the first hit, sized to the branches
+ * still to come - so an all-negative lookup, the common case for PATH
+ * and include probes, allocates nothing.  A caller that already holds a
+ * stack to append to passes it in @m->oe with @m->n set and must have
+ * reserved room for the rest of @poe.  @m->allow_top_nondir lets a
+ * non-directory become the whole stack when nothing precedes it (that is
+ * what keys a lower-only file); a directory stack being rebuilt never
+ * wants that.
+ *
+ * Returns 0 or negative errno.  On either outcome the caller publishes
+ * @m->n into @m->oe->numlower, so freeing the entry drops exactly the
+ * references taken here.  Caller holds pfs->dyn_lock and runs under
+ * creator credentials.
+ */
+int aufsng_merge_dirs(struct aufsng_merge *m, struct aufsng_entry *poe,
+		   unsigned int from, const struct qstr *name,
+		   const struct aufsng_layer *skip)
+{
+	unsigned int i;
+
+	for (i = from; poe && i < poe->numlower; i++) {
+		struct aufsng_path *lower = &poe->lowerstack[i];
+		struct dentry *this;
+		int wh = 0, opq;
+
+		if (skip && lower->layer == skip)
+			continue;
+		this = aufsng_lookup_once(lower->mnt, lower->dentry, name, &wh);
+		if (IS_ERR(this))
+			return PTR_ERR(this);
+		if (wh)
+			break;
+		if (!this)
+			continue;
+		if (!m->oe) {
+			m->oe = aufsng_alloc_entry(poe->numlower - i);
+			if (!m->oe) {
+				dput(this);
+				return -ENOMEM;
+			}
+			m->oe->numlower = 0;
+		}
+		if (!d_is_dir(this)) {
+			if (m->allow_top_nondir && !m->n) {
+				m->oe->lowerstack[m->n].layer = lower->layer;
+				m->oe->lowerstack[m->n].dentry = this;
+				m->oe->lowerstack[m->n].mnt = lower->mnt;
+				m->n++;
+			} else {
+				dput(this);
+			}
+			break;
+		}
+		m->oe->lowerstack[m->n].layer = lower->layer;
+		m->oe->lowerstack[m->n].dentry = this;
+		m->oe->lowerstack[m->n].mnt = lower->mnt;
+		m->n++;
+
+		/*
+		 * On the last branch the opaque verdict changes nothing
+		 * (break == falling out of the loop), so don't pay a branch
+		 * lookup for it.
+		 */
+		if (i + 1 >= poe->numlower)
+			break;
+		opq = aufsng_check_diropq(lower->mnt, this);
+		if (opq < 0)
+			return opq;
+		if (opq)
+			break;
+	}
+	return 0;
+}
+
+/*
  * Does any lower branch of @dir still visibly provide @name?  The
  * boolean form of aufsng_find_origin() for callers that only need the
  * verdict, not the origin itself.  Returns 1/0, negative errno on
@@ -204,7 +293,7 @@ bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name)
 	int wh;
 
 	old_cred = override_creds(pfs->creator_cred);
-	down_read(&pfs->dyn_lock);
+	percpu_down_read(&pfs->dyn_lock);
 
 	pupper = aufsng_upperdentry(dir);
 	/*
@@ -241,7 +330,7 @@ bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name)
 		valid = false;	/* a lower branch now provides it */
 
 out:
-	up_read(&pfs->dyn_lock);
+	percpu_up_read(&pfs->dyn_lock);
 	revert_creds(old_cred);
 	return valid;
 }
@@ -387,7 +476,6 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 	const struct cred *old_cred;
 	unsigned long stamp;
 	unsigned long gen;
-	unsigned int i;
 	bool stopped = false;
 	int wh, err = 0;
 
@@ -407,7 +495,7 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 	 * ultimately derives from) may be swapped by a runtime branch
 	 * add/remove; exclude that for the whole lookup.
 	 */
-	down_read(&pfs->dyn_lock);
+	percpu_down_read(&pfs->dyn_lock);
 	old_cred = override_creds(pfs->creator_cred);
 
 	poe = AUFSNG_E(dentry->d_parent);
@@ -469,83 +557,26 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 			err = found;
 			goto out;
 		}
-		err = -ENOMEM;
-		oe = aufsng_alloc_entry(found);
-		if (!oe) {
-			dput(origin.dentry);
+		oe = aufsng_entry_from_origin(found, &origin);
+		if (IS_ERR(oe)) {
+			err = PTR_ERR(oe);
+			oe = NULL;
 			goto out;
 		}
-		err = 0;
-		if (found)
-			oe->lowerstack[0] = origin;
 	} else if (!stopped && poe && poe->numlower) {
-		for (i = 0; i < poe->numlower; i++) {
-			struct aufsng_path *lower = &poe->lowerstack[i];
+		/*
+		 * Merge the parent's lowers by the shared rule: only a
+		 * non-directory at the very top can stand alone as the stack,
+		 * and only when no upper already holds that place.
+		 */
+		struct aufsng_merge m = { .allow_top_nondir = !upper };
 
-			wh = 0;
-			this = aufsng_lookup_once(lower->mnt,
-					       lower->dentry, &dentry->d_name,
-					       &wh);
-			if (IS_ERR(this)) {
-				err = PTR_ERR(this);
-				goto out;
-			}
-			if (wh)
-				break;
-			if (!this)
-				continue;
-			/*
-			 * Allocated on the first hit, not up front, so
-			 * an all-negative lookup (PATH/include probes)
-			 * allocates nothing; the remaining branch count
-			 * still bounds the stack size.
-			 */
-			if (!oe) {
-				oe = aufsng_alloc_entry(poe->numlower - i);
-				if (!oe) {
-					dput(this);
-					err = -ENOMEM;
-					goto out;
-				}
-				oe->numlower = 0;
-			}
-			/*
-			 * Merging continues only through directories: a
-			 * non-directory match is the end of the stack,
-			 * and only counts at all if it is the top of it.
-			 */
-			if (!d_is_dir(this)) {
-				if (!upper && !oe->numlower) {
-					oe->lowerstack[0].layer = lower->layer;
-					oe->lowerstack[0].dentry = this;
-					oe->lowerstack[0].mnt = lower->mnt;
-					oe->numlower = 1;
-				} else {
-					dput(this);
-				}
-				break;
-			}
-			oe->lowerstack[oe->numlower].layer = lower->layer;
-			oe->lowerstack[oe->numlower].dentry = this;
-			oe->lowerstack[oe->numlower].mnt = lower->mnt;
-			oe->numlower++;
-
-			/*
-			 * On the last branch the opaque verdict changes
-			 * nothing (break == falling out of the loop), so
-			 * don't pay a branch lookup for it.
-			 */
-			if (i + 1 < poe->numlower) {
-				int opq = aufsng_check_diropq(lower->mnt,
-							   this);
-				if (opq < 0) {
-					err = opq;
-					goto out;
-				}
-				if (opq)
-					break;
-			}
-		}
+		err = aufsng_merge_dirs(&m, poe, 0, &dentry->d_name, NULL);
+		oe = m.oe;
+		if (oe)
+			oe->numlower = m.n;
+		if (err)
+			goto out;
 	}
 
 	if (upper || (oe && oe->numlower)) {
@@ -569,7 +600,7 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 
 out:
 	revert_creds(old_cred);
-	up_read(&pfs->dyn_lock);
+	percpu_up_read(&pfs->dyn_lock);
 	aufsng_free_entry(oe);
 	dput(upper);
 	if (err)

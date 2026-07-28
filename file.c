@@ -163,20 +163,55 @@ static int aufsng_fsync(struct file *file, loff_t start, loff_t end,
 		     int datasync)
 {
 	struct inode *inode = file_inode(file);
+	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
 	struct file *realfile = file->private_data;
 	struct dentry *upper = aufsng_upperdentry(inode);
+	struct file *upperfile;
+	struct path upperpath;
+	int err;
 
 	/*
-	 * Nothing to sync unless this fd's own backing file is the
-	 * upper one: lower layers are read-only, and an fd opened
-	 * O_RDONLY before a copy-up still points at the (possibly
-	 * fsync-less, e.g. squashfs) lower file and has written
-	 * nothing.
+	 * No upper at all: every lower branch is read-only (and may be
+	 * fsync-less, e.g. squashfs), so nothing can be dirty.
 	 */
-	if (!upper || file_inode(realfile) != d_inode(upper))
+	if (!upper)
 		return 0;
 
-	return vfs_fsync_range(realfile, start, end, datasync);
+	/* the common case: this fd already writes through the current upper */
+	if (file_inode(realfile) == d_inode(upper))
+		return vfs_fsync_range(realfile, start, end, datasync);
+
+	/*
+	 * This fd's backing file is NOT the current upper: it was opened
+	 * before the copy-up (so it still points at the lower), or an
+	 * adopt/shed replaced the upper under it (udba=reval).  fsync(2) is
+	 * a barrier for the FILE, not for the descriptor it is called on, so
+	 * returning 0 here would report durability for data that was never
+	 * written back - the upper's dirty pages after a copy-up, or, when
+	 * the upper was replaced, even this fd's OWN writes.
+	 *
+	 * Sync both halves: the fd's backing file when it could have been
+	 * written through (a superseded upper stays pinned while the fd
+	 * lives), and the current upper - opened for the sync exactly as
+	 * aufsng_dir_fsync() opens it, and as overlayfs's ovl_fsync does for
+	 * this same case, rather than skipping the sync.
+	 */
+	if (realfile->f_mode & FMODE_WRITE) {
+		err = vfs_fsync_range(realfile, start, end, datasync);
+		if (err)
+			return err;
+	}
+
+	upperpath.mnt = aufsng_upper_mnt(pfs);
+	upperpath.dentry = upper;
+	/* read-only: fsync needs no write mode, and O_WRONLY could truncate */
+	upperfile = kernel_file_open(&upperpath, O_RDONLY | O_LARGEFILE,
+				     pfs->creator_cred);
+	if (IS_ERR(upperfile))
+		return PTR_ERR(upperfile);
+	err = vfs_fsync_range(upperfile, start, end, datasync);
+	fput(upperfile);
+	return err;
 }
 
 static int aufsng_flush(struct file *file, fl_owner_t id)
@@ -207,7 +242,7 @@ static long aufsng_fallocate(struct file *file, int mode, loff_t offset,
 	ret = vfs_fallocate(file->private_data, mode, offset, len);
 	revert_creds(old_cred);
 	if (!ret)
-		aufsng_copyattr(inode);
+		aufsng_copyattr_from(inode, file_inode(file->private_data));
 	inode_unlock(inode);
 
 	return ret;
