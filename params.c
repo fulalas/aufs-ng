@@ -162,25 +162,6 @@ static int aufsng_parse_branch_spec(struct fs_context *fc, char *spec,
 	return 0;
 }
 
-static int aufsng_ctx_realloc(void **arr, size_t *cap, size_t need,
-			  size_t elemsize)
-{
-	void *p;
-	size_t nr;
-
-	if (need <= *cap)
-		return 0;
-	nr = max_t(size_t, 16, *cap * 2);
-	if (nr < need)
-		nr = need;
-	p = krealloc_array(*arr, nr, elemsize, GFP_KERNEL_ACCOUNT);
-	if (!p)
-		return -ENOMEM;
-	*arr = p;
-	*cap = nr;
-	return 0;
-}
-
 /* "br:PATH=MODE[:PATH=MODE...]", mount time only */
 static int aufsng_parse_br(struct fs_context *fc, char *value)
 {
@@ -194,8 +175,9 @@ static int aufsng_parse_br(struct fs_context *fc, char *value)
 		if (ctx->nr >= AUFSNG_MAX_STACK)
 			return invalfc(fc, "too many branches, limit is %d",
 				       AUFSNG_MAX_STACK);
-		err = aufsng_ctx_realloc((void **)&ctx->br, &ctx->cap,
-				      ctx->nr + 1, sizeof(*ctx->br));
+		err = aufsng_grow_array((void **)&ctx->br, &ctx->cap,
+				     ctx->nr + 1, sizeof(*ctx->br),
+				     GFP_KERNEL_ACCOUNT);
 		if (err)
 			return err;
 		err = aufsng_parse_branch_spec(fc, tok, &ctx->br[ctx->nr]);
@@ -235,8 +217,9 @@ static int aufsng_parse_add(struct fs_context *fc, char *value)
 		return invalfc(fc, "add=%u: is not supported, only add=1: (top of the read-only stack)",
 			       pos);
 
-	err = aufsng_ctx_realloc((void **)&ctx->dyn_add, &ctx->cap_dyn_add,
-			      ctx->nr_dyn_add + 1, sizeof(*ctx->dyn_add));
+	err = aufsng_grow_array((void **)&ctx->dyn_add, &ctx->cap_dyn_add,
+			     ctx->nr_dyn_add + 1, sizeof(*ctx->dyn_add),
+			     GFP_KERNEL_ACCOUNT);
 	if (err)
 		return err;
 	err = aufsng_parse_branch_spec(fc, colon + 1,
@@ -261,8 +244,9 @@ static int aufsng_parse_del(struct fs_context *fc, char *value)
 	if (err)
 		return err;
 
-	err = aufsng_ctx_realloc((void **)&ctx->dyn_del, &ctx->cap_dyn_del,
-			      ctx->nr_dyn_del + 1, sizeof(*ctx->dyn_del));
+	err = aufsng_grow_array((void **)&ctx->dyn_del, &ctx->cap_dyn_del,
+			     ctx->nr_dyn_del + 1, sizeof(*ctx->dyn_del),
+			     GFP_KERNEL_ACCOUNT);
 	if (err) {
 		path_put(&path);
 		return err;

@@ -83,7 +83,9 @@ or `ro` (read-only). For compatibility, `aufs-ng` also accepts `aufs`'s
 other read-only spelling `rr` (meant for natively read-only filesystems
 like squashfs) and mode suffixes such as `+wh` or `+nolwh` — the
 suffixes are ignored; as in `aufs`, only the base token (`rw` vs
-`ro`/`rr`) decides.
+`ro`/`rr`) decides. A later branch declared `rw` is accepted but demoted
+to read-only, with a warning in the kernel log; `/proc/mounts` reports
+it as `ro`.
 
 - `udba=` — `reval` (the default) shows changes made directly inside a
   branch; `none` skips that detection (faster and safe if branches are
@@ -91,8 +93,9 @@ suffixes are ignored; as in `aufs`, only the base token (`rw` vs
   accepted but behaves as `reval`. Any other value is rejected, as
   original `aufs` rejects it — a typo must not silently disable
   revalidation.
-- `xino=` — where original `aufs` writes its inode-number table; `aufs-ng`
-  keeps inode numbers stable without a table, so this is ignored.
+- `xino=`, `noxino` — where original `aufs` writes its inode-number table,
+  and the switch that turns it off; `aufs-ng` keeps inode numbers stable
+  without a table, so both are ignored.
 - `dirperm1` — makes original `aufs` check only the topmost branch's
   permissions for a directory; `aufs-ng` always behaves that way, so the
   option changes nothing.
@@ -109,7 +112,9 @@ Unlike original `aufs`, removing a branch doesn't fail with `EBUSY`
 just because a file it provides is open (only a memory-mapped one still
 does): an open file keeps working from the removed branch until closed
 — the usual open-files rule — while fresh lookups resolve to a
-surviving branch, if any.
+surviving branch, if any. Same for an object already deleted through the
+union while still held open — a directory (a process's cwd) as much as a
+file: it keeps the removed branch until the last user lets go.
 
 ## On-disk format
 

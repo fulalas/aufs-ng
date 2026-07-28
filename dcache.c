@@ -41,6 +41,7 @@
 #include <linux/namei.h>
 #include <linux/iversion.h>
 #include <linux/cred.h>
+#include <linux/rcupdate.h>
 #include "aufsng.h"
 
 /* fold the upper dir's change signal into one d_fsdata-sized stamp */
@@ -82,7 +83,13 @@ static int aufsng_attrs_valid(struct inode *inode, struct inode *real,
 		return 1;
 	if (flags & LOOKUP_RCU)
 		return -ECHILD;
-	aufsng_copyattr(inode);
+	/*
+	 * @real is the very object aufsng_path_real() would resolve, and the
+	 * one whose drift was just detected: re-deriving it through the
+	 * lockless upper/stack protocol (aufsng_copyattr) would only repeat
+	 * work the caller already did.
+	 */
+	aufsng_copyattr_from(inode, real);
 	return 1;
 }
 
@@ -91,23 +98,34 @@ static int aufsng_attrs_valid(struct inode *inode, struct inode *real,
  * hardlink siblings share one union inode whose single upperdentry
  * holds whichever name was copied up first, so "the inode has an
  * upper" is a per-INODE fact while revalidation needs the per-NAME
- * one.  The reads are unlocked: in RCU walk nothing may block, and a
- * torn read against a concurrent out-of-band branch rename at worst
- * fails the match, sending the caller down the slower per-name gates
- * which re-derive the truth.
+ * one.
+ *
+ * The compare is d_same_name(), the dcache's own: nothing here locks
+ * @upper (RCU walk may not block, and even in ref-walk the pinning
+ * reference stops the dentry from being freed but not from being
+ * RENAMED), so a concurrent d_move() can swap d_name mid-compare -
+ * switching a long external name for the short inline buffer and
+ * kfree_rcu()ing the old one.  d_same_name() survives that by
+ * construction (its dentry_cmp() stops at the NUL that cannot occur in
+ * the search name, and external names are RCU-freed), and it honors a
+ * branch fs's own ->d_compare; a hand-rolled len + memcmp pair does
+ * neither and can read past the inline buffer or into freed memory.
+ * The rcu_read_lock() is what makes the RCU-delayed free enough in
+ * ref-walk too; in RCU walk it just nests.
  */
 static bool aufsng_upper_carries_name(struct inode *dir, struct dentry *upper,
 				      const struct qstr *name)
 {
 	struct dentry *pupper = aufsng_upperdentry(dir);
-	const char *upper_name;
+	bool same;
 
 	if (!pupper || READ_ONCE(upper->d_parent) != pupper)
 		return false;
-	if (READ_ONCE(upper->d_name.len) != name->len)
-		return false;
-	upper_name = READ_ONCE(upper->d_name.name);
-	return !memcmp(upper_name, name->name, name->len);
+
+	rcu_read_lock();
+	same = d_same_name(upper, pupper, name);
+	rcu_read_unlock();
+	return same;
 }
 
 static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
@@ -199,7 +217,7 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 		return -ECHILD;
 
 	old_cred = override_creds(pfs->creator_cred);
-	down_read(&pfs->dyn_lock);
+	percpu_down_read(&pfs->dyn_lock);
 
 	if (!stamp_hit && reval && pupper) {
 		this = aufsng_lookup_once(aufsng_upper_mnt(pfs), pupper, name,
@@ -281,7 +299,7 @@ out_stamp:
 	if (ret)
 		aufsng_store_reval_stamps(dentry, stamp, gen);
 out:
-	up_read(&pfs->dyn_lock);
+	percpu_up_read(&pfs->dyn_lock);
 	revert_creds(old_cred);
 	return ret;
 }

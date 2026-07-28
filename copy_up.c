@@ -270,13 +270,13 @@ out_drop:
  * live upper.
  */
 static int aufsng_copy_up_commit_regular(struct aufsng_fs *pfs,
-				      struct dentry *dentry,
+				      const struct qstr *name,
 				      const struct path *lowerpath,
 				      struct dentry *pupper,
 				      struct dentry *work)
 {
 	struct renamedata rd = {};
-	struct qstr nameq = QSTR_LEN(dentry->d_name.name, dentry->d_name.len);
+	struct qstr nameq = QSTR_LEN(name->name, name->len);
 	struct kstat stat;
 	int err;
 
@@ -343,7 +343,7 @@ static int aufsng_copy_up_commit_regular(struct aufsng_fs *pfs,
  * delete slipped in since.
  */
 static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
-					  struct dentry *dentry,
+					  const struct qstr *name,
 					  const struct path *lowerpath,
 					  struct dentry *pupper,
 					  const struct kstat *stat)
@@ -360,7 +360,7 @@ static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 			return ERR_CAST(link);
 	}
 
-	slot = aufsng_create_slot(pupper, &dentry->d_name);
+	slot = aufsng_create_slot(pupper, name);
 	if (IS_ERR(slot)) {
 		do_delayed_call(&done);
 		return slot;
@@ -403,11 +403,23 @@ static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 		 * temp+rename scheme: a half-attributed object left
 		 * under the real name would be adopted with wrong
 		 * metadata and make every retry fail with EEXIST.
+		 *
+		 * When the compensating removal ALSO fails - likely, since
+		 * whatever broke the metadata (a full or failing branch)
+		 * tends to break this too - the leftover is live under the
+		 * real name with the mounter's ownership and none of the
+		 * lower's xattrs, and no sweep removes it (clear_whiteouts
+		 * only knows ".wh." names).  Report -EIO rather than the
+		 * original errno then: "ENOSPC, nothing changed" would be a
+		 * lie about a branch that now needs the admin.  This is
+		 * AUFS's own escalation in au_cpup_single()'s error path.
 		 */
+		int rerr;
+
 		dput(upper);
-		aufsng_remove_object(pfs, pupper, &dentry->d_name,
-				  S_ISDIR(stat->mode));
-		return ERR_PTR(err);
+		rerr = aufsng_remove_object(pfs, pupper, name,
+					 S_ISDIR(stat->mode));
+		return ERR_PTR(rerr ? -EIO : err);
 	}
 	return upper;
 
@@ -429,12 +441,23 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 	struct kstat stat;
 	struct dentry *upper;
 	struct dentry *work = NULL;
+	struct name_snapshot ns;
 	char tmpbuf[32];
 	struct qstr tmpq;
 	int err;
 
-	if (WARN_ON(!pupper))
-		return -ENOENT;
+	/*
+	 * The caller's walk saw the parent's upper, but nothing pins it
+	 * between that check and this sample: under udba=reval a lookup of
+	 * the parent can shed a just-created upper dir that was removed
+	 * out-of-band (aufsng_dyn_shed_upper), which no lock here excludes.
+	 * -ESTALE, not a WARN: this is reachable from an ordinary open, and
+	 * aufsng_copy_up()'s retry loop re-drives the ancestor walk and
+	 * copies the parent up again - the heal, rather than a panic on the
+	 * panic_on_warn kernels this ships on.
+	 */
+	if (!pupper)
+		return -ESTALE;
 	if (READ_ONCE(oi->upperdentry))
 		return 0;
 	/*
@@ -477,6 +500,23 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 			return PTR_ERR(work);
 	}
 
+	/*
+	 * From here the name is read through a snapshot, exactly as
+	 * aufsng_dyn_prep_repoint() does and for the same reason: neither
+	 * oi->lock nor the caller's locks keep @dentry's d_name stable
+	 * across the sleeping branch operations below.  d_splice_alias() can
+	 * __d_move() a DIRECTORY alias (same-parent __d_unalias takes none
+	 * of the locks held here) when a fresh lookup keys the same cached
+	 * inode - after an out-of-band rename inside the branch, or after a
+	 * failed revalidation unhashed this alias - which rewrites d_name in
+	 * place or kfree_rcu()s the external one.  Worse than a torn read:
+	 * the whiteout re-check, the create and the compensating removal
+	 * would each act on whatever the name happened to be at that
+	 * instant, so a failed copy-up could unlink an unrelated upper
+	 * object.  One snapshot makes all three agree on one string.
+	 */
+	take_dentry_name_snapshot(&ns, dentry);
+
 	/* sb_writers ranks before oi->lock, as in every mutation path */
 	err = mnt_want_write(aufsng_upper_mnt(pfs));
 	if (err)
@@ -510,22 +550,21 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 		err = -ENOENT;
 		goto out;
 	}
-	err = aufsng_check_whiteout(aufsng_upper_mnt(pfs), pupper,
-				 &dentry->d_name);
+	err = aufsng_check_whiteout(aufsng_upper_mnt(pfs), pupper, &ns.name);
 	if (err) {
 		err = err < 0 ? err : -ENOENT;
 		goto out;
 	}
 
 	if (work) {
-		err = aufsng_copy_up_commit_regular(pfs, dentry, &lowerpath,
+		err = aufsng_copy_up_commit_regular(pfs, &ns.name, &lowerpath,
 						 pupper, work);
 		if (err)
 			goto out;
 		upper = work;
 		work = NULL;	/* committed: live under the real name now */
 	} else {
-		upper = aufsng_copy_up_inplace(pfs, dentry, &lowerpath, pupper,
+		upper = aufsng_copy_up_inplace(pfs, &ns.name, &lowerpath, pupper,
 					    &stat);
 		if (IS_ERR(upper)) {
 			err = PTR_ERR(upper);
@@ -549,6 +588,7 @@ out_tmp:
 		aufsng_discard_tmp(pfs, pupper, &tmpq, tmpbuf);
 		dput(work);
 	}
+	release_dentry_name_snapshot(&ns);
 	return err;
 }
 
@@ -601,4 +641,47 @@ int aufsng_copy_up(struct dentry *dentry)
 
 	revert_creds(old_cred);
 	return err;
+}
+
+/*
+ * Copy up @dentry and hand back its upper WITH A REFERENCE - the form
+ * every mutation that then operates on the upper needs.
+ *
+ * aufsng_copy_up() alone is not enough for that: it early-outs the
+ * moment an upper exists, taking no lock, so a caller re-reading
+ * oi->upperdentry afterwards can find the NULL a concurrent
+ * aufsng_dyn_shed_upper() just published (udba=reval, out-of-band
+ * unlink of the rw copy) and dereference it.  Nothing the callers hold
+ * excludes that heal: it runs from a lookup, under the parent's
+ * i_rwsem and only oi->lock.
+ *
+ * So re-read under oi->lock and pin the result; a shed upper stays
+ * parked (and thus valid) until the inode is evicted, so acting on one
+ * shed a moment ago is just the operation landing before the
+ * out-of-band unlink.  Only a genuine NULL loops back into copy-up,
+ * which recreates the upper - the same converge-by-retry protocol
+ * aufsng_copy_up() already uses for -ESTALE.
+ */
+struct dentry *aufsng_copy_up_upper(struct dentry *dentry)
+{
+	struct aufsng_inode *oi = AUFSNG_I(d_inode(dentry));
+	int retries = 0;
+
+	for (;;) {
+		struct dentry *upper;
+		int err = aufsng_copy_up(dentry);
+
+		if (err)
+			return ERR_PTR(err);
+
+		mutex_lock(&oi->lock);
+		upper = oi->upperdentry;
+		if (upper)
+			dget(upper);
+		mutex_unlock(&oi->lock);
+		if (upper)
+			return upper;
+		if (++retries > 3)
+			return ERR_PTR(-ESTALE);
+	}
 }

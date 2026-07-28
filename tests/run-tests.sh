@@ -14,7 +14,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=75; PASS=0; FAIL=0
+	N=0; TOTAL=82; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -398,6 +398,56 @@ guest_main() {
 		|| bad "readdir of pinned dir shows re-merged content"
 	exec 8<&-
 	rm -rf $L3/od
+
+	echo "=== 27. branch removal with a deleted-but-open directory ==="
+	# Test 25's case for a DIRECTORY: a dir provided only by the branch
+	# being removed is rmdir'ed through the union while a process still
+	# holds it open.  rmdir clears its link count, so no fresh lookup
+	# can reach it again - it must take the same pin-only path a
+	# deleted-but-open file takes.  It used to wedge the removal
+	# instead: ENOENT from copy-up's dead-name early-out, or EBUSY
+	# after five futile passes once a parked upper made copy-up a no-op.
+	mkdir -p $L3/dgone
+	$M aufs aufs $U "add=1:$L3=rr" 32 || bad "remount add (deleted-open dir)"
+	test -d $U/dgone || bad "precondition: dgone visible"
+	exec 8<$U/dgone                          # pin the dir with an open fd
+	rmdir $U/dgone                           # delete through the union
+	checkfail "deleted dir gone from union"  test -e $U/dgone
+	$M aufs aufs $U "del=$L3" 32 \
+		&& ok "removal succeeds with deleted-but-open dir" \
+		|| bad "removal succeeds with deleted-but-open dir"
+	exec 8<&-
+	rmdir $L3/dgone 2>/dev/null; rm -f $W/.wh.dgone
+
+	echo "=== 28. lower branch declared rw is demoted, and reported so ==="
+	# AUFS grammar allows "=rw" on any branch; aufs-ng only ever writes
+	# branch 0, so a lower "=rw" is accepted but clamped read-only.
+	# /proc/mounts is the only place branch modes are exposed, so it
+	# must show the mode the branch actually HAS - it used to echo back
+	# the "=rw" that was asked for.
+	mkdir -p /mnt/dw /mnt/dl /mnt/du
+	$M tmpfs tmpfs /mnt/dw; $M tmpfs tmpfs /mnt/dl
+	echo lowerdata > /mnt/dl/lf
+	$M aufs aufs /mnt/du "br:/mnt/dw=rw:/mnt/dl=rw" \
+		&& ok "lower =rw accepted (AUFS grammar)" \
+		|| bad "lower =rw accepted (AUFS grammar)"
+	grep " /mnt/du " /proc/mounts | grep -q '/mnt/dl=ro' \
+		&& ok "/proc/mounts reports the demoted lower as ro" \
+		|| bad "/proc/mounts reports the demoted lower as ro (got: $(grep ' /mnt/du ' /proc/mounts))"
+	echo new > /mnt/du/lf
+	check "write to a lower-=rw name lands in branch 0" grep -q new /mnt/dw/lf
+	check "the demoted lower branch stays untouched"    grep -q lowerdata /mnt/dl/lf
+	$M -u /mnt/du
+
+	echo "=== 29. noxino accepted at mount time (aufs compatibility) ==="
+	# aufs-ng keeps no inode table, so xino=/noxino are accepted and
+	# ignored rather than rejected - real aufs commands carry them.
+	mkdir -p /mnt/nxw /mnt/nxu
+	$M tmpfs tmpfs /mnt/nxw
+	$M aufs aufs /mnt/nxu "br:/mnt/nxw=rw:$L1=ro,noxino" \
+		&& ok "noxino accepted at mount time" \
+		|| bad "noxino accepted at mount time"
+	$M -u /mnt/nxu
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.

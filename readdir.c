@@ -32,6 +32,7 @@
 #include <linux/refcount.h>
 #include <linux/iversion.h>
 #include <linux/rcupdate.h>
+#include <linux/fs_dirent.h>
 #include "aufsng.h"
 
 struct aufsng_cache_entry {
@@ -115,7 +116,79 @@ struct aufsng_readdir_data {
 	struct aufsng_dir_drain dd;
 	struct aufsng_dir_cache *cache;
 	unsigned int idx;	/* branch slot of the layer being read */
+	/* deferred type checks for this layer (see struct aufsng_ino_probe) */
+	struct list_head ino_probes;
 };
+
+/*
+ * An inode-number donation whose type check getdents could not answer:
+ * the lower branch reported DT_UNKNOWN for the name (isofs does so for
+ * every entry, as does ext4 without the filetype feature), so whether
+ * this lower occurrence really is the upper name's copy-up origin - and
+ * may therefore hand it its inode number - is only decidable by looking
+ * the name up in that branch.
+ *
+ * Deferred to just after the branch's drain, because a lookup from
+ * inside iterate_dir() would re-acquire the directory's i_rwsem.
+ * Treating DT_UNKNOWN as "matches anything" instead would let a
+ * type-MISMATCHED lower donate, making readdir's d_ino disagree with
+ * the st_ino lookup computes (aufsng_origin_type_ok() rejects that
+ * lower, so the union inode keeps the upper's number); simply refusing
+ * to donate would be worse still, breaking every genuine copy-up origin
+ * on such a branch.  Nothing is allocated for branches that report real
+ * types, which is every filesystem a live distro layers.
+ */
+struct aufsng_ino_probe {
+	struct list_head node;
+	struct aufsng_cache_entry *e;
+	u64 ino;		/* donated only if the type checks out */
+};
+
+static int aufsng_ino_probe_add(struct list_head *probes,
+			     struct aufsng_cache_entry *e, u64 ino)
+{
+	struct aufsng_ino_probe *pr = kmalloc(sizeof(*pr), GFP_KERNEL);
+
+	if (!pr)
+		return -ENOMEM;
+	pr->e = e;
+	pr->ino = ino;
+	list_add_tail(&pr->node, probes);
+	return 0;
+}
+
+/*
+ * Settle (and free) one branch's deferred donations: hand over the
+ * recorded number only when the branch object really is the same file
+ * type as the upper entry receiving it - the rule
+ * aufsng_origin_type_ok() applies in lookup.  @resolve is false when the
+ * drain itself failed and the cache is about to be discarded; a lookup
+ * error leaves the upper's own number in place, the same conservative
+ * answer a type mismatch gives.
+ */
+static void aufsng_ino_probes_settle(const struct path *realpath,
+				  struct list_head *probes, bool resolve)
+{
+	struct aufsng_ino_probe *pr, *n;
+
+	list_for_each_entry_safe(pr, n, probes, node) {
+		struct qstr q = QSTR_LEN(pr->e->name, pr->e->len);
+		struct dentry *this;
+
+		if (resolve) {
+			this = lookup_one_positive_unlocked(mnt_idmap(realpath->mnt),
+							    &q, realpath->dentry);
+			if (!IS_ERR(this)) {
+				if (fs_umode_to_dtype(d_inode(this)->i_mode) ==
+				    pr->e->d_type)
+					pr->e->ino = pr->ino;
+				dput(this);
+			}
+		}
+		list_del(&pr->node);
+		kfree(pr);
+	}
+}
 
 /* ".wh..wh." double-prefix: opaque marker + AUFS bookkeeping names */
 static bool aufsng_is_wh_bookkeeping(const char *name, int len)
@@ -135,7 +208,8 @@ static int aufsng_cache_entry_cmp(const char *name, int len,
 
 static int aufsng_cache_add(struct aufsng_dir_cache *cache, const char *name,
 			 int namelen, u64 ino, unsigned int d_type,
-			 bool hidden, unsigned int idx)
+			 bool hidden, unsigned int idx,
+			 struct list_head *probes)
 {
 	struct rb_node **newp = &cache->root.rb_node;
 	struct rb_node *parent = NULL;
@@ -184,13 +258,31 @@ static int aufsng_cache_add(struct aufsng_dir_cache *cache, const char *name,
 		if (hidden && !p->hidden && p->idx == idx) {
 			p->hidden = true;
 			cache->nr_visible--;
-		} else if (!p->hidden && !p->ino_fixed && p->idx == 0 &&
-			   idx != 0) {
-			if (!hidden &&
-			    (p->d_type == d_type || p->d_type == DT_UNKNOWN ||
-			     d_type == DT_UNKNOWN))
-				p->ino = aufsng_map_ino(ino, idx);
+		} else if (!p->hidden && !p->ino_fixed && idx != 0) {
+			/*
+			 * @p came from branch 0 - implied by !ino_fixed, which
+			 * is initialized to "idx != 0" and only ever set - so
+			 * this lower occurrence is a candidate origin, and
+			 * settles the number either way.
+			 */
 			p->ino_fixed = true;
+			if (hidden)
+				;	/* whiteout: ends the origin search */
+			else if (d_type == p->d_type)
+				p->ino = aufsng_map_ino(ino, idx);
+			else if (d_type == DT_UNKNOWN && p->d_type != DT_UNKNOWN)
+				/* only the branch itself can tell: defer */
+				return aufsng_ino_probe_add(probes, p,
+						aufsng_map_ino(ino, idx));
+			else if (p->d_type == DT_UNKNOWN)
+				/*
+				 * The UPPER's type is the unknown one, and this
+				 * branch cannot resolve it; branch 0 is a local
+				 * writable fs in every supported configuration
+				 * and does report types, so accept the donation
+				 * rather than pay a second lookup.
+				 */
+				p->ino = aufsng_map_ino(ino, idx);
 		}
 		return 0;
 	}
@@ -236,7 +328,7 @@ static bool aufsng_fill_merge(struct dir_context *ctx, const char *name,
 		int reallen = namelen - AUFSNG_WH_PFX_LEN;
 
 		err = aufsng_cache_add(rdd->cache, real, reallen, 0, 0, true,
-				    rdd->idx);
+				    rdd->idx, &rdd->ino_probes);
 	} else {
 		/*
 		 * Fold the branch slot into the inode number, exactly as the
@@ -249,7 +341,7 @@ static bool aufsng_fill_merge(struct dir_context *ctx, const char *name,
 		 */
 		err = aufsng_cache_add(rdd->cache, name, namelen,
 				    aufsng_map_ino(ino, rdd->idx), d_type,
-				    false, rdd->idx);
+				    false, rdd->idx, &rdd->ino_probes);
 	}
 
 	if (err) {
@@ -300,8 +392,14 @@ static int aufsng_dir_read_layer(struct aufsng_fs *pfs, const struct path *realp
 		.cache = cache,
 		.idx = idx,
 	};
+	int err;
 
-	return aufsng_dir_drain(pfs, realpath, &rdd.dd);
+	INIT_LIST_HEAD(&rdd.ino_probes);
+	err = aufsng_dir_drain(pfs, realpath, &rdd.dd);
+
+	/* the type checks getdents left open, now that no i_rwsem is held */
+	aufsng_ino_probes_settle(realpath, &rdd.ino_probes, !err);
+	return err;
 }
 
 static void aufsng_cache_free(struct aufsng_dir_cache *cache)
@@ -382,7 +480,7 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
 	 * stack this loop touches can be swapped or freed while it
 	 * runs, and the pre-sampled version cannot go stale unseen.
 	 */
-	down_read(&pfs->dyn_lock);
+	percpu_down_read(&pfs->dyn_lock);
 	version = atomic64_read(&AUFSNG_I(inode)->version);
 	old_cred = override_creds(pfs->creator_cred);
 
@@ -432,7 +530,7 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
 
 out:
 	revert_creds(old_cred);
-	up_read(&pfs->dyn_lock);
+	percpu_up_read(&pfs->dyn_lock);
 
 	if (err) {
 		aufsng_cache_free(cache);
@@ -638,11 +736,15 @@ int aufsng_check_empty_dir(struct dentry *dentry)
 		cache = aufsng_cache_build(inode, true);
 		if (IS_ERR(cache))
 			return PTR_ERR(cache);
-		err = cache->nr_visible ? -ENOTEMPTY : 0;
-		aufsng_cache_free(cache);
-		return err;
 	}
 
+	/*
+	 * One verdict-and-release tail for both cases: a freshly built probe
+	 * cache comes back at refcount 1, so the put releases it just as a
+	 * direct free would - without a second copy of the verdict, and
+	 * without bypassing the refcount protocol that keeps a shared cache
+	 * alive.
+	 */
 	err = cache->nr_visible ? -ENOTEMPTY : 0;
 	aufsng_cache_put(cache);
 	return err;
