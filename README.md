@@ -24,7 +24,7 @@ and mount grammar, while providing the following improvements:
 
 - **No kernel patches** — every symbol it uses is a standard, currently
   exported kernel API.
-- **A much smaller surface** — ~4,000 lines, vs. `aufs`'s ~28,000.
+- **A much smaller surface** — ~5,000 lines, vs. `aufs`'s ~28,000.
 - **Modern I/O passthrough** — reads/writes/splice/mmap go through the
   kernel's `backing_file_*` API (the same infrastructure FUSE passthrough
   and `OverlayFS` use) instead of taking a filesystem-wide lock on every
