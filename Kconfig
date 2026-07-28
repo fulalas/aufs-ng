@@ -5,10 +5,9 @@ config AUFSNG_FS
 	help
 	  aufs-ng is a standalone, from-scratch union filesystem
 	  compatible with many live Linux distributions. It registers
-	  as filesystem type
-	  "aufs", using AUFS's own mount option syntax and on-disk
-	  whiteout format, so that scripts issuing real AUFS
-	  mount/remount commands work unmodified.
+	  as filesystem type "aufs", using AUFS's own mount option
+	  syntax and on-disk whiteout format, so that scripts issuing
+	  real AUFS mount/remount commands work unmodified.
 
 	  A live-boot sequence typically needs this filesystem type
 	  mounted before any loadable module can be reached (the same
