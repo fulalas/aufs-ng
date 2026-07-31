@@ -234,7 +234,11 @@ static int aufsng_cache_add(struct aufsng_dir_cache *cache, const char *name,
 	 *   inode number.  A type-mismatched lower is shadowed as an
 	 *   unrelated object (the upper keeps its own ino), and a
 	 *   whiteout ends the origin search - both settle the number
-	 *   for all deeper branches.
+	 *   for all deeper branches.  An upper non-directory that
+	 *   copy-up never marked as a lower's copy is settled before
+	 *   any lower is read (aufsng_cache_fix_unmarked), so it is
+	 *   never a donation candidate to begin with - lookup keys it
+	 *   on itself.
 	 *
 	 * One rbtree descent serves both the find and, on a miss, the
 	 * insert position: every entry of every branch passes through
@@ -402,6 +406,47 @@ static int aufsng_dir_read_layer(struct aufsng_fs *pfs, const struct path *realp
 	return err;
 }
 
+/*
+ * Settle which of the rw branch's own entries may still be handed a
+ * lower's inode number, now that the branch is drained and no i_rwsem
+ * is held.  The rule is aufsng_upper_claims_origin()'s, the same one
+ * lookup applies - an entry it refuses keeps the number branch 0 gave
+ * it, or readdir's d_ino would contradict stat's st_ino, the very
+ * invariant the donation in aufsng_cache_add() exists to hold.
+ *
+ * Directories go through it too: they usually claim, but an opaque one
+ * ends its own merged stack and is keyed on the upper like any
+ * unmarked file.  A failed lookup settles the entry on the upper's
+ * number, the conservative answer.
+ *
+ * Called only with lower branches left to read: with none, no donation
+ * can happen and nothing would ever consult the verdict.
+ */
+static void aufsng_cache_fix_unmarked(struct aufsng_fs *pfs,
+				   const struct path *upperpath,
+				   struct aufsng_dir_cache *cache)
+{
+	struct aufsng_cache_entry *p;
+
+	list_for_each_entry(p, &cache->entries, l_node) {
+		struct qstr q = QSTR_LEN(p->name, p->len);
+		struct dentry *this;
+
+		if (p->hidden)
+			continue;
+
+		this = lookup_one_positive_unlocked(mnt_idmap(upperpath->mnt),
+						    &q, upperpath->dentry);
+		if (IS_ERR(this)) {
+			p->ino_fixed = true;
+			continue;
+		}
+		if (!aufsng_upper_claims_origin(pfs, this, &q))
+			p->ino_fixed = true;
+		dput(this);
+	}
+}
+
 static void aufsng_cache_free(struct aufsng_dir_cache *cache)
 {
 	struct aufsng_cache_entry *p, *n;
@@ -517,6 +562,16 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
 		realpath.mnt = aufsng_upper_mnt(pfs);
 		realpath.dentry = upper;
 		err = aufsng_dir_read_layer(pfs, &realpath, cache, 0);
+		/*
+		 * Only worth settling when a lower is actually going to be
+		 * read: the emptiness probe stops at the first visible
+		 * entry and a directory with no lowers takes no donations,
+		 * so in both cases the verdict would cost a lookup per
+		 * entry and never be consulted.
+		 */
+		if (!err && oe && oe->numlower &&
+		    !(stop_when_visible && cache->nr_visible))
+			aufsng_cache_fix_unmarked(pfs, &realpath, cache);
 	}
 
 	for (i = 0; !err && oe && i < oe->numlower &&

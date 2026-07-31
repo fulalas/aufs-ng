@@ -14,7 +14,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=82; PASS=0; FAIL=0
+	N=0; TOTAL=99; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -449,6 +449,148 @@ guest_main() {
 		|| bad "noxino accepted at mount time"
 	$M -u /mnt/nxu
 
+	# helpers shared by the identity checks below
+	same_ino()  { test "$(stat -c %i "$1")" = "$2"; }
+	# plant a victim binary in a lower branch and exec it through the
+	# union; sets $vpid.  Its name must not be running for the caller's
+	# replacement to be the thing under test, so wait for the exec.
+	# $2, when given, is a second lower name for the same file - made
+	# before the union ever resolves $1, or the union inode caches a
+	# link count of 1 and the shared-inode case is never reached.
+	spawn_victim() {
+		cp "$(command -v sleep)" $L1/bin/$1 && chmod 755 $L1/bin/$1
+		[ -n "${2:-}" ] && ln $L1/bin/$1 $L1/bin/$2
+		$U/bin/$1 60 &
+		vpid=$!
+		sleep 1
+	}
+	reap_victim() { kill $vpid 2>/dev/null; wait $vpid 2>/dev/null; }
+
+	echo "=== 30. re-creating a name over its own running binary ==="
+	# What installpkg does when it unpacks over a binary that is
+	# running: tar unlinks the name, then re-creates it.  The union
+	# inode is keyed by the lower origin, which the re-create resolves
+	# to again, so the removal has to take the dead inode out of the
+	# hash - otherwise the new file inherits it, along with the
+	# deny_write_access() exec took on it, and the first write-open
+	# fails with ETXTBSY leaving behind the empty file ->create() made.
+	spawn_victim runner
+	# without this the whole block passes green when the exec never
+	# happened: the re-create then meets no deny_write_access at all
+	check "the victim binary is running from the union" test -e /proc/$vpid/exe
+	rm -f $U/bin/runner
+	echo newtool > $U/bin/runner 2>/dev/null \
+		&& ok "re-create over a running binary succeeds" \
+		|| bad "re-create over a running binary succeeds"
+	check "the re-created file has its data in the rw branch" \
+		grep -q newtool $W/bin/runner
+	# a reaped-but-unwaited child still answers kill -0, so read the state
+	check "the replaced binary keeps running" \
+		grep -qE '^State:[[:space:]]+[RS]' /proc/$vpid/status
+	reap_victim
+	# clean both branches directly: a last rm through the union would
+	# leave a whiteout behind for whatever test comes next
+	rm -f $L1/bin/runner $W/bin/runner $W/bin/.wh.runner
+
+	echo "=== 31. only a real copy-up inherits a lower's identity ==="
+	# A union inode is keyed by the lower it was copied from, so its
+	# st_ino survives copy-up and cache eviction.  The link is recorded
+	# on the upper by copy-up; sharing a name with a lower does not
+	# earn it.  Guessing it from the name gave a re-created file the
+	# identity of the one it replaced - and with it the write block
+	# exec holds on a running binary.
+	drop_caches() { sync; echo 2 > /proc/sys/vm/drop_caches 2>/dev/null; }
+	# d_ino as getdents reports it, WITHOUT stat'ing the name - the two
+	# must agree, and only a readdir-level read can tell whether they do
+	dino() { python3 -c 'import os,sys
+for e in os.scandir(sys.argv[1]):
+    if e.name == sys.argv[2]: print(e.inode())' "$1" "$2"; }
+	echo lower-cu > $L1/cumark
+	ino_cu=$(stat -c %i $U/cumark)
+	echo copied-up > $U/cumark
+	# the marker is aufs-ng's own bookkeeping: on disk in the rw branch,
+	# and invisible - and unforgeable - through the union
+	getfattr -d -m - $W/cumark 2>/dev/null | grep -q aufs_ng \
+		&& ok "copy-up writes the marker to the rw branch" \
+		|| bad "copy-up writes the marker to the rw branch"
+	getfattr -d -m - $U/cumark 2>/dev/null | grep -q aufs_ng \
+		&& bad "the copy-up marker is hidden from the union" \
+		|| ok "the copy-up marker is hidden from the union"
+	checkfail "the copy-up marker cannot be set through the union" \
+		setfattr -n trusted.aufs_ng.origin -v x $U/cumark
+	drop_caches
+	check "st_ino survives copy-up and a cache drop" same_ino $U/cumark "$ino_cu"
+	rm -f $U/cumark
+	echo re-created > $U/cumark
+	checkfail "a re-created name does not inherit the old identity" \
+		same_ino $U/cumark "$ino_cu"
+	[ "$(dino $U cumark)" = "$(stat -c %i $U/cumark)" ] \
+		&& ok "readdir's d_ino agrees with stat on a re-created name" \
+		|| bad "readdir's d_ino agrees with stat on a re-created name ($(dino $U cumark) vs $(stat -c %i $U/cumark))"
+
+	mkdir -p $L1/opqdir && echo lower > $L1/opqdir/inner
+	rm -rf $U/opqdir && mkdir $U/opqdir
+	drop_caches
+	[ "$(dino $U opqdir)" = "$(stat -c %i $U/opqdir)" ] \
+		&& ok "readdir's d_ino agrees with stat on an opaque dir" \
+		|| bad "readdir's d_ino agrees with stat on an opaque dir ($(dino $U opqdir) vs $(stat -c %i $U/opqdir))"
+
+	# the marker records the NAME it was copied up under, which is what
+	# scopes a per-inode xattr to one name: moving a copied-up file onto
+	# a name a lower also provides must not hand it that lower's identity
+	echo lower-mvt > $L1/mvtarget
+	echo lower-mvs > $L1/mvsrc
+	ino_mvt=$(stat -c %i $U/mvtarget)
+	echo copied-up > $U/mvsrc
+	mv $U/mvsrc $U/mvtarget
+	drop_caches
+	checkfail "a copied-up file moved onto a lower's name keeps its own identity" \
+		same_ino $U/mvtarget "$ino_mvt"
+
+	# ... and neither must a second link to that same copied-up inode
+	echo lower-lnn > $L1/lnname
+	echo lower-lns > $L1/lnsrc
+	ino_lnn=$(stat -c %i $U/lnname)
+	echo copied-up > $U/lnsrc
+	rm -f $U/lnname
+	ln $U/lnsrc $U/lnname
+	drop_caches
+	checkfail "a link onto a lower's name keeps its own identity" \
+		same_ino $U/lnname "$ino_lnn"
+
+	# a lower whose file has two names: the shared union inode stays
+	# reachable through the sibling, so the delete cannot retire it -
+	# what keeps the re-created name off it is that a created file is
+	# keyed on itself and never adopts a lower's identity
+	spawn_victim hardrun hardsib
+	check "the hardlinked binary is running from the union" \
+		test -e /proc/$vpid/exe
+	rm -f $U/bin/hardrun
+	echo newhard > $U/bin/hardrun 2>/dev/null \
+		&& ok "re-create over a running hardlinked binary succeeds" \
+		|| bad "re-create over a running hardlinked binary succeeds"
+	check "the hardlink sibling keeps its own content" \
+		cmp -s $U/bin/hardsib "$(command -v sleep)"
+	reap_victim
+
+	# a name moved over a running binary: the mover is a new object, so
+	# it must not pick up the replaced one's identity when the dentry
+	# is dropped and the name resolved afresh
+	spawn_victim mvold
+	echo replacement > $U/bin/mvnew
+	mv $U/bin/mvnew $U/bin/mvold
+	drop_caches
+	echo later > $U/bin/mvold 2>/dev/null \
+		&& ok "writing to a name moved over a running binary" \
+		|| bad "writing to a name moved over a running binary"
+	reap_victim
+
+	rm -rf $L1/opqdir $W/opqdir $W/.wh.opqdir
+	rm -f $L1/cumark $L1/mvtarget $L1/mvsrc $L1/lnname $L1/lnsrc
+	rm -f $L1/bin/hardrun $L1/bin/hardsib $L1/bin/mvold
+	rm -f $W/cumark $W/mvtarget $W/lnname $W/lnsrc $W/.wh.lnname
+	rm -f $W/bin/hardrun $W/bin/mvold $W/bin/.wh.hardrun
+
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.
 	if [ "$N" != "$TOTAL" ]; then
@@ -657,6 +799,19 @@ host_main() {
 			--enable PROVE_LOCKING \
 			--enable DEBUG_ATOMIC_SLEEP || exit
 	fi
+	# Outside the block above on purpose: it is skipped for a tree an
+	# earlier run already configured, and TMPFS_XATTR defaults to n -
+	# without it the tmpfs branches cannot hold the copy-up marker and
+	# the identity checks fail for a reason that is not aufs-ng's.
+	"$KDIR/scripts/config" --file "$KDIR/.config" \
+		--enable TMPFS_XATTR || exit
+	for t in python3 getfattr setfattr; do
+		command -v "$t" >/dev/null && continue
+		echo "run-tests: the guest runs on this host's root (hostfs) and" >&2
+		echo "run-tests: needs $t for the inode-identity checks." >&2
+		echo "run-tests: install python3 and the attr package." >&2
+		exit 1
+	done
 	make -C "$KDIR" ARCH=um olddefconfig >/dev/null || exit
 	# The integration must have taken effect: otherwise olddefconfig
 	# silently drops the unknown symbol, the kernel builds WITHOUT

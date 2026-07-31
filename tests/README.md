@@ -11,7 +11,10 @@ mutation happens on tmpfs mounts the suite creates itself.
 run-tests.sh
 ```
 
-No root is required.
+No root is required. The guest runs on your own root (via hostfs), so
+it needs `python3` and the `attr` package (`getfattr`/`setfattr`) to be
+installed for the inode-identity checks; the script says so and stops
+if either is missing.
 
 The kernel source tree is looked for as `linux-*/` first in `tests/`,
 then in the `aufs-ng/` folder above it. If neither has one, the latest
