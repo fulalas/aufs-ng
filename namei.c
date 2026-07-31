@@ -249,6 +249,36 @@ int aufsng_merge_dirs(struct aufsng_merge *m, struct aufsng_entry *poe,
 }
 
 /*
+ * May the object @upper provides as @name be keyed on a lower - the
+ * question every caller of aufsng_find_origin_ex() has to answer first,
+ * in ONE place so lookup, readdir, revalidation and branch removal
+ * cannot drift apart (they must not: a disagreement shows up directly
+ * as readdir's d_ino contradicting stat's st_ino).
+ *
+ * No upper at all is a pure lower object and always may.  A directory
+ * may unless it is opaque: it is keyed by its merged stack, which is
+ * why copy-up never marks one - but ".wh..wh..opq" ends that stack, and
+ * lookup then keys it on the upper alone.  Everything else may only if
+ * copy-up recorded it as the copy of the lower called @name - see
+ * AUFSNG_XATTR_ORIGIN.
+ *
+ * @upper must be NULL or positive; a dead one (unhashed by an
+ * out-of-band branch edit, pending the shed heal) has no inode to read.
+ * Must run under creator credentials (the marker lives in "trusted."),
+ * and not from an RCU walk.  A probe that fails answers "no", the
+ * conservative side: the object keeps its own identity.
+ */
+bool aufsng_upper_claims_origin(struct aufsng_fs *pfs, struct dentry *upper,
+			     const struct qstr *name)
+{
+	if (!upper)
+		return true;
+	if (d_is_dir(upper))
+		return aufsng_check_diropq(aufsng_upper_mnt(pfs), upper) == 0;
+	return aufsng_has_origin(pfs, upper, name);
+}
+
+/*
  * Does any lower branch of @dir still visibly provide @name?  The
  * boolean form of aufsng_find_origin() for callers that only need the
  * verdict, not the origin itself.  Returns 1/0, negative errno on
@@ -541,21 +571,30 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 		 * origin (the topmost lower still visibly providing this
 		 * name) is still collected: the union inode is hashed by
 		 * the origin, which keeps the inode - and st_ino -
-		 * stable across copy-up and cache eviction.  A same-named
-		 * lower of a *different* type is not an origin, though: the
-		 * upper is then an independent object shadowing it (e.g. a
-		 * symlink created over a lower regular file), and keying it
-		 * onto the lower's identity would alias two unrelated
-		 * objects of conflicting type - so it is keyed by its upper.
+		 * stable across copy-up and cache eviction.
+		 *
+		 * Only a real copy-up gets that link
+		 * (aufsng_upper_claims_origin): sharing a name with a lower
+		 * is not enough, or a file created over that name's
+		 * whiteout, renamed onto it, or hardlinked to a copied-up
+		 * inode would inherit the identity of the file it replaced.
+		 * A same-named lower of a *different* type is excluded on
+		 * top of that, so a marker that outlived its object (an
+		 * out-of-band swap in the rw branch under udba=reval) still
+		 * cannot alias two conflicting types.
 		 */
 		struct aufsng_path origin = { NULL, NULL };
-		int found;
+		int found = 0;
 
-		found = aufsng_find_origin_ex(poe, &dentry->d_name, NULL,
-					   d_inode(upper)->i_mode, &origin);
-		if (found < 0) {
-			err = found;
-			goto out;
+		if (aufsng_upper_claims_origin(pfs, upper, &dentry->d_name)) {
+			found = aufsng_find_origin_ex(poe, &dentry->d_name,
+						   NULL,
+						   d_inode(upper)->i_mode,
+						   &origin);
+			if (found < 0) {
+				err = found;
+				goto out;
+			}
 		}
 		oe = aufsng_entry_from_origin(found, &origin);
 		if (IS_ERR(oe)) {

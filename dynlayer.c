@@ -1031,8 +1031,19 @@ static struct aufsng_entry *aufsng_dyn_prep_repoint(struct aufsng_fs *pfs,
 
 		take_dentry_name_snapshot(&ns, alias);
 		old_cred = override_creds(pfs->creator_cred);
-		found = aufsng_find_origin_ex(AUFSNG_E(parent), &ns.name,
-					   layer, inode->i_mode, &origin);
+		/*
+		 * The gate a fresh lookup applies, so the two agree.  A
+		 * DEAD upper is passed as none: it carries no readable
+		 * marker (it has no inode at all), and the object is about
+		 * to be served by a lower again anyway - which is exactly
+		 * what re-resolving finds.
+		 */
+		if (aufsng_upper_claims_origin(pfs,
+					    upper_alive ? upper : NULL,
+					    &ns.name))
+			found = aufsng_find_origin_ex(AUFSNG_E(parent),
+						   &ns.name, layer,
+						   inode->i_mode, &origin);
 		revert_creds(old_cred);
 		release_dentry_name_snapshot(&ns);
 		dput(parent);

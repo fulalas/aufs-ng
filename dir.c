@@ -324,14 +324,13 @@ static int aufsng_create_object(struct dentry *dentry,
 	const struct cred *old_cred;
 	struct cred *create_cred = NULL;
 	struct dentry *pupper, *slot, *upper, *made;
-	struct aufsng_path origin = { NULL, NULL };
 	struct aufsng_entry *oe;
 	struct inode *inode;
 	bool is_dir = (a->mode & S_IFMT) == S_IFDIR;
 	char whtmpbuf[NAME_MAX + 1];
 	struct qstr whtmp;
 	int parked = 0;
-	int found;
+	int hides_lower = 0;
 	int err;
 
 	err = aufsng_copy_up(parent);
@@ -350,41 +349,31 @@ static int aufsng_create_object(struct dentry *dentry,
 	}
 
 	/*
-	 * The topmost lower this name would resurface as: a new
-	 * directory over it must be marked opaque, and a new
-	 * non-directory keeps it as the union inode's hash key origin,
-	 * exactly as a copy-up of that lower would - so the keying is
-	 * identical no matter which path created the upper object.
-	 * dyn_lock stays held from this verdict through the mutation
-	 * and the inode hashing that consume it, so a concurrent
-	 * branch add/remove cannot invalidate either the opaque/keying
-	 * decision or the origin's branch pinning in between.
+	 * Would a lower resurface under this name?  Only a new DIRECTORY
+	 * cares - it must hide it with an opaque marker.  Nothing created
+	 * here is ever a copy-up, so nothing takes a lower into its stack
+	 * or sets AUFSNG_XATTR_ORIGIN: a new object is keyed by itself.
+	 * (->create only ever runs on a negative dentry, so a lower
+	 * providing this name means the upper whites it out - the
+	 * delete-then-recreate case, which used to hand the new file the
+	 * deleted one's identity.)  dyn_lock stays held from the verdict
+	 * through the mutation that consumes it, so a concurrent branch
+	 * add/remove cannot invalidate it in between.
 	 */
 	percpu_down_read(&pfs->dyn_lock);
-	found = aufsng_find_origin(AUFSNG_I_E(dir), &dentry->d_name, &origin);
-	if (found < 0) {
-		err = found;
-		goto out_creds;
-	}
-	/*
-	 * A same-named lower of a different type is not this object's
-	 * copy-up origin (e.g. creating a symlink where a lower regular
-	 * file exists); the new upper shadows it as an independent object
-	 * and must be keyed by itself, not aliased onto the lower's
-	 * identity.  Directory creates use @found only for opaque marking,
-	 * which is type-independent, so this is scoped to non-directories.
-	 */
-	if (!is_dir && found && !aufsng_origin_type_ok(origin.dentry, a->mode)) {
-		dput(origin.dentry);
-		origin.dentry = NULL;
-		found = 0;
+	if (is_dir) {
+		hides_lower = aufsng_lower_covers(dir, &dentry->d_name);
+		if (hides_lower < 0) {
+			err = hides_lower;
+			goto out_creds;
+		}
 	}
 
 	parked = aufsng_park_whiteout(pfs, pupper, &dentry->d_name,
 				   &whtmp, whtmpbuf);
 	if (parked < 0) {
 		err = parked;
-		goto out_origin;
+		goto out_creds;
 	}
 
 	slot = aufsng_create_slot(pupper, &dentry->d_name);
@@ -424,7 +413,7 @@ static int aufsng_create_object(struct dentry *dentry,
 	upper = dget(slot);
 	end_dirop(slot);
 
-	if (is_dir && found) {
+	if (hides_lower) {
 		err = aufsng_mark_diropq(pfs, upper);
 		if (err) {
 			dput(upper);
@@ -432,15 +421,11 @@ static int aufsng_create_object(struct dentry *dentry,
 		}
 	}
 
-	/*
-	 * A directory create marks the upper opaque instead of keying it on
-	 * the lower (see above), so it never takes the origin into its
-	 * stack; the reference is dropped at out_origin either way.
-	 */
-	oe = aufsng_entry_from_origin(!is_dir && found, &origin);
-	if (IS_ERR(oe)) {
+	/* a new object is keyed by itself: no lower in its stack */
+	oe = aufsng_alloc_entry(0);
+	if (!oe) {
 		dput(upper);
-		err = PTR_ERR(oe);
+		err = -ENOMEM;
 		goto out_remove;
 	}
 	inode = aufsng_get_inode(dentry->d_sb, upper, oe);
@@ -466,8 +451,6 @@ out_unpark:
 	if (parked)
 		aufsng_unpark_whiteout(pfs, pupper, &dentry->d_name, &whtmp,
 				    err != 0);
-out_origin:
-	dput(origin.dentry);
 out_creds:
 	percpu_up_read(&pfs->dyn_lock);
 	revert_creds(old_cred);
@@ -759,7 +742,50 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 			clear_nlink(inode);
 	} else if (real_removed) {
 		drop_nlink(inode);
+	} else if (!upper) {
+		/*
+		 * A lower-only name.  No real link went away, but if that
+		 * lower had only this one, the single way this union inode
+		 * could be reached just did, so it is as dead as a
+		 * really-removed one.  (The other whiteout-only case - a
+		 * copied-up hardlink sibling's other name, the -ENOENT arm
+		 * above - keeps an upper and is excluded here; its inode is
+		 * still reachable through the name that was copied up.)
+		 *
+		 * Ask the lower itself, not the union inode's mirror of it:
+		 * the mirror is only refreshed when something notices the
+		 * attributes drift, so under udba=reval a link made directly
+		 * in the branch after this inode was cached would leave it
+		 * reading 1 while a sibling name resolves to it - and
+		 * retiring it would strip the sibling of its inode.
+		 */
+		struct inode *real = aufsng_inode_real(inode);
+
+		if (real && real->i_nlink <= 1)
+			clear_nlink(inode);
 	}
+
+	/*
+	 * The last name is gone: take the union inode out of the inode hash.
+	 *
+	 * The hash key is the copy-up origin - the topmost lower providing
+	 * the name - and aufsng_create_object() re-derives that origin by
+	 * name, so without this a re-create of the same name hands the NEW
+	 * file the dead inode of the one just deleted, along with everything
+	 * the VFS still holds against it.  Most visibly a running executable:
+	 * exec takes deny_write_access() on the union inode, so the first
+	 * write-open of the replacement fails with ETXTBSY and leaves behind
+	 * the empty file ->create() had already made - which is what
+	 * unpacking a package over its own running binaries produced.  A real
+	 * filesystem gives the re-created name a new inode; so must this one.
+	 *
+	 * Eviction is not enough on its own: it unhashes only once the last
+	 * reference is dropped, and the deleted object still being open (or
+	 * still executing) is precisely the case that needs this.
+	 */
+	if (!inode->i_nlink)
+		remove_inode_hash(inode);
+
 	atomic64_inc(&AUFSNG_I(dir)->version);
 	aufsng_copyattr(dir);
 
@@ -1020,6 +1046,7 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 			       new->d_name.len, new->d_name.name, opqerr);
 	}
 
+	/* the copy-up marker is per-name: a rename stops matching it */
 	atomic64_inc(&AUFSNG_I(olddir)->version);
 	if (newdir != olddir)
 		atomic64_inc(&AUFSNG_I(newdir)->version);

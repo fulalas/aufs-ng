@@ -105,10 +105,12 @@ static int aufsng_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 }
 
 /*
- * Unlike overlayfs, AUFS reserves no xattr namespace for its own
- * bookkeeping (whiteouts and the opaque marker are plain files, not
- * xattrs - see namei.c/dir.c), so xattr passthrough needs no
- * filtering here.
+ * Whiteouts and the opaque marker are plain files, not xattrs (see
+ * namei.c/dir.c), exactly as in AUFS - so all the passthrough below has
+ * to filter out is aufs-ng's own xattr namespace (AUFSNG_XATTR_PFX).
+ * Nothing in it may show up in a listing, be readable or writable
+ * through the union, or ride along on a cp -a into a file that was
+ * never copied up.
  */
 static ssize_t aufsng_listxattr(struct dentry *dentry, char *list, size_t size)
 {
@@ -116,13 +118,33 @@ static ssize_t aufsng_listxattr(struct dentry *dentry, char *list, size_t size)
 	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
 	const struct cred *old_cred;
 	struct path realpath;
+	char *from, *to, *end;
 	ssize_t res;
 
 	aufsng_path_real(inode, &realpath);
 	old_cred = override_creds(pfs->creator_cred);
 	res = vfs_listxattr(realpath.dentry, list, size);
 	revert_creds(old_cred);
-	return res;
+	/*
+	 * A size probe (@list NULL) may over-report by the marker's
+	 * length; the buffered call below then returns the real, shorter
+	 * length.  Reporting a bound that is too large is what the VFS
+	 * expects here, and what overlayfs's ovl_listxattr does too.
+	 */
+	if (res <= 0 || !list)
+		return res;
+
+	for (from = list, to = list, end = list + res; from < end;) {
+		size_t len = strlen(from) + 1;
+
+		if (!aufsng_is_private_xattr(from)) {
+			if (to != from)
+				memmove(to, from, len);
+			to += len;
+		}
+		from += len;
+	}
+	return to - list;
 }
 
 static int aufsng_xattr_get(const struct xattr_handler *handler,
@@ -133,6 +155,9 @@ static int aufsng_xattr_get(const struct xattr_handler *handler,
 	const struct cred *old_cred;
 	struct path realpath;
 	int res;
+
+	if (aufsng_is_private_xattr(name))
+		return -ENODATA;
 
 	aufsng_path_real(inode, &realpath);
 	old_cred = override_creds(pfs->creator_cred);
@@ -152,6 +177,10 @@ static int aufsng_xattr_set(const struct xattr_handler *handler,
 	const struct cred *old_cred;
 	struct dentry *upper;
 	int err;
+
+	/* forging it would let a file claim another's identity */
+	if (aufsng_is_private_xattr(name))
+		return -EPERM;
 
 	/* pinned: a concurrent shed-upper heal must not NULL it under us */
 	upper = aufsng_copy_up_upper(dentry);

@@ -95,7 +95,8 @@ it as `ro`.
   revalidation.
 - `xino=`, `noxino` — where original `aufs` writes its inode-number table,
   and the switch that turns it off; `aufs-ng` keeps inode numbers stable
-  without a table, so both are ignored.
+  without a table (see [on-disk format](#on-disk-format)), so both are
+  ignored.
 - `dirperm1` — makes original `aufs` check only the topmost branch's
   permissions for a directory; `aufs-ng` always behaves that way, so the
   option changes nothing.
@@ -147,6 +148,21 @@ during an operation, same as in `aufs`. They are never visible in the
 union, and any leftovers after a crash are harmless and get removed
 together with their directory (a non-empty leftover directory needs
 removing by hand, as in `aufs`).
+
+`aufs-ng` writes one thing `aufs` does not. A file copied into the
+writable branch gets a `trusted.aufs_ng.origin` xattr naming the file it
+was copied from. That is what keeps its inode number the same afterwards
+— the job `aufs` uses its `xino` tables for. It is hidden from the union
+and changes nothing about the whiteout format above.
+
+Only a real copy gets it. A file that merely ends up with the same name
+as one in a lower branch — created after that name was deleted, moved
+onto it, or hard-linked to a copy — is a different file and gets its own
+inode number, as on any normal filesystem.
+
+A writable branch that cannot store xattrs still works. Files copied up
+there just get a new inode number once the kernel drops them from its
+cache, and the log says so once. (`OverlayFS` refuses to mount at all.)
 
 ## Trade-offs
 

@@ -242,6 +242,12 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 			 * per-path split brain until eviction.  Drop the
 			 * dentry so a fresh lookup rebuilds the upper-only
 			 * view, exactly as aufsng_lookup() would resolve it.
+			 *
+			 * Nor is an upper that claims no copy-up origin: this
+			 * one appeared out of band, so nothing marked it, and
+			 * adopting it would keep the cached inode keyed on a
+			 * lower that a fresh lookup - and readdir's d_ino -
+			 * would no longer use.  Same remedy, same reason.
 			 */
 			bool adopt = aufsng_origin_type_ok(this, inode->i_mode);
 
@@ -255,6 +261,16 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 					goto out;
 				}
 				adopt = !opq;
+			} else if (adopt) {
+				/*
+				 * The directory arm above is what
+				 * aufsng_upper_claims_origin() would answer
+				 * for a directory, kept open-coded so a
+				 * failed probe can keep the dentry and
+				 * re-probe rather than drop it.
+				 */
+				adopt = aufsng_upper_claims_origin(pfs, this,
+								name);
 			}
 			if (adopt)
 				ret = aufsng_dyn_adopt_upper(inode,

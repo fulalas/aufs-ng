@@ -42,6 +42,36 @@
 #define AUFSNG_WH_DIROPQ		".wh..wh..opq"
 #define AUFSNG_WH_MODE		0444
 
+/*
+ * The one piece of bookkeeping AUFS itself has no on-disk equivalent
+ * for (it keeps the same knowledge in its xino tables instead): an
+ * xattr set on an upper non-directory by copy-up, holding the NAME the
+ * object was copied up under - "the lower called this is what I was
+ * copied from".
+ *
+ * A union inode is keyed by that lower so its st_ino survives copy-up
+ * and cache eviction, and only a real copy-up may claim the link.  A
+ * file that merely happens to share a name with a lower - created over
+ * a whiteout, or renamed onto the name - is an independent object and
+ * gets its own identity, the way it would on any real filesystem.
+ * Guessing the link from the name instead handed such a file the
+ * deleted one's inode, including the write block exec puts on a
+ * running binary (ETXTBSY on the first write to its replacement).
+ *
+ * The name is what makes the claim per-NAME on a per-inode xattr, and
+ * nothing else would: link(2) gives a second name to the very inode
+ * copy-up marked, and rename gives that inode a name it was never
+ * copied up under.  Both then stop matching, with no cleanup pass to
+ * get wrong - and a rename of one hardlink cannot silently revoke its
+ * siblings' claim either.
+ *
+ * "trusted." keeps it out of reach of unprivileged users, and the
+ * handlers in inode.c hide it from the union so it never leaks into a
+ * listing or a cp -a.
+ */
+#define AUFSNG_XATTR_PFX	"trusted.aufs_ng."
+#define AUFSNG_XATTR_ORIGIN	AUFSNG_XATTR_PFX "origin"
+
 enum aufsng_br_perm {
 	AUFSNG_BR_RW,
 	AUFSNG_BR_RO,	/* "ro"/"rr": read-only, never written to */
@@ -370,6 +400,18 @@ static inline bool aufsng_is_wh_name(const char *name, int len)
 }
 
 /*
+ * Is @name in aufs-ng's own xattr namespace?  Nothing in it is ever
+ * exposed through the union or copied up from a branch.  The test is on
+ * the namespace, not the one name in it today, so a branch that once
+ * WAS a rw branch (a squashfs module built from one) cannot smuggle any
+ * of this bookkeeping into a new upper.
+ */
+static inline bool aufsng_is_private_xattr(const char *name)
+{
+	return !strncmp(name, AUFSNG_XATTR_PFX, sizeof(AUFSNG_XATTR_PFX) - 1);
+}
+
+/*
  * Build the on-disk whiteout name ".wh.<name>" into @buf (which must
  * hold at least NAME_MAX + 1 bytes).  The single definition of the
  * format shared by lookup, mutation and readdir.  A name too long to
@@ -546,6 +588,8 @@ static inline int aufsng_find_origin(struct aufsng_entry *poe,
 	return aufsng_find_origin_ex(poe, name, NULL, 0, out);
 }
 int aufsng_lower_covers(struct inode *dir, const struct qstr *name);
+bool aufsng_upper_claims_origin(struct aufsng_fs *pfs, struct dentry *upper,
+			     const struct qstr *name);
 
 /* inode.c */
 extern const struct inode_operations aufsng_dir_inode_operations;
@@ -557,6 +601,8 @@ extern const struct xattr_handler * const aufsng_xattr_handlers[];
 /* copy_up.c */
 int aufsng_copy_up(struct dentry *dentry);
 struct dentry *aufsng_copy_up_upper(struct dentry *dentry);
+bool aufsng_has_origin(struct aufsng_fs *pfs, struct dentry *upper,
+		    const struct qstr *name);
 
 /* dir.c */
 int aufsng_create(struct mnt_idmap *idmap, struct inode *dir,

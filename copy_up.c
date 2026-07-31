@@ -67,6 +67,9 @@ static int aufsng_copy_xattr(struct aufsng_fs *pfs, const struct path *oldpath,
 
 	for (name = buf; list_size;
 	     list_size -= strlen(name) + 1, name += strlen(name) + 1) {
+		/* our own bookkeeping is never inherited; the commit sets it */
+		if (aufsng_is_private_xattr(name))
+			continue;
 retry:
 		size = vfs_getxattr(old_idmap, oldpath->dentry, name, value,
 				    value_size);
@@ -109,6 +112,48 @@ out:
 	kvfree(value);
 	kvfree(buf);
 	return err;
+}
+
+/*
+ * Record on @upper that the lower called @name is its copy-up origin.
+ *
+ * Best effort: a branch fs that will not hold the xattr simply leaves
+ * the object unmarked, which costs it a stable st_ino across cache
+ * eviction and nothing else - far better than failing the copy-up over
+ * bookkeeping.  Unlike the cp -a of a lower's own xattrs above, though,
+ * EOPNOTSUPP is not silently fine here: it means every copy-up on this
+ * branch loses that stability, which the admin should hear about.  One
+ * line for the module either way - the condition is per rw branch, and
+ * a mount has exactly one.
+ */
+static void aufsng_mark_origin(struct aufsng_fs *pfs, struct dentry *upper,
+			    const struct qstr *name)
+{
+	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	int err = vfs_setxattr(idmap, upper, AUFSNG_XATTR_ORIGIN,
+			       name->name, name->len, 0);
+
+	if (err)
+		pr_warn_once("aufs (aufs-ng): rw branch cannot hold the copy-up marker (%d); copied-up files get a fresh st_ino when their dentry is evicted\n",
+			     err);
+}
+
+/*
+ * Was @upper copied up under @name?  The stored name is what scopes an
+ * inode-wide xattr to one name: a second link to the same inode, or the
+ * same inode carrying a name it was renamed to, does not match and so
+ * claims no origin.  A value that does not fit @buf comes back as
+ * -ERANGE and fails the compare, like any other mismatch.
+ */
+bool aufsng_has_origin(struct aufsng_fs *pfs, struct dentry *upper,
+		    const struct qstr *name)
+{
+	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	char buf[NAME_MAX];
+	ssize_t len;
+
+	len = vfs_getxattr(idmap, upper, AUFSNG_XATTR_ORIGIN, buf, sizeof(buf));
+	return len == name->len && !memcmp(buf, name->name, len);
 }
 
 static int aufsng_set_attr_from(struct aufsng_fs *pfs, struct dentry *upper,
@@ -298,6 +343,9 @@ static int aufsng_copy_up_commit_regular(struct aufsng_fs *pfs,
 	if (err)
 		return err;
 
+	/* before the rename: the name never appears unmarked */
+	aufsng_mark_origin(pfs, work, name);
+
 	/*
 	 * No whiteout can sit at the target: the name was visible to
 	 * the lookup that triggered this copy-up (a whiteout would
@@ -397,6 +445,13 @@ static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 	err = aufsng_copy_xattr(pfs, lowerpath, upper);
 	if (!err)
 		err = aufsng_set_attr_from(pfs, upper, stat);
+	/*
+	 * Directories are keyed by their merged stack, not by an origin,
+	 * so nothing ever reads a marker on one - leave it off rather
+	 * than carry a claim no code path honours.
+	 */
+	if (!err && !S_ISDIR(stat->mode))
+		aufsng_mark_origin(pfs, upper, name);
 	if (err) {
 		/*
 		 * Same cleanup duty the regular-file path gets from its
