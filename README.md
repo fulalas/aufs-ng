@@ -87,8 +87,7 @@ other read-only spelling `rr` (meant for natively read-only filesystems
 like squashfs) and mode suffixes such as `+wh` or `+nolwh` — the
 suffixes are ignored; as in `aufs`, only the base token (`rw` vs
 `ro`/`rr`) decides. A later branch declared `rw` is accepted but demoted
-to read-only, with a warning in the kernel log; `/proc/mounts` reports
-it as `ro`.
+to read-only, with a warning in the kernel log.
 
 - `udba=` — `reval` (the default) shows changes made directly inside a
   branch; `none` skips that detection (faster and safe if branches are
@@ -108,9 +107,15 @@ it as `ro`.
 
 On remount, unknown options are silently ignored; at mount time,
 options outside the list above — including `aufs` options `aufs-ng`
-doesn't implement, such as `dirs=` — are rejected. Unlike original
-`aufs`, there is no `/sys/fs/aufs` tree; the branch list appears
-directly in `/proc/mounts`.
+doesn't implement, such as `dirs=` — are rejected.
+
+`/proc/mounts` shows the mount id (`si=`) and the options, not the
+branch list — same as original `aufs`, which only prints the list when
+its `/sys/fs/aufs` tree is switched off. The line has to stay short:
+with hundreds of branches a full list runs past 4 KB, and tools that
+read `/proc/self/mountinfo` line by line into a fixed buffer then fail.
+`aufs-ng` has no `/sys/fs/aufs` tree either, so the branch list is not
+exposed to userspace.
 
 Unlike original `aufs`, removing a branch doesn't fail with `EBUSY`
 just because a file it provides is open (only a memory-mapped one still

@@ -1,41 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Runtime branch add/remove for aufs-ng ("add=N:PATH=MODE" /
- * "del=PATH" on remount), matching AUFS semantics.
+ * Runtime branch add/remove ("add=N:PATH=MODE" / "del=PATH" on
+ * remount), matching AUFS semantics.
  *
- *  - Branches are allocated one by one and never moved or freed before
- *    umount, so their addresses stay stable for the mount's lifetime
- *    (aufsng_entry stacks reference them by pointer); only the slot
- *    TABLE grows, and freed slots (mnt == NULL) are reused first.
+ *  - Branches are never moved or freed before umount (entries point at
+ *    them); only the slot table grows, freed slots are reused first.
  *
- *  - A new branch is inserted at the front of the root's lowerstack
- *    (matching AUFS's "add=1:" - always immediately below branch 0),
- *    so the most recently added branch has top priority.  Only N=1 is
- *    supported - the in-place splice below and its blocked/unhash
- *    verdicts assume the added branch is the new TOP lower - and the
- *    parser rejects any other index (real live-distro usage only ever
- *    specifies N=1).
+ *  - A new branch goes to the front of the root's lowerstack, so the
+ *    newest wins.  Only N=1 is supported: the splice below assumes the
+ *    added branch is the new TOP lower.
  *
- *  - Both add and remove update every cached directory surgically, in
- *    place, under dyn_lock held for writing: no dentry is ever
- *    invalidated by a branch change, so pinned dentries (open fds,
- *    process CWDs) and nested mounts under the union survive intact -
- *    a d_invalidate-driven refresh would detach the mounts and strand
- *    fd-based re-resolution (firejail, fusermount) with ESTALE.
+ *  - Add and remove update every cached directory in place under
+ *    dyn_lock(write), so no dentry is ever invalidated: pinned
+ *    dentries and nested mounts survive, where a d_invalidate refresh
+ *    would detach the mounts and strand fd-based re-resolution.
  *
- *  - Directory aliasing prevention: a cached directory inode is
- *    re-keyed in the inode hash whenever its top lower changes, so a
- *    fresh lookup finds the pinned inode instead of allocating an
- *    alias.
+ *  - A cached directory inode is re-keyed whenever its top lower
+ *    changes, so a fresh lookup finds it instead of an alias.
  *
- *  - Superseded per-directory stacks are parked on the inode (with
- *    the removed branch's mount pinned) until the inode is evicted,
- *    not freed after a single synchronize_rcu(): an in-flight
- *    getattr/permission may still be dereferencing them.
+ *  - Superseded stacks are parked on the inode until eviction, not
+ *    freed after one synchronize_rcu(): an in-flight getattr may still
+ *    be dereferencing them.
  *
- *  - Removal's busy-scan uses evict_inodes() (one sb-wide pass) after
- *    shrink_dcache_sb(), not a per-inode evict-and-restart loop that
- *    is effectively quadratic in cached inode count.
+ *  - The removal scan uses one sb-wide evict_inodes() pass, not a
+ *    per-inode evict-and-restart loop quadratic in cached inodes.
  */
 
 #include <linux/fs.h>
@@ -54,10 +42,9 @@ static inline struct inode *aufsng_root_inode(struct super_block *sb)
 }
 
 /*
- * Swap the root dentry's aufsng_entry.  Caller must hold the root inode
- * lock and pfs->dyn_lock for writing.  Returns the old entry, which
- * the caller must free with aufsng_free_entry() after all possible
- * readers are done (readers hold pfs->dyn_lock for reading).
+ * Swap the root dentry's entry, under the root inode lock and
+ * dyn_lock(write).  The returned old entry is freed by the caller once
+ * every possible reader is done.
  */
 static struct aufsng_entry *aufsng_dyn_swap_root(struct super_block *sb,
 					   struct aufsng_entry *new_oe)
@@ -65,12 +52,7 @@ static struct aufsng_entry *aufsng_dyn_swap_root(struct super_block *sb,
 	struct inode *inode = aufsng_root_inode(sb);
 	struct aufsng_entry *old_oe = AUFSNG_I_E(inode);
 
-	/*
-	 * Release-publish: lockless readers (aufsng_path_real() via
-	 * getattr, get_link, copy-up) load the pointer with READ_ONCE
-	 * and no dyn_lock, so the entry's freshly written contents must
-	 * be ordered before the pointer store.
-	 */
+	/* Release-publish: lockless readers load the pointer with READ_ONCE */
 	smp_store_release(&AUFSNG_I(inode)->oe, new_oe);
 	/* force the merged readdir cache of the root to be rebuilt */
 	atomic64_inc(&AUFSNG_I(inode)->version);
@@ -81,18 +63,15 @@ static struct aufsng_entry *aufsng_dyn_swap_root(struct super_block *sb,
 static void aufsng_dyn_drop_neg_children(struct inode *inode);
 
 /*
- * Fill @pk and link it onto @oi's parked list: @oe is the superseded
- * stack the node OWNS (freed at eviction; NULL for a pin-only node),
- * @upper the superseded upper it owns, and @mnt_src the stack whose
- * branch mounts it must PIN - every mount a parked stack's dentries
- * point into has to outlive the branch's kern_unmount(), or the branch
- * is torn down under them ("Dentry still in use" on umount).
+ * Fill @pk and link it onto @oi's parked list: @oe is the stack the
+ * node OWNS (NULL for a pin-only node), @upper the superseded upper it
+ * owns, @mnt_src the stack whose mounts it must PIN - they have to
+ * outlive the branch's kern_unmount().
  *
- * Owned stack and pinned stack are separate parameters on purpose: a
- * pin-only node leaves the inode's LIVE stack in place and only pins its
- * mounts, so passing that stack as @oe would have eviction dput and free
- * a stack still in use.  @pk must have room for @mnt_src's lowers.
- * Caller holds oi->lock.
+ * Owned and pinned are separate on purpose: a pin-only node leaves the
+ * LIVE stack in place, so passing it as @oe would have eviction free a
+ * stack still in use.  @pk has room for @mnt_src's lowers.  Caller
+ * holds oi->lock.
  */
 static void aufsng_dyn_park_fill(struct aufsng_inode *oi,
 			      struct aufsng_dyn_parked *pk,
@@ -112,13 +91,11 @@ static void aufsng_dyn_park_fill(struct aufsng_inode *oi,
 }
 
 /*
- * Park the inode's current upper on the dyn_parked list - a lockless
- * aufsng_path_real() reader may still hold a pointer to it until the
- * inode is evicted - and publish @new_upper (NULL sheds the upper so
- * the top lower resurfaces), refreshing the mirrored attributes and
- * the merged-readdir version to follow the new top real object.  A
- * pin-only node (no mounts): a bare upper points into branch 0, which
- * outlives every inode.  Returns false on allocation failure, with
+ * Park the current upper - a lockless reader may hold a pointer until
+ * eviction - and publish @new_upper (NULL sheds it so the top lower
+ * resurfaces), refreshing the mirrored attributes and the readdir
+ * version.  The node pins no mounts: a bare upper points into branch
+ * 0, which outlives every inode.  False on allocation failure, with
  * nothing changed.  Caller holds oi->lock.
  */
 static bool aufsng_dyn_park_upper(struct aufsng_inode *oi, struct inode *inode,
@@ -137,21 +114,16 @@ static bool aufsng_dyn_park_upper(struct aufsng_inode *oi, struct inode *inode,
 }
 
 /*
- * With dynamic branches, an object may be looked up again while an
- * older union inode for it is still cached and pinned: branch changes
- * reorder priorities, so the top lower (the inode hash key) of a
- * fresh lookup can differ from the one the cached inode was created
- * with, temporarily aliasing the object.  Heal it by adopting the new
- * upper instead of failing the lookup with ESTALE.  An object's rw
- * copy can also be replaced (rmdir+mkdir, or write-tmp-and-rename
- * saves, at the same path) so its upper resolves to a different
- * inode; adopt the fresh one, park the superseded upper for a
- * lockless aufsng_path_real() reader (dropped at eviction), bump the
- * version so a directory's merged listing is rebuilt, and drop cached
- * negative children so a name the new upper provides re-resolves.
- * The one adopt-or-park state machine below serves the branch-change
- * path, lookup's ESTALE heal (aufsng_get_inode()) and udba=reval's
- * positive-dentry revalidation (dcache.c) alike.
+ * An object can be looked up again while an older union inode for it
+ * is still pinned: a branch change reorders priorities, so a fresh
+ * lookup's key may differ from the cached inode's.  Heal by adopting
+ * the new upper instead of returning ESTALE.
+ *
+ * An rw copy can also be replaced at the same path, so its upper is a
+ * different inode: adopt that, park the superseded upper for lockless
+ * readers, bump the version to rebuild a merged listing, and drop
+ * cached negative children.  This one state machine serves the branch
+ * change, lookup's ESTALE heal and udba=reval revalidation alike.
  */
 bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 			 struct dentry *upperdentry)
@@ -164,11 +136,7 @@ bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 
 	if (!upperdentry || d_is_negative(upperdentry))
 		return false;
-	/*
-	 * A replacement of a different file type is never adopted: the
-	 * cached inode's ops were fixed at its type, so that falls
-	 * through to ESTALE at the caller.
-	 */
+	/* A different file type is never adopted: the ops are fixed at the type */
 	if (!aufsng_origin_type_ok(upperdentry, inode->i_mode))
 		return false;
 	if (is_dir && (!lowerdentry || !d_is_dir(lowerdentry)))
@@ -177,10 +145,9 @@ bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 	mutex_lock(&oi->lock);
 	oe = oi->oe;
 	/*
-	 * For directories the top-lower identity must match, keeping
-	 * this from grafting an unrelated directory onto the inode.
-	 * Non-directories are already identified by the inode hash key
-	 * (their lower origin), so no extra match is needed.
+	 * Directories must match on the top lower, or an unrelated one
+	 * could be grafted on; non-directories are already identified by
+	 * the hash key.
 	 */
 	if (is_dir && !(oe && oe->numlower &&
 			d_inode(oe->lowerstack[0].dentry) ==
@@ -208,16 +175,12 @@ out:
 }
 
 /*
- * Shed a DEAD upper (unhashed or turned negative by an out-of-band
- * unlink/rename in the rw branch) from a lower-backed inode, so the
- * lower resurfaces exactly as udba=reval promises.  Keeping it would
- * serve the deleted upper's content forever and route write opens into
- * the unlinked inode (they skip copy-up while upperdentry is set).
- * The upper is parked, not dropped: a lockless aufsng_path_real()
- * reader may still hold a pointer to it until the inode is evicted.
- * Returns false if the upper turned out to be alive after all (the
- * caller's unlocked read raced a re-adopt) or on allocation failure -
- * the caller then falls back to its no-heal path.
+ * Shed a DEAD upper - one an out-of-band unlink/rename killed - from a
+ * lower-backed inode, so the lower resurfaces as udba=reval promises.
+ * Keeping it would serve the deleted content forever and route write
+ * opens into the unlinked inode.  Parked, not dropped: a lockless
+ * reader may hold a pointer until eviction.  False if the upper was
+ * alive after all, or on allocation failure.
  */
 bool aufsng_dyn_shed_upper(struct inode *inode)
 {
@@ -246,12 +209,9 @@ bool aufsng_dyn_shed_upper(struct inode *inode)
 out:
 	mutex_unlock(&oi->lock);
 	/*
-	 * Losing the upper can resurface lower names that a whiteout or
-	 * opaque marker in the just-shed upper directory was hiding.  Cached
-	 * negative children were primed against the has-upper state, and
-	 * aufsng_lookup_negative_valid()'s !pupper shortcut would now keep
-	 * them valid forever - drop them so those names re-resolve, exactly
-	 * as the adopt path does on the reverse transition.
+	 * Losing the upper resurfaces names its whiteouts hid.  Cached
+	 * negatives were primed against the has-upper state and the
+	 * !pupper shortcut would keep them valid forever; drop them.
 	 */
 	if (shed && S_ISDIR(inode->i_mode))
 		aufsng_dyn_drop_neg_children(inode);
@@ -259,14 +219,11 @@ out:
 }
 
 /*
- * Re-key a cached inode in the inode hash when its top real object
- * changes, recomputing i_ino exactly as a fresh lookup would
- * (aufsng_get_inode): the number folds in the providing branch's slot,
- * so a re-pointed object must not keep a number minted from the
- * REMOVED branch's slot - readdir derives d_ino live from the current
- * stack (d_ino must match st_ino), and a later add= reusing the freed
- * slot could otherwise mint a different file with the identical
- * (st_dev, st_ino), which archivers treat as a hardlink.
+ * Re-key a cached inode when its top real object changes, recomputing
+ * i_ino as a fresh lookup would: the number folds in the providing
+ * slot, so a re-pointed object must not keep the REMOVED branch's.
+ * readdir derives d_ino live, and a later add reusing that slot could
+ * mint an identical (st_dev, st_ino) for a different file.
  */
 static void aufsng_dyn_rekey_inode(struct inode *inode, struct aufsng_entry *oe)
 {
@@ -322,33 +279,28 @@ static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode
 #define AUFSNG_MEMO_BITS 9
 
 /*
- * Per-splice-pass memo of "union directory dentry -> its counterpart
- * in the branch being added (NULL = path blocked/absent)".  Cached
- * directories share their ancestor chains, so memoizing each ancestor
- * verdict makes the whole pass O(dirs) branch lookups instead of
- * O(dirs * depth) - the pass runs under dyn_lock held for WRITING,
- * with every union lookup and readdir blocked behind it, so each
- * saved lookup directly shortens a whole-filesystem stall.
+ * Per-pass memo of "union directory -> its counterpart in the branch
+ * being added" (NULL = blocked or absent).  Cached directories share
+ * ancestor chains, so memoizing makes the pass O(dirs) lookups instead
+ * of O(dirs * depth) - and it runs under dyn_lock(write), with every
+ * lookup and readdir blocked behind it.
  */
 struct aufsng_memo_ent {
 	struct hlist_node node;
 	struct dentry *uniond;	/* key; ref held for the memo's lifetime */
 	struct dentry *branchd;	/* counterpart, ref held; NULL = absent */
 	/*
-	 * The new branch actively HIDES this union object (a whiteout or
-	 * same-named non-directory in the now-top branch, with no upper
-	 * to win over it) - stronger than "absent": the union name is
-	 * gone, and every cached directory at or below it must be
-	 * unhashed rather than kept on its pre-add stack.
+	 * The new branch HIDES this object - stronger than absent: the
+	 * union name is gone, so every cached directory at or below it
+	 * must be unhashed, not kept on its pre-add stack.
 	 */
 	bool blocked;
 };
 
 /*
- * The upper diropq verdict is per PARENT, not per child: without its
- * own memo, k sibling directories under one memo-missed parent would
- * each probe the same upper directory's ".wh..wh..opq" once, inside
- * the whole-filesystem stall dyn_lock(write) imposes.
+ * The upper diropq verdict is per PARENT: without its own memo, k
+ * siblings under one missed parent each re-probe the same
+ * ".wh..wh..opq", inside the stall dyn_lock(write) imposes.
  */
 struct aufsng_opq_ent {
 	struct hlist_node node;
@@ -436,20 +388,16 @@ static void aufsng_memo_free(struct aufsng_splice_memo *memo)
 }
 
 /*
- * Advance one path component: given the union parent's inode @punion
- * and the already-resolved branch parent @pbase, resolve the union
- * child dentry @d in the new branch, enforcing the same per-level
- * visibility rules a fresh lookup would.  Returns the branch child
- * (ref held) or NULL when the path is not provided: also on transient
- * errors - skipping is safe, the directory just keeps its pre-add
- * view until evicted, same as one deeper than the replay limit.
+ * Advance one path component: resolve the union child @d in the new
+ * branch under the resolved branch parent @pbase, by the same
+ * per-level rules a fresh lookup applies.  The branch child (ref held)
+ * or NULL when the path is not provided - also on transient errors,
+ * where skipping just leaves the pre-add view until eviction.
  *
- * @blocked is set when the new branch actively HIDES the union object
- * at this level: it carries a whiteout for the name, or provides a
- * same-named non-directory, and the union object has no upper to win
- * over the new top lower.  A fresh lookup of that path would no longer
- * find the cached directory at all, so the caller must unhash it
- * instead of keeping its pre-add view.
+ * @blocked is set when the new branch HIDES the object at this level:
+ * a whiteout, or a same-named non-directory, with no upper to win.  A
+ * fresh lookup would not find the cached directory at all, so the
+ * caller must unhash it.
  */
 static struct dentry *aufsng_dyn_resolve_step(struct aufsng_fs *pfs,
 					   struct vfsmount *mnt,
@@ -465,41 +413,32 @@ static struct dentry *aufsng_dyn_resolve_step(struct aufsng_fs *pfs,
 	int wh;
 
 	/*
-	 * Upper-branch masking, exactly as aufsng_lookup() enforces it
-	 * level by level: an opaque upper ancestor hides every lower
-	 * branch at and below it - including the one being added (it
-	 * splices in as the TOP lower, so only the upper can mask it) -
-	 * and an upper whiteout of this component kills the path the
-	 * same way.  Without these checks a pinned directory would show
-	 * module content that a fresh lookup of the same path would
-	 * never merge, which then silently vanishes on dcache eviction.
+	 * Upper masking, as lookup enforces it level by level: an opaque
+	 * upper ancestor hides every lower at and below it - the added
+	 * branch included, since only the upper can mask a top lower -
+	 * and an upper whiteout kills the path the same way.  Without
+	 * this a pinned directory shows content no fresh lookup merges.
 	 */
 	if (pupper && aufsng_memo_diropq(pfs, memo, pupper))
 		return NULL;
 
 	/*
-	 * The name is read via a snapshot.  Cross-directory union
-	 * renames - the ones that re-parent, i.e. would tear the
-	 * ancestor chain this walk replays - are excluded outright: the
-	 * splice pass holds the union sb's s_vfs_rename_mutex, which
-	 * lock_rename() holds across ->rename() AND the union-level
-	 * d_move().  (dyn_lock alone would not do: aufsng_rename()
-	 * releases it before the VFS runs d_move.)  Same-directory
-	 * renames take no rename mutex, so a concurrent one can still
-	 * swap a d_name mid-walk; the snapshot makes that read safe,
-	 * and at worst the walk resolves the pre-rename name and this
-	 * directory keeps its pre-add view until evicted - the same
-	 * fallback as any transient probe error below.
+	 * The name is read via a snapshot.  Cross-directory renames - the
+	 * ones that would tear the ancestor chain this walk replays - are
+	 * excluded by s_vfs_rename_mutex, which spans ->rename() and the
+	 * union-level d_move() (dyn_lock would not: rename drops it
+	 * first).  Same-directory renames take no such mutex and can
+	 * still swap a d_name mid-walk; the snapshot makes that safe,
+	 * and at worst the pre-add view survives until eviction.
 	 */
 	take_dentry_name_snapshot(&ns, d);
 	if (pupper &&
 	    aufsng_check_whiteout(aufsng_upper_mnt(pfs), pupper, &ns.name))
 		goto out;
 	/*
-	 * The new branch's own whiteout: as the new TOP lower it hides
-	 * the name in every branch below - if no upper provides the
-	 * union object, the object itself is gone from the union.  A
-	 * probe error skips instead (transient: keep the pre-add view).
+	 * The new branch's whiteout hides the name in every branch below,
+	 * so with no upper the object is gone from the union.  A probe
+	 * error skips instead, keeping the pre-add view.
 	 */
 	wh = aufsng_check_whiteout(mnt, pbase, &ns.name);
 	if (wh) {
@@ -513,9 +452,8 @@ static struct dentry *aufsng_dyn_resolve_step(struct aufsng_fs *pfs,
 		child = NULL;
 	} else if (!d_is_dir(child)) {
 		/*
-		 * A same-named non-directory in the new top lower ends
-		 * the merge at itself: a lower-only union directory is
-		 * shadowed by it, exactly as if deleted and replaced.
+		 * A same-named non-directory ends the merge at itself: a
+		 * lower-only directory is shadowed, as if deleted.
 		 */
 		*blocked = !aufsng_upperdentry(d_inode(d));
 		dput(child);
@@ -527,14 +465,11 @@ out:
 }
 
 /*
- * Resolve the directory in the just-added branch @mnt that corresponds
- * to a cached union directory @inode, by replaying @inode's ancestor
- * chain from the branch root downward through the memo.  Returns a
- * positive directory dentry (ref held) or NULL if the branch does not
- * provide this path as a visible directory.  *@blocked is set when the
- * new branch actively hides this directory or one of its ancestors
- * (see aufsng_dyn_resolve_step): the path no longer exists in the
- * union at all.
+ * Resolve the directory in the just-added branch matching a cached
+ * union directory, by replaying its ancestor chain from the branch
+ * root through the memo.  A positive dentry (ref held), or NULL if the
+ * branch does not provide the path as a visible directory.  *@blocked
+ * means the new branch hides it or an ancestor: the path is gone.
  */
 static struct dentry *aufsng_dyn_resolve_lower(struct aufsng_fs *pfs,
 					    struct super_block *sb,
@@ -596,10 +531,9 @@ static struct dentry *aufsng_dyn_resolve_lower(struct aufsng_fs *pfs,
 }
 
 /*
- * Build the new stack for cached union directory @inode after a branch
- * add: the new branch's directory @nd becomes the top lower (add=1
- * semantics).  Returns the new entry, NULL to skip (nothing to merge),
- * or ERR_PTR on failure.  Caller holds dyn_lock for writing.
+ * Build the new stack for a cached directory after an add: @nd becomes
+ * the top lower.  The new entry, NULL to skip, or ERR_PTR.  Caller
+ * holds dyn_lock(write).
  */
 static struct aufsng_entry *aufsng_dyn_prep_splice(struct aufsng_fs *pfs,
 					     struct inode *inode,
@@ -633,9 +567,8 @@ static struct aufsng_entry *aufsng_dyn_prep_splice(struct aufsng_fs *pfs,
 }
 
 /*
- * Drop cached negative children of @inode so names the new branch now
- * provides are re-resolved instead of returning a stale "not found".
- * Negative dentries are never mountpoints, so this touches no mounts.
+ * Drop cached negative children so names the new branch provides are
+ * re-resolved.  Negatives are never mountpoints, so no mount is hit.
  */
 static void aufsng_dyn_drop_neg_children(struct inode *inode)
 {
@@ -657,11 +590,10 @@ static void aufsng_dyn_drop_neg_children(struct inode *inode)
 }
 
 /*
- * After the root stack gained @layer, splice that branch into every
- * cached union directory in place, so pinned directories (open fds,
- * cwds) immediately show the new branch's content - without a
- * cache-invalidation that would detach nested mounts.  Caller holds the
- * root inode lock and dyn_lock for writing.
+ * Splice @layer into every cached union directory in place, so pinned
+ * directories show the new content at once - without an invalidation
+ * that would detach nested mounts.  Under the root inode lock and
+ * dyn_lock(write).
  */
 static void aufsng_dyn_splice_cached(struct aufsng_fs *pfs, struct super_block *sb,
 				  struct aufsng_layer *layer,
@@ -712,14 +644,10 @@ static void aufsng_dyn_splice_cached(struct aufsng_fs *pfs, struct super_block *
 
 		if (blocked) {
 			/*
-			 * The new branch hides this directory (a whiteout
-			 * or same-named non-directory in the now-top
-			 * branch, no upper to win over it): the name is
-			 * gone from the union, exactly as if deleted.
-			 * Unhash the alias so fresh lookups re-resolve
-			 * (to the shadowing file, or to ENOENT); pinned
-			 * users keep the old view until they let go, as
-			 * with any deleted-while-open directory.
+			 * The new branch hides this directory: the name is
+			 * gone from the union, as if deleted.  Unhash the
+			 * alias so fresh lookups re-resolve; pinned users
+			 * keep the old view until they let go.
 			 */
 			struct dentry *alias = d_find_alias(dirs[i]);
 
@@ -756,7 +684,7 @@ out_iput:
 }
 
 int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
-		       const struct path *path, const char *permstr)
+		       const struct path *path)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(sb);
 	struct inode *root_inode = aufsng_root_inode(sb);
@@ -779,27 +707,20 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	if (err)
 		return err;
 	/*
-	 * The new branch's name-length limit, folded in as mount time does
-	 * for every initial branch: the advertised limit must fit the
-	 * SHALLOWEST branch (see aufsng_get_namelen()).  Only PROBED here -
-	 * the clamp is applied under the locks below, once nothing can fail
-	 * anymore: a shrunken limit is never widened back (it is a
-	 * mount-lifetime promise to userspace), so applying it before a
-	 * kstrdup or clone_private_mount failure would leave statfs
-	 * under-reporting f_namelen forever for a branch that was never
-	 * added.
+	 * The advertised name limit must fit the SHALLOWEST branch.  Only
+	 * PROBED here; the clamp lands under the locks below, once
+	 * nothing can fail: it is never widened back, so applying it
+	 * before a failure would under-report f_namelen forever for a
+	 * branch that was never added.
 	 */
 	err = aufsng_probe_namelen(path, &namelen);
 	if (err)
 		return err;
 
 	/*
-	 * The branch slot, grown into existence if this is the first add
-	 * past the table's current size.  Done before the point of no
-	 * return like everything else here, and idempotent: the slot (and
-	 * its branch object) outlives a failed add and the next one reuses
-	 * it, so a fixed table size - and the ENOSPC a live system hit
-	 * after ~128 module loads - is gone.
+	 * Grows the slot table if this add needs a new slot.  Before the
+	 * point of no return, and idempotent: a slot left by a failed add
+	 * is reused by the next one.
 	 */
 	layer = aufsng_layer_reserve(pfs, idx);
 	if (IS_ERR(layer))
@@ -814,19 +735,14 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 		err = PTR_ERR(mnt);
 		goto out_name;
 	}
-	/*
-	 * An added branch is always a lower (never branch 0), and only
-	 * branch 0 is ever written: even a "=rw" add gets a read-only
-	 * private clone, as in aufsng_fill_super().
-	 */
+	/* Only branch 0 is ever written, so even a "=rw" add clones read-only */
 	mnt->mnt_flags |= MNT_READONLY | MNT_NOATIME;
 
 	cur_oe = AUFSNG_I_E(root_inode);
 
 	/*
-	 * The new branch becomes the top lower (add=1, the only mode).  @mnt
-	 * is passed explicitly because layer->mnt is only published below,
-	 * once the locks are held.
+	 * The new branch becomes the top lower.  @mnt is passed
+	 * explicitly: layer->mnt is only published below, under the locks.
 	 */
 	new_oe = aufsng_entry_prepend(cur_oe, cur_oe->numlower, layer,
 				  path->dentry, mnt);
@@ -836,12 +752,9 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	}
 
 	/*
-	 * s_vfs_rename_mutex excludes cross-directory union renames -
-	 * including their VFS-level d_move(), which runs after
-	 * ->rename() returns and re-parents the very ancestor chains
-	 * the splice pass replays (see aufsng_dyn_resolve_step()).
-	 * Taken before the root's i_rwsem, matching lock_rename()'s own
-	 * ordering.
+	 * s_vfs_rename_mutex excludes cross-directory renames, d_move()
+	 * included, which would re-parent the ancestor chains the splice
+	 * replays.  Before the root's i_rwsem, as lock_rename() orders it.
 	 */
 	mutex_lock(&sb->s_vfs_rename_mutex);
 	inode_lock(root_inode);
@@ -850,15 +763,12 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	layer->mnt = mnt;
 	pfs->namelen = min(pfs->namelen, namelen);
 	layer->path = dup_name;
-	strscpy(layer->perm, permstr, AUFSNG_PERM_LEN);
 	if (idx == pfs->numlayer)
 		pfs->numlayer++;
 
 	/*
-	 * The root stack swap plus the in-place splice into every
-	 * cached directory refresh the whole tree without invalidating
-	 * any dentry, so nested mounts under the union are never
-	 * detached (a d_invalidate-driven refresh would detach them).
+	 * The root swap plus the in-place splice refresh the whole tree
+	 * without invalidating a dentry, so nested mounts survive.
 	 */
 	old_oe = aufsng_dyn_swap_root(sb, new_oe);
 	aufsng_dyn_drop_neg_children(root_inode);
@@ -872,12 +782,11 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 
 	/*
 	 * The grace period only orders freeing the superseded ROOT entry
-	 * against its RCU readers (show_options, getattr's dir-nlink
-	 * walk).  Expedited: a plain synchronize_rcu() stalls every
-	 * module load ~10-40ms for a stack nothing hot depends on -
-	 * precedent in kern_unmount_array().  (Parking the root entry
-	 * instead would mntget every pre-existing lower until umount,
-	 * keeping removed branches' loop devices attached - worse.)
+	 * against its RCU readers (getattr's dir-nlink walk).  Expedited:
+	 * a plain synchronize_rcu() stalls every add ~10-40ms for a stack
+	 * nothing hot depends on - precedent in kern_unmount_array().
+	 * (Parking the root entry instead would mntget every pre-existing
+	 * lower until umount, keeping removed branches attached - worse.)
 	 */
 	synchronize_rcu_expedited();
 	aufsng_free_entry(old_oe);
@@ -886,11 +795,7 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	return 0;
 
 out_mnt:
-	/*
-	 * clone_private_mount() clones are "longterm" mounts
-	 * (mnt_ns == MNT_NS_INTERNAL): plain mntput() never tears one
-	 * down - only kern_unmount() does, via mnt_make_shortterm().
-	 */
+	/* Private clones are longterm mounts: only kern_unmount() tears them down */
 	kern_unmount(mnt);
 out_name:
 	kfree(dup_name);
@@ -912,11 +817,9 @@ static bool aufsng_entry_has_layer(struct aufsng_entry *oe,
 
 	for (i = 0; oe && i < oe->numlower; i++) {
 		/*
-		 * Match the mount too, not the slot pointer alone: a
-		 * deleted-but-open inode keeps a stack referencing a
-		 * REMOVED branch (aufsng_dyn_pin_stack), and a later add
-		 * may reuse that layer slot for a different branch - the
-		 * stale entry must not claim the new branch.
+		 * Match the mount too: a deleted-but-open inode keeps a
+		 * stack on a REMOVED branch, and a later add may reuse the
+		 * slot - the stale entry must not claim the new branch.
 		 */
 		if (oe->lowerstack[i].layer == layer &&
 		    oe->lowerstack[i].mnt == layer->mnt)
@@ -926,15 +829,11 @@ static bool aufsng_entry_has_layer(struct aufsng_entry *oe,
 }
 
 /*
- * A directory removed through the union but still pinned by a cwd or an
- * open fd: rmdir cleared its link count, so no fresh lookup can ever
- * reach it again.  Exactly like a deleted-but-open FILE it must not
- * block a branch removal - there is nothing to re-point and nothing to
- * re-point to - so it takes the same pin-only path
- * (aufsng_dyn_pin_stack): the stack stays, its mounts pinned, until the
- * last user lets go.  Without this it wedged the removal instead, with
- * -EBUSY once the whtmp'd upper made aufsng_copy_up() a no-op, or
- * -ENOENT straight from copy-up's dead-name early-out.
+ * A directory removed through the union but still pinned by a cwd or
+ * fd: rmdir cleared its link count, so no lookup can reach it again.
+ * Like a deleted-but-open file it must not block a branch removal -
+ * there is nothing to re-point to - so it takes the same pin-only
+ * path: the stack stays, mounts pinned, until the last user lets go.
  */
 static bool aufsng_dyn_dir_gone(struct inode *inode)
 {
@@ -942,12 +841,10 @@ static bool aufsng_dyn_dir_gone(struct inode *inode)
 }
 
 /*
- * True when something other than @layer still backs @inode: a live
- * upper, or a lower entry from another branch.  A dead upper -
- * unhashed by an out-of-band unlink in the rw branch under udba=reval,
- * pending the shed-upper heal (aufsng_get_inode) - is not a survivor:
- * treating it as one would strip the stack the heal needs and serve
- * the deleted upper forever.
+ * Does anything other than @layer still back @inode - a live upper, or
+ * a lower from another branch?  A dead upper is not a survivor:
+ * counting it would strip the stack the shed heal needs and serve the
+ * deleted upper forever.
  */
 static bool aufsng_dyn_has_survivor(struct inode *inode,
 				 const struct aufsng_layer *layer)
@@ -965,11 +862,9 @@ static bool aufsng_dyn_has_survivor(struct inode *inode,
 }
 
 /*
- * Is @inode's real object on @layer the target of a live memory
- * mapping?  Checked on the BACKING inode: aufsng_mmap maps through
- * backing_file_mmap, which links the vma into the real inode's
- * address_space - the union inode's own i_mapping never sees a
- * mapping.  Non-sleeping; called under i_lock.
+ * Is @inode's object on @layer memory-mapped?  Checked on the BACKING
+ * inode: mmap goes through backing_file_mmap, which links the vma into
+ * the real address_space.  Non-sleeping; called under i_lock.
  */
 static bool aufsng_dyn_mapped_on_layer(struct inode *inode,
 				    const struct aufsng_layer *layer)
@@ -987,35 +882,24 @@ static bool aufsng_dyn_mapped_on_layer(struct inode *inode,
 
 /*
  * Rebuild a pinned non-directory's stack for the removal of @layer.
- * A non-directory stack records only the topmost provider (namei.c),
- * so the survivor cannot be read off the old stack: re-resolve the
- * name against the surviving branches (aufsng_find_origin_ex with the
- * removed layer skipped and the type check applied), exactly as the
- * first fresh lookup after the removal will, so the rekeyed inode
- * keeps the identity (hash key, st_ino) a fresh lookup computes.
+ * Such a stack records only the topmost provider, so the survivor
+ * cannot be read off it: re-resolve the name against the surviving
+ * branches exactly as the first fresh lookup will, so the rekeyed
+ * inode keeps the identity that lookup computes.
  *
- * The alias's name is read through a snapshot and its parent through
- * its own reference: dyn_lock does NOT keep either stable - a union
- * rename releases it before the VFS runs d_move (see the matching
- * comment in aufsng_dyn_resolve_step()), and a same-directory rename
- * takes no rename mutex at all, so a concurrent one can swap (or
- * kfree_rcu) the d_name this walk would otherwise dereference across
- * sleeping branch lookups.  Cross-directory renames - the ones that
- * would re-parent the alias mid-walk - are excluded by the caller's
- * s_vfs_rename_mutex, exactly as on the add path.
+ * The name is read through a snapshot and the parent through its own
+ * reference: dyn_lock keeps neither stable, since a same-directory
+ * rename takes no rename mutex and can swap d_name across the sleeping
+ * lookups here.  Cross-directory ones are excluded by the caller's
+ * s_vfs_rename_mutex, as on the add path.
  *
- * When no name resolves to a survivor and no live upper carries the
- * object, it is invisible to fresh lookups already (deleted through
- * the union while held open, or every alias evicted): *@pin_only is
- * set and NULL returned - the caller keeps the stack and pins its
- * mounts until eviction (aufsng_dyn_pin_stack()) instead of failing
- * the whole removal with EBUSY for an object the union no longer
- * shows.  (With several hardlink aliases sharing this inode the
- * arbitrary d_find_alias() pick decides which name is re-resolved;
- * per-name divergence for the un-chosen sibling is inherent to the
- * one-inode-per-lower-origin design.)  Returns the rebuilt entry, or
- * ERR_PTR on error.  Caller holds the root inode lock,
- * s_vfs_rename_mutex and pfs->dyn_lock for writing.
+ * With no survivor for any name and no live upper, the object is
+ * already invisible to fresh lookups: *@pin_only is set and NULL
+ * returned, so the caller keeps the stack and pins its mounts rather
+ * than failing the removal with EBUSY.  (Which of several hardlink
+ * aliases is re-resolved is the arbitrary d_find_alias() pick.)  The
+ * rebuilt entry or ERR_PTR; caller holds the root inode lock,
+ * s_vfs_rename_mutex and dyn_lock(write).
  */
 static struct aufsng_entry *aufsng_dyn_prep_repoint(struct aufsng_fs *pfs,
 					      struct inode *inode,
@@ -1041,10 +925,8 @@ static struct aufsng_entry *aufsng_dyn_prep_repoint(struct aufsng_fs *pfs,
 		old_cred = override_creds(pfs->creator_cred);
 		/*
 		 * The gate a fresh lookup applies, so the two agree.  A
-		 * DEAD upper is passed as none: it carries no readable
-		 * marker (it has no inode at all), and the object is about
-		 * to be served by a lower again anyway - which is exactly
-		 * what re-resolving finds.
+		 * DEAD upper is passed as none: it has no inode to read a
+		 * marker from, and a lower is about to serve the object.
 		 */
 		if (aufsng_upper_claims_origin(pfs,
 					    upper_alive ? upper : NULL,
@@ -1069,12 +951,10 @@ static struct aufsng_entry *aufsng_dyn_prep_repoint(struct aufsng_fs *pfs,
 }
 
 /*
- * Pin every branch mount @oe references on @oi's parked list WITHOUT
- * swapping the stack: a deleted-but-open (or alias-less) object whose
- * serving branch is being removed keeps working through its open fds
- * exactly like any deleted-while-open file, but the stack's mounts
- * must outlive the branch's kern_unmount().  @pk has room for
- * oe->numlower mounts.  Caller holds pfs->dyn_lock for writing.
+ * Pin every mount @oe references WITHOUT swapping the stack: a
+ * deleted-but-open object whose branch is being removed keeps working
+ * through its fds, but the stack's mounts must outlive the branch's
+ * kern_unmount().  @pk has room for oe->numlower.  Under dyn_lock(write).
  */
 static void aufsng_dyn_pin_stack(struct aufsng_inode *oi,
 			      struct aufsng_entry *oe,
@@ -1087,14 +967,11 @@ static void aufsng_dyn_pin_stack(struct aufsng_inode *oi,
 }
 
 /*
- * Drop every cache-only reference to @layer and classify what
- * remains: a non-directory whose @layer object is memory-mapped makes
- * the branch busy (a live mapping cannot have its backing pulled);
- * every other in-use inode - directories (ancestors of running
- * binaries, working directories) and re-pointable files alike - is
- * collected so its stack can be rebuilt without the branch.
- * Caller holds the root inode lock and pfs->dyn_lock for writing, so
- * no new reference can appear while we look.
+ * Drop every cache-only reference to @layer and classify the rest: a
+ * memory-mapped non-directory makes the branch busy, since a live
+ * mapping cannot have its backing pulled; every other in-use inode is
+ * collected for a stack rebuild.  Under the root inode lock and
+ * dyn_lock(write), so no new reference can appear meanwhile.
  */
 static int aufsng_dyn_scan_branch(struct super_block *sb,
 			       const struct aufsng_layer *layer,
@@ -1106,14 +983,11 @@ static int aufsng_dyn_scan_branch(struct super_block *sb,
 	int err = 0;
 
 	/*
-	 * Shrink INSIDE the removal locks, every pass.  i_count is the only
-	 * thing separating "a process is using this" from "the dcache merely
-	 * remembers it", so a lookup landing between an unlocked shrink and
-	 * this walk leaves a cache-only inode looking exactly like an open
-	 * fd - and a sole-backed directory misclassified that way gets
-	 * physically copied up into the rw branch, or fails the removal
-	 * outright if that copy-up errors.  Holding dyn_lock for writing
-	 * here keeps lookups out for the whole shrink-then-classify window.
+	 * Shrink INSIDE the removal locks, every pass: i_count is all
+	 * that separates "in use" from "merely cached", so a lookup
+	 * landing between an unlocked shrink and this walk makes a
+	 * cache-only inode look pinned - and a sole-backed directory
+	 * misclassified that way gets physically copied up.
 	 */
 	shrink_dcache_sb(sb);
 	evict_inodes(sb);
@@ -1157,14 +1031,10 @@ static int aufsng_dyn_scan_branch(struct super_block *sb,
 			continue;
 		}
 		/*
-		 * Cache-only: mark I_DONTCACHE and take a reference so
-		 * the deferred iput below evicts it - AFTER the walk,
-		 * not here.  An in-place iput would have to drop the
-		 * list lock and restart the walk, re-scanning the whole
-		 * list (and re-collecting every pinned inode) once per
-		 * evicted inode - O(n * evicted) under dyn_lock held
-		 * for writing.  A single forward pass never revisits an
-		 * inode, so nothing is double-counted.
+		 * Cache-only: mark I_DONTCACHE and take a reference so the
+		 * deferred iput evicts it after the walk.  An in-place
+		 * iput would drop the list lock and restart, making the
+		 * pass O(n * evicted) under dyn_lock(write).
 		 */
 		err = aufsng_grow_array((void **)&dispose, &dcap, nd + 1,
 				     sizeof(*dispose), GFP_ATOMIC);
@@ -1187,9 +1057,8 @@ static int aufsng_dyn_scan_branch(struct super_block *sb,
 }
 
 /*
- * Copy up the collected directories that would lose their only
- * backing with @layer; survivor-backed ones keep being served from a
- * surviving branch and need nothing.
+ * Copy up the collected directories that would lose their only backing
+ * with @layer; survivor-backed ones need nothing.
  */
 static int aufsng_dyn_copy_up_dirs(struct aufsng_dyn_scan *scan,
 				const struct aufsng_layer *layer)
@@ -1215,21 +1084,16 @@ static int aufsng_dyn_copy_up_dirs(struct aufsng_dyn_scan *scan,
 }
 
 /*
- * Filter @layer out of a cached directory's stack.  When the removed
- * entry was the BOTTOM of the stack and carried an opaque marker, the
- * merge that built this stack stopped AT the removed branch: branches
- * below it in the parent's stack were never probed, though a fresh
- * lookup after the removal will now merge them (the marker leaves the
- * union with its branch).  Re-run that tail of the merge here, by the
- * same rules as aufsng_lookup (stop at a whiteout, a non-directory, or
- * an opaque directory), so the pinned directory and a fresh lookup of
- * the same path keep answering identically - a filter alone can only
- * shorten the stack and would leave the pinned view permanently
- * missing everything the removed opaque branch was hiding.
+ * Filter @layer out of a cached directory's stack.  If the removed
+ * entry was the BOTTOM and carried an opaque marker, the merge that
+ * built this stack stopped there and never probed the branches below,
+ * which a fresh lookup will now merge - the marker leaves with its
+ * branch.  Re-run that tail here by lookup's own rules, or the pinned
+ * view stays permanently missing what the opaque branch hid.
+ *
  * @tail_merge is false for the ROOT, whose stack is the branch list
- * itself, not the product of a merge.  Caller holds the root inode
- * lock, s_vfs_rename_mutex (keeping the alias name/parent walk safe,
- * as in aufsng_dyn_prep_repoint) and pfs->dyn_lock for writing.
+ * itself.  Caller holds the root inode lock, s_vfs_rename_mutex and
+ * dyn_lock(write).
  */
 static struct aufsng_entry *aufsng_dyn_prep_rebuild(struct aufsng_fs *pfs,
 					      struct inode *inode,
@@ -1322,28 +1186,18 @@ static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode
 	struct aufsng_entry *old_oe;
 
 	/*
-	 * No inode_lock() here: pfs->dyn_lock (write, held by caller)
-	 * alone excludes every other oe reader/writer in this design
-	 * (aufsng_lookup(), readdir's cache build, etc. all serialize on
-	 * dyn_lock, not this directory's inode lock).  Taking
-	 * inode_lock() too would deadlock: a concurrent lookup holds
-	 * the parent's i_rwsem (shared) before calling ->lookup(),
-	 * which blocks on percpu_down_read(&pfs->dyn_lock) - ABBA with
-	 * inode_lock(inode)+dyn_lock(write) here.
+	 * No inode_lock(): dyn_lock(write) alone excludes every other oe
+	 * reader and writer here, and taking it too would be ABBA - a
+	 * lookup holds the parent's i_rwsem before blocking on
+	 * dyn_lock(read).
 	 *
-	 * oi->lock IS taken: copy-up never takes dyn_lock (its data
-	 * copy runs lock-free by design), so this swap is the one
-	 * branch-change publication a mid-flight copy-up could
-	 * interleave with.  Under oi->lock the two serialize: copy-up
-	 * re-reads the stack under the same lock before committing and
-	 * aborts with -ESTALE if this swap won - otherwise its upper
-	 * published first and this is a plain copy-up-then-branch-change
-	 * sequence.  Lock order dyn_lock(write) -> oi->lock matches the
-	 * documented mnt_want_write -> dyn_lock -> oi->lock ordering.
+	 * oi->lock IS taken: copy-up never takes dyn_lock, so this swap
+	 * is the one publication a mid-flight copy-up can interleave
+	 * with.  Under oi->lock the two serialize - copy-up re-reads the
+	 * stack there and aborts with -ESTALE if this swap won.  Order
+	 * dyn_lock(write) -> oi->lock matches the documented one.
 	 *
-	 * @parked must have room for old_oe->numlower mounts (see the
-	 * struct aufsng_dyn_parked comment: each parked stack pins
-	 * every branch mount its dentries point into).
+	 * @parked has room for old_oe->numlower mounts.
 	 */
 	mutex_lock(&oi->lock);
 	old_oe = oi->oe;
@@ -1352,10 +1206,8 @@ static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode
 	atomic64_inc(&oi->version);
 	aufsng_dyn_rekey_inode(inode, new_oe);
 	/*
-	 * The top real object may have changed (a spliced-in branch's
-	 * directory, or the surviving top after a removal); the union
-	 * inode's attributes - directory permissions above all - must
-	 * follow it, exactly as a fresh lookup of the same path would.
+	 * The top real object may have changed, so the union inode's
+	 * attributes must follow it, as a fresh lookup would.
 	 */
 	aufsng_copyattr(inode);
 
@@ -1393,18 +1245,14 @@ void aufsng_dyn_free_parked(struct aufsng_inode *oi)
 }
 
 /*
- * A rekey re-hashes @inode under the key its rebuilt stack computes,
- * and __insert_inode_hash() performs no duplicate check - a second
- * inode under one key would shadow the first for every fresh lookup,
- * splitting one lower hardlink family across two union identities
- * (distinct st_ino for siblings, independent copy-ups of one file).
- * Reachable exactly through hardlinks: two pinned union inodes for
- * sibling names, one keyed on the removed branch's inode, re-pointing
- * onto the surviving branch's inode that already keys the other (which
- * the scan never visits - its stack holds no removed layer).  Refuse
- * the removal instead.  @new_oes[0..@i] are this batch's prepared
- * stacks: two collected inodes may also be re-pointing onto the SAME
- * new key, which the hash (neither is rekeyed yet) cannot show.
+ * A rekey re-hashes @inode under its rebuilt stack's key, and
+ * __insert_inode_hash() checks no duplicates - a second inode under
+ * one key shadows the first for every lookup, splitting one hardlink
+ * family into two identities.  Reachable through hardlinks: two pinned
+ * inodes for sibling names, one re-pointing onto the key the other
+ * already holds.  Refuse the removal instead.  @new_oes[0..@i] are
+ * this batch's stacks: two of them may also target the SAME new key,
+ * which the hash cannot show while neither is rekeyed.
  */
 static int aufsng_dyn_check_rekey(struct super_block *sb,
 			       struct aufsng_dyn_scan *scan,
@@ -1444,20 +1292,13 @@ static void aufsng_dyn_release_branch(struct aufsng_layer *layer)
 {
 	kfree(layer->path);
 	layer->path = NULL;
-	layer->perm[0] = '\0';
 	/*
-	 * clone_private_mount() clones are "longterm" mounts
-	 * (mnt_ns == MNT_NS_INTERNAL): mntput()'s fast path only
-	 * decrements the count while mnt_ns is set and never schedules
-	 * cleanup, so a plain mntput() here would leak the mount, its
-	 * root dentry and the branch superblock's active count forever
-	 * (a deactivated squashfs would keep its loop device attached).
-	 * kern_unmount() makes the mount shortterm first, exactly as
-	 * put_super does for the surviving branches.  Its one-element
-	 * _array form is that same teardown behind an EXPEDITED grace
-	 * period instead of a plain one, which is what the add path already
-	 * uses for its own publication - a module deactivation should not
-	 * stall the remount ~10-40ms per branch.
+	 * Private clones are longterm mounts: mntput()'s fast path never
+	 * schedules cleanup, so it would leak the mount, its root dentry
+	 * and the branch sb's active count forever, backing device
+	 * included.  kern_unmount() makes it shortterm first; the
+	 * one-element _array form is the same teardown behind an
+	 * expedited grace period, so a removal does not stall ~10-40ms.
 	 */
 	kern_unmount_array(&layer->mnt, 1);
 	layer->mnt = NULL;
@@ -1481,10 +1322,9 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 	if (!layer)
 		return -ENOENT;
 	/*
-	 * The branch root dentry is the layer filesystem's own root, so
-	 * '%pd' on it prints "/"; the config string is the path the user
-	 * knows the branch by.  Freed only in aufsng_dyn_release_branch(),
-	 * after the last message below.
+	 * '%pd' on the branch root prints "/", so use the stored path -
+	 * the name the user knows.  Freed only in release_branch(), after
+	 * the last message below.
 	 */
 	brname = layer->path;
 
@@ -1493,13 +1333,9 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 
 	for (tries = 0; ; tries++) {
 		/*
-		 * s_vfs_rename_mutex excludes cross-directory union
-		 * renames - including their VFS-level d_move(), which
-		 * runs after ->rename() drops dyn_lock and would
-		 * re-parent the aliases whose name/parent the re-point
-		 * and opaque tail-merge below resolve.  Same ordering as
-		 * the add path (taken before the root's i_rwsem, matching
-		 * lock_rename()).
+		 * s_vfs_rename_mutex excludes cross-directory renames,
+		 * whose d_move() would re-parent the aliases the re-point
+		 * and tail merge resolve.  Same ordering as the add path.
 		 */
 		mutex_lock(&sb->s_vfs_rename_mutex);
 		inode_lock(root_inode);
@@ -1520,9 +1356,8 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 		}
 
 		/*
-		 * A pinned directory only needs a copy-up when the removed
-		 * branch is its sole backing: with a survivor, the rebuilt
-		 * stack keeps serving it from a surviving branch.
+		 * A pinned directory needs a copy-up only when the removed
+		 * branch is its sole backing.
 		 */
 		blocker_ino = 0;
 		for (i = 0; i < scan.nr; i++) {
@@ -1568,10 +1403,8 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 		if (S_ISDIR(scan.pinned[i]->i_mode)) {
 			/*
 			 * A deleted-but-open directory with no survivor has
-			 * nothing to rebuild onto: keep its stack and pin the
-			 * mounts, as the non-directory path does for the same
-			 * state.  (With a survivor the filter below still
-			 * produces a valid stack, so let it.)
+			 * nothing to rebuild onto: keep the stack and pin
+			 * the mounts, as the non-directory path does.
 			 */
 			if (aufsng_dyn_dir_gone(scan.pinned[i]) &&
 			    !aufsng_dyn_has_survivor(scan.pinned[i], layer))
@@ -1597,11 +1430,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 			if (err)
 				goto out_unlock;
 		}
-		/*
-		 * Sized to pin every mount the superseded stack - or, for
-		 * a pin-only skip (deleted-but-open object), the KEPT
-		 * stack - references.
-		 */
+		/* Sized for every mount the superseded - or KEPT - stack uses */
 		cur = AUFSNG_I_E(scan.pinned[i]);
 		parked[i] = kmalloc(struct_size(parked[i], mnts,
 						cur ? cur->numlower : 0),
@@ -1613,12 +1442,9 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 	}
 
 	/*
-	 * The root stack is rebuilt through the same filter helper as
-	 * every cached directory's (it also sizes the copy exactly, by
-	 * counted hits).  NULL means the layer was not in the root
-	 * stack at all - impossible for an active branch, which the add
-	 * path put there exactly once - so it is treated as corruption
-	 * rather than silently skipping the swap.
+	 * The root stack goes through the same filter as every cached
+	 * directory's.  NULL means the layer was not in it at all -
+	 * impossible for an active branch, so treat it as corruption.
 	 */
 	new_oe = aufsng_dyn_prep_rebuild(pfs, root_inode, layer, false);
 	if (IS_ERR(new_oe)) {
@@ -1633,43 +1459,33 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 	err = 0;
 
 	/*
-	 * Removal invalidates no dentries: shrink+evict+in-place
-	 * rebuild (below, still under dyn_lock write) already keeps
-	 * every surviving cached dentry consistent, and invalidating
-	 * would strand pinned dentries (open fds, CWDs) that no fresh
-	 * lookup can replace, breaking fd-based re-resolution with
-	 * ESTALE.
+	 * Removal invalidates no dentries: the shrink, evict and in-place
+	 * rebuild keep every survivor consistent, and invalidating would
+	 * strand pinned dentries no fresh lookup can replace.
 	 */
 	old_root_oe = aufsng_dyn_swap_root(sb, new_oe);
 
 	/*
-	 * Swap in the prepared stacks of the collected in-use
-	 * directories before releasing dyn_lock: a lookup through one
-	 * of these directories takes dyn_lock for reading, so as long
-	 * as we still hold it for writing here, no lookup can resolve
-	 * a child through a stack that still references the removed
-	 * branch.
+	 * Swap the prepared stacks in before releasing dyn_lock: while it
+	 * is held for writing, no lookup can resolve a child through a
+	 * stack that still references the removed branch.
 	 */
 	for (i = 0; i < scan.nr; i++) {
 		if (new_oes[i]) {
 			aufsng_dyn_commit_rebuild(pfs, scan.pinned[i], new_oes[i],
 					      parked[i]);
 			/*
-			 * Removing a branch that carried a whiteout reveals the
-			 * name it was hiding in a lower-priority branch, so drop
-			 * cached negative children whose "absent" verdict the
-			 * removal may have overturned - the same refresh the add
-			 * path does after splicing.  Regular files have no
-			 * children to refresh.
+			 * A removed branch's whiteout stops hiding the name
+			 * below it, so drop cached negatives whose "absent"
+			 * verdict the removal overturned.
 			 */
 			if (S_ISDIR(scan.pinned[i]->i_mode))
 				aufsng_dyn_drop_neg_children(scan.pinned[i]);
 		} else if (parked[i]) {
 			/*
-			 * Deleted-but-open: nothing to re-point and nothing
-			 * to re-point TO - keep the stack and pin its mounts
-			 * until the inode is evicted, so the open fds keep
-			 * working across the branch's kern_unmount().
+			 * Deleted-but-open: nothing to re-point to.  Keep the
+			 * stack and pin its mounts until eviction, so open
+			 * fds survive the branch's kern_unmount().
 			 */
 			aufsng_dyn_pin_stack(AUFSNG_I(scan.pinned[i]),
 					  AUFSNG_I_E(scan.pinned[i]),
@@ -1696,11 +1512,10 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 	synchronize_rcu_expedited();
 	aufsng_free_entry(old_root_oe);
 	/*
-	 * Only after the grace period: an RCU show_options snapshot of
-	 * the superseded root stack may still be printing this branch's
-	 * config strings.  Slot reuse by a later add is safe for the
-	 * same reason - it cannot begin before this removal (and its
-	 * grace period) completes.
+	 * Only after the grace period: an RCU reader of the superseded
+	 * root stack may still be dereferencing this branch's dentries
+	 * and mount.  Slot reuse by a later add is safe for the same
+	 * reason - it cannot begin before this removal completes.
 	 */
 	aufsng_dyn_release_branch(layer);
 
@@ -1731,9 +1546,8 @@ out_scan:
 }
 
 /*
- * Called from aufsng_reconfigure() (params.c) with sb->s_umount held for
- * writing.  Applies the "add=N:PATH=MODE" additions and "del=PATH"
- * removals collected in @ctx.
+ * Called with sb->s_umount held for writing: applies the add= and del=
+ * changes collected in @ctx.
  */
 int aufsng_dyn_reconfigure(struct fs_context *fc)
 {
@@ -1743,10 +1557,9 @@ int aufsng_dyn_reconfigure(struct fs_context *fc)
 	int err = 0;
 
 	/*
-	 * udba= may be changed on remount, as on real AUFS.  Only an
-	 * explicitly given value is applied: legacy remounts replay the
-	 * current options, and a remount without udba= must not reset
-	 * the mount-time choice to the parser default.
+	 * udba= may change on remount, as on AUFS.  Only an explicit
+	 * value applies: a remount without one must not reset the
+	 * mount-time choice to the parser default.
 	 */
 	if (ctx->udba_set)
 		AUFSNG_FS(sb)->config.udba = ctx->config.udba;
@@ -1755,18 +1568,13 @@ int aufsng_dyn_reconfigure(struct fs_context *fc)
 		struct aufsng_ctx_branch *b = &ctx->dyn_add[i];
 
 		/*
-		 * An added branch is always a lower, so it is cloned read-only
-		 * whatever the mode says (see aufsng_dyn_add_branch()).  Record
-		 * the mode it will actually have, or /proc/mounts would echo
-		 * back a "=rw" this branch never gets - the same effective-mode
-		 * rule aufsng_fill_super() applies to a lower "=rw".
+		 * An added branch is always a lower, so read-only whatever the
+		 * mode says.  Warn: no branch mode is echoed to userspace.
 		 */
-		if (b->perm == AUFSNG_BR_RW) {
+		if (b->perm == AUFSNG_BR_RW)
 			pr_warn("aufs (aufs-ng): branch '%s' declared rw but only the first branch is writable; using ro\n",
 				b->name);
-			strscpy(b->permstr, "ro", AUFSNG_PERM_LEN);
-		}
-		err = aufsng_dyn_add_branch(sb, b->name, &b->path, b->permstr);
+		err = aufsng_dyn_add_branch(sb, b->name, &b->path);
 		/*
 		 * Tolerate re-adding a present branch: legacy remounts
 		 * may replay the current mount options.

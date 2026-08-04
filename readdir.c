@@ -1,25 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * aufs-ng merged directory reading, AUFS-compatible whiteout
- * semantics.
+ * Merged directory reading with AUFS whiteout semantics.
  *
- * A directory listing is the union of branch 0 (rw) and the dentry's
- * lower branch stack, highest priority first: the first branch to
- * provide a name wins.  A name whose branch instead provides a
- * ".wh.<name>" marker is a tombstone: it is never shown, and it also
- * hides that name in every lower branch (inserted into the same
- * cache keyed on the real name, so a later, lower-priority branch's
- * real occurrence of that name is suppressed by the ordinary
- * first-one-wins rule).  Any ".wh..wh.*"-prefixed name (the opaque
- * marker and AUFS bookkeeping names aufs-ng never writes) is never
- * shown and never hides anything - it isn't a whiteout, just noise.
+ * A listing is the union of branch 0 and the lower stack, highest
+ * priority first: the first branch to provide a name wins.  A
+ * ".wh.<name>" marker is a tombstone - never shown, and cached under
+ * the real name so first-one-wins also hides it in every lower branch.
+ * A ".wh..wh.*" name is never shown and hides nothing: not a whiteout,
+ * just bookkeeping.
  *
- * The merged result is cached on the inode and validated against the
- * inode version, which every mutation and branch change bumps.  The
- * version is sampled *before* the merge: a branch change bumps it
- * without holding this dir's lock, so a version read after the merge
- * could already account for a change the merge did not see, wrongly
- * marking a stale cache valid.
+ * The result is cached on the inode against its version, sampled
+ * BEFORE the merge: a branch change bumps it without this dir's lock,
+ * so a later sample could cover a change the merge never saw.
  */
 
 #include <linux/fs.h>
@@ -54,30 +46,16 @@ struct aufsng_dir_stamp {
 };
 
 struct aufsng_dir_cache {
-	/*
-	 * Lock-free: oi->cache itself holds a reference while the
-	 * pointer is set (getters take theirs under oi->lock, which
-	 * guards the pointer), so a put - every closedir pays one -
-	 * never needs the mutex.
-	 */
+	/* oi->cache holds a reference while set, so a put needs no mutex */
 	refcount_t refcount;
 	u64 version;
 	/*
-	 * Every branch directory's change stamp when this listing was
-	 * built (slot 0 = upper, then the lower stack in order).  Under
-	 * udba=reval they let an out-of-band edit of ANY branch - a
-	 * hand-removed whiteout in the rw branch, a file created in a
-	 * lower branch through its source mount - invalidate the cache
-	 * without re-reading every branch on each open; those edits are
-	 * the only way the merged view can change without bumping
-	 * @version.  Lookup's revalidation honors the same signals for
-	 * positive names (and negatives under an upper-backed parent;
-	 * a cached negative whose parent has NO upper deliberately
-	 * skips the lower rescan - see aufsng_lookup_negative_valid() -
-	 * so readdir may show an out-of-band lower addition before a
-	 * cached miss for it expires).
-	 * i_version is the tick-independent signal where the branch fs
-	 * supports it; mtime is the always-present fallback.
+	 * Each branch directory's change stamp when the listing was built
+	 * (slot 0 = upper, then the lower stack).  Under udba=reval they
+	 * catch an out-of-band edit of any branch - the only way the
+	 * merged view changes without bumping @version - without
+	 * re-reading every branch on each open.  i_version where the
+	 * branch fs has it, mtime as the fallback.
 	 */
 	unsigned int nr_stamps;
 	struct aufsng_dir_stamp *stamps;
@@ -90,21 +68,18 @@ struct aufsng_dir_cache {
 struct aufsng_dir_file {
 	struct aufsng_dir_cache *cache;
 	/*
-	 * Where the previous getdents on this fd stopped: the list node
-	 * whose entry sits at offset @cursor_pos.  Only trusted while
+	 * Where the previous getdents stopped.  Trusted only while
 	 * @cache is unchanged and ctx->pos still equals @cursor_pos;
-	 * anything else (llseek, rewind, cache rebuild) falls back to a
-	 * scan from the head.  Without it, each getdents call re-skips
-	 * everything already returned and a full listing goes O(n^2).
+	 * anything else scans from the head.  Without it a full listing
+	 * is O(n^2).
 	 */
 	struct list_head *cursor;
 	loff_t cursor_pos;
 };
 
 /*
- * Common head for actors fed through aufsng_dir_drain(): the drain
- * loop needs the per-call progress count and the actor's sticky error.
- * Must be the first member of the embedding struct.
+ * Common head for aufsng_dir_drain() actors: the loop needs the
+ * per-call count and the sticky error.  Must be the first member.
  */
 struct aufsng_dir_drain {
 	struct dir_context ctx;
@@ -122,21 +97,14 @@ struct aufsng_readdir_data {
 
 /*
  * An inode-number donation whose type check getdents could not answer:
- * the lower branch reported DT_UNKNOWN for the name (isofs does so for
- * every entry, as does ext4 without the filetype feature), so whether
- * this lower occurrence really is the upper name's copy-up origin - and
- * may therefore hand it its inode number - is only decidable by looking
- * the name up in that branch.
+ * the branch reported DT_UNKNOWN, so whether this lower really is the
+ * upper name's copy-up origin needs a lookup in that branch.
  *
- * Deferred to just after the branch's drain, because a lookup from
- * inside iterate_dir() would re-acquire the directory's i_rwsem.
- * Treating DT_UNKNOWN as "matches anything" instead would let a
- * type-MISMATCHED lower donate, making readdir's d_ino disagree with
- * the st_ino lookup computes (aufsng_origin_type_ok() rejects that
- * lower, so the union inode keeps the upper's number); simply refusing
- * to donate would be worse still, breaking every genuine copy-up origin
- * on such a branch.  Nothing is allocated for branches that report real
- * types, which is every filesystem a live distro layers.
+ * Deferred until after the drain, since a lookup inside iterate_dir()
+ * would re-acquire i_rwsem.  Treating DT_UNKNOWN as "matches anything"
+ * would let a type-mismatched lower donate and make d_ino disagree
+ * with st_ino; refusing outright would break every genuine origin on
+ * such a branch.  Branches reporting real types allocate nothing.
  */
 struct aufsng_ino_probe {
 	struct list_head node;
@@ -158,13 +126,10 @@ static int aufsng_ino_probe_add(struct list_head *probes,
 }
 
 /*
- * Settle (and free) one branch's deferred donations: hand over the
- * recorded number only when the branch object really is the same file
- * type as the upper entry receiving it - the rule
- * aufsng_origin_type_ok() applies in lookup.  @resolve is false when the
- * drain itself failed and the cache is about to be discarded; a lookup
- * error leaves the upper's own number in place, the same conservative
- * answer a type mismatch gives.
+ * Settle (and free) one branch's deferred donations: hand the number
+ * over only at the same file type, the rule lookup applies.  @resolve
+ * is false when the drain failed and the cache is being discarded; a
+ * lookup error leaves the upper's own number, as a mismatch does.
  */
 static void aufsng_ino_probes_settle(const struct path *realpath,
 				  struct list_head *probes, bool resolve)
@@ -216,34 +181,21 @@ static int aufsng_cache_add(struct aufsng_dir_cache *cache, const char *name,
 	struct aufsng_cache_entry *p;
 
 	/*
-	 * The first (highest priority) branch to claim a name wins,
-	 * whether that claim is a real entry or a whiteout tombstone -
+	 * The first branch to claim a name wins, entry or tombstone -
 	 * with two refinements for later occurrences:
 	 *
-	 * - "foo" and ".wh.foo" inside the SAME branch directory: the
-	 *   whiteout wins no matter which one getdents returned first,
-	 *   matching lookup's whiteout-first probe.  (The state occurs
-	 *   transiently inside a delete, after a crash mid-delete, or
-	 *   via an out-of-band branch edit; hash-ordered getdents makes
-	 *   the arrival order arbitrary.)
+	 * - "foo" and ".wh.foo" in the SAME branch dir: the whiteout
+	 *   wins whichever getdents returned first, matching lookup's
+	 *   whiteout-first probe.  Hash order makes it arbitrary.
 	 *
-	 * - an upper entry's d_ino must match what stat() reports: the
-	 *   union inode is keyed by the topmost same-type LOWER origin
-	 *   when one exists (see aufsng_get_inode()), so the first
-	 *   lower occurrence of an upper-provided name donates its
-	 *   inode number.  A type-mismatched lower is shadowed as an
-	 *   unrelated object (the upper keeps its own ino), and a
-	 *   whiteout ends the origin search - both settle the number
-	 *   for all deeper branches.  An upper non-directory that
-	 *   copy-up never marked as a lower's copy is settled before
-	 *   any lower is read (aufsng_cache_fix_unmarked), so it is
-	 *   never a donation candidate to begin with - lookup keys it
-	 *   on itself.
+	 * - an upper entry's d_ino must match stat(): the union inode is
+	 *   keyed by the topmost same-type LOWER origin, so the first
+	 *   such lower donates its number.  A type mismatch or a
+	 *   whiteout settles the number for all deeper branches, and an
+	 *   unmarked upper file is settled before any lower is read.
 	 *
-	 * One rbtree descent serves both the find and, on a miss, the
-	 * insert position: every entry of every branch passes through
-	 * here, so a separate find-then-insert would double the merge's
-	 * tree work.
+	 * One rbtree descent serves the find and the insert position:
+	 * every entry of every branch passes through here.
 	 */
 	while (*newp) {
 		int cmp;
@@ -264,10 +216,8 @@ static int aufsng_cache_add(struct aufsng_dir_cache *cache, const char *name,
 			cache->nr_visible--;
 		} else if (!p->hidden && !p->ino_fixed && idx != 0) {
 			/*
-			 * @p came from branch 0 - implied by !ino_fixed, which
-			 * is initialized to "idx != 0" and only ever set - so
-			 * this lower occurrence is a candidate origin, and
-			 * settles the number either way.
+			 * @p came from branch 0 (implied by !ino_fixed), so
+			 * this lower is a candidate origin and settles it.
 			 */
 			p->ino_fixed = true;
 			if (hidden)
@@ -280,11 +230,9 @@ static int aufsng_cache_add(struct aufsng_dir_cache *cache, const char *name,
 						aufsng_map_ino(ino, idx));
 			else if (p->d_type == DT_UNKNOWN)
 				/*
-				 * The UPPER's type is the unknown one, and this
-				 * branch cannot resolve it; branch 0 is a local
-				 * writable fs in every supported configuration
-				 * and does report types, so accept the donation
-				 * rather than pay a second lookup.
+				 * The UPPER's type is the unknown one.  Branch
+				 * 0 is a local writable fs and does report
+				 * types, so accept rather than look up again.
 				 */
 				p->ino = aufsng_map_ino(ino, idx);
 		}
@@ -335,13 +283,10 @@ static bool aufsng_fill_merge(struct dir_context *ctx, const char *name,
 				    rdd->idx, &rdd->ino_probes);
 	} else {
 		/*
-		 * Fold the branch slot into the inode number, exactly as the
-		 * stat/getattr path does (aufsng_map_ino), so a file's d_ino
-		 * from readdir matches its st_ino and cannot collide with a
-		 * same-numbered inode in another branch under the one union
-		 * st_dev.  (For upper names with a lower origin the number
-		 * is corrected to the origin's when the origin's branch is
-		 * merged - see aufsng_cache_add().)
+		 * Fold the slot into the number as getattr does, so d_ino
+		 * matches st_ino and cannot collide across branches under
+		 * the one union st_dev.  Upper names with a lower origin
+		 * are corrected when that branch is merged.
 		 */
 		err = aufsng_cache_add(rdd->cache, name, namelen,
 				    aufsng_map_ino(ino, rdd->idx), d_type,
@@ -357,12 +302,10 @@ static bool aufsng_fill_merge(struct dir_context *ctx, const char *name,
 }
 
 /*
- * Open the real directory @realpath with the creator credentials and
- * feed every entry through @dd's actor.  A single iterate_dir() call
- * is not guaranteed to reach the end of the directory, so it is called
- * again until a call adds nothing (the actor counts its accepted
- * entries in dd->count); the actor's own sticky error (dd->err) is
- * honored only when the call itself succeeded.
+ * Open @realpath with creator credentials and feed every entry through
+ * @dd's actor.  One iterate_dir() need not reach the end, so it runs
+ * until a call adds nothing; the actor's sticky error counts only when
+ * the call itself succeeded.
  */
 static int aufsng_dir_drain(struct aufsng_fs *pfs, const struct path *realpath,
 			 struct aufsng_dir_drain *dd)
@@ -407,20 +350,14 @@ static int aufsng_dir_read_layer(struct aufsng_fs *pfs, const struct path *realp
 }
 
 /*
- * Settle which of the rw branch's own entries may still be handed a
- * lower's inode number, now that the branch is drained and no i_rwsem
- * is held.  The rule is aufsng_upper_claims_origin()'s, the same one
- * lookup applies - an entry it refuses keeps the number branch 0 gave
- * it, or readdir's d_ino would contradict stat's st_ino, the very
- * invariant the donation in aufsng_cache_add() exists to hold.
+ * Which of the rw branch's entries may still take a lower's inode
+ * number, now that it is drained and no i_rwsem is held.  The rule is
+ * lookup's own: an entry it refuses keeps branch 0's number, or d_ino
+ * would contradict st_ino.
  *
- * Directories go through it too: they usually claim, but an opaque one
- * ends its own merged stack and is keyed on the upper like any
- * unmarked file.  A failed lookup settles the entry on the upper's
- * number, the conservative answer.
- *
- * Called only with lower branches left to read: with none, no donation
- * can happen and nothing would ever consult the verdict.
+ * Directories go through it too - an opaque one ends its merged stack
+ * and is keyed on the upper.  A failed lookup settles on the upper's
+ * number.  Called only with lowers left to read.
  */
 static void aufsng_cache_fix_unmarked(struct aufsng_fs *pfs,
 				   const struct path *upperpath,
@@ -493,12 +430,10 @@ void aufsng_dir_cache_release(struct aufsng_inode *oi)
 
 /*
  * Merge every branch of @inode into a fresh cache.  With
- * @stop_when_visible (the rmdir/union-emptiness probe) the merge
- * stops at the first branch boundary after a visible entry appears:
- * the answer is already "not empty", and materializing a huge lower
- * directory's full listing just to throw it away would be pure waste.
- * (Stopping mid-branch would be wrong: a later ".wh.<name>" in the
- * same branch may still hide the entry just seen.)
+ * @stop_when_visible (the emptiness probe) it stops at the first
+ * branch boundary after a visible entry: the answer is already "not
+ * empty".  Stopping mid-branch would be wrong - a later ".wh.<name>"
+ * in the same branch may still hide that entry.
  */
 static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
 						bool stop_when_visible)
@@ -520,11 +455,7 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
 	INIT_LIST_HEAD(&cache->entries);
 	cache->root = RB_ROOT;
 
-	/*
-	 * dyn_lock excludes branch changes for the whole merge, so no
-	 * stack this loop touches can be swapped or freed while it
-	 * runs, and the pre-sampled version cannot go stale unseen.
-	 */
+	/* dyn_lock excludes branch changes for the whole merge */
 	percpu_down_read(&pfs->dyn_lock);
 	version = atomic64_read(&AUFSNG_I(inode)->version);
 	old_cred = override_creds(pfs->creator_cred);
@@ -533,15 +464,11 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
 	oe = AUFSNG_I_E(inode);
 
 	/*
-	 * Sample every branch's stamp before reading anything: if a
-	 * concurrent edit lands during the read, the stored stamp stays
-	 * older than the now-current one, so the next reuse check
-	 * rebuilds rather than trust a listing that might have
-	 * half-caught the change.  The stamps feed only udba=reval's
-	 * freshness check (aufsng_dir_cache_fresh); under udba=none
-	 * nothing reads them, so none are taken - a later remount to
-	 * udba=reval then finds nr_stamps == 0, fails the compare and
-	 * rebuilds once, the conservative answer.
+	 * Sample every stamp before reading anything: an edit landing
+	 * during the read leaves the stored stamp older than the current
+	 * one, so the next check rebuilds instead of trusting a listing
+	 * that half-caught it.  Only udba=reval reads them; a remount
+	 * into it finds nr_stamps == 0 and rebuilds once.
 	 */
 	if (aufsng_udba_reval(pfs)) {
 		cache->nr_stamps = 1 + (oe ? oe->numlower : 0);
@@ -563,11 +490,9 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
 		realpath.dentry = upper;
 		err = aufsng_dir_read_layer(pfs, &realpath, cache, 0);
 		/*
-		 * Only worth settling when a lower is actually going to be
-		 * read: the emptiness probe stops at the first visible
-		 * entry and a directory with no lowers takes no donations,
-		 * so in both cases the verdict would cost a lookup per
-		 * entry and never be consulted.
+		 * Only worth settling when a lower will actually be read;
+		 * otherwise the verdict costs a lookup per entry and is
+		 * never consulted.
 		 */
 		if (!err && oe && oe->numlower &&
 		    !(stop_when_visible && cache->nr_visible))
@@ -596,11 +521,10 @@ out:
 }
 
 /*
- * Is @cache still consistent with the branches?  The caller has already
- * checked @version (in-union mutations).  Under udba=reval also require
- * every branch directory's stamp to be unchanged - the only signal an
- * out-of-band branch edit leaves without bumping @version.  Read under
- * oi->lock so the sampled branches match the cache being validated.
+ * Is @cache still consistent with the branches?  The caller checked
+ * @version already; under udba=reval every branch stamp must also be
+ * unchanged - the only signal an out-of-band edit leaves.  Under
+ * oi->lock, so the branches match the cache being validated.
  */
 static bool aufsng_dir_cache_fresh(struct aufsng_fs *pfs, struct inode *inode,
 				   struct aufsng_dir_cache *cache)
@@ -613,10 +537,9 @@ static bool aufsng_dir_cache_fresh(struct aufsng_fs *pfs, struct inode *inode,
 	if (!aufsng_udba_reval(pfs))
 		return true;
 	/*
-	 * RCU-protect the branch-stack walk: oi->lock (held by the
-	 * caller) does not cover the ROOT's entry, which the root swap
-	 * replaces under dyn_lock only and frees one grace period later
-	 * (non-root stacks are parked on the inode until eviction).
+	 * RCU for the walk: oi->lock does not cover the ROOT's entry,
+	 * which the root swap replaces under dyn_lock and frees a grace
+	 * period later.
 	 */
 	rcu_read_lock();
 	upper = aufsng_upperdentry(inode);
@@ -640,12 +563,10 @@ out:
 }
 
 /*
- * Is @cache still the directory's current listing?  Version-valid (no
- * in-union mutation since it was built) AND, under udba=reval, no
- * branch directory edited out-of-band (aufsng_dir_cache_fresh) - the
- * ONE definition of "reusable", shared by open, rewinddir and the
- * rmdir emptiness probe, so a future invalidation signal cannot be
- * added to one copy and missed by another.  Caller holds oi->lock.
+ * Is @cache still the current listing?  Version-valid AND, under
+ * udba=reval, no branch edited out of band - the ONE definition of
+ * "reusable", shared by open, rewinddir and the emptiness probe.
+ * Caller holds oi->lock.
  */
 static bool aufsng_cache_usable(struct aufsng_fs *pfs, struct inode *inode,
 			     struct aufsng_dir_cache *cache)
@@ -668,11 +589,7 @@ static struct aufsng_dir_cache *aufsng_cache_get(struct file *file)
 
 	mutex_lock(&oi->lock);
 	cache = oi->cache;
-	/*
-	 * Reuse the cached listing while it is still usable.  This makes
-	 * the common "nothing changed" open O(1) instead of re-reading
-	 * every branch each time.
-	 */
+	/* Reuse while usable: the "nothing changed" open stays O(1) */
 	if (aufsng_cache_usable(pfs, inode, cache)) {
 		refcount_inc(&cache->refcount);
 	} else {
@@ -704,10 +621,9 @@ static void aufsng_dir_reset(struct file *file)
 	if (!od->cache)
 		return;
 	/*
-	 * rewinddir() must reflect the directory's current state, so
-	 * the freshness probe runs here exactly as it does on a fresh
-	 * open - the version check alone would keep replaying a
-	 * listing an out-of-band branch edit already invalidated.
+	 * rewinddir() must show the current state, so the freshness probe
+	 * runs as on a fresh open: the version check alone would replay a
+	 * listing an out-of-band edit already invalidated.
 	 */
 	mutex_lock(&oi->lock);
 	stale = !aufsng_cache_usable(pfs, inode, od->cache);
@@ -738,12 +654,10 @@ static int aufsng_iterate(struct file *file, struct dir_context *ctx)
 		return PTR_ERR(cache);
 
 	/*
-	 * Offsets 2.. index the (stable, immutable once built) merged
-	 * list; hidden tombstone entries consume an offset so cookies
-	 * stay valid across getdents calls on the same cache.  The
-	 * cursor resumes where the previous call stopped, so a full
-	 * listing costs O(n) in total; a seek anywhere else falls back
-	 * to a scan from the head.
+	 * Offsets 2.. index the merged list, immutable once built;
+	 * tombstones consume an offset so cookies stay valid across
+	 * calls.  The cursor resumes where the last call stopped, making
+	 * a full listing O(n); any other seek scans from the head.
 	 */
 	if (od->cursor && od->cursor_pos == ctx->pos) {
 		node = od->cursor;
@@ -775,10 +689,7 @@ int aufsng_check_empty_dir(struct dentry *dentry)
 	struct aufsng_dir_cache *cache = NULL;
 	int err;
 
-	/*
-	 * A still-valid cached listing already knows the answer; only
-	 * rebuild (aborting at the first visible entry) without one.
-	 */
+	/* A valid cache knows the answer; only rebuild without one */
 	mutex_lock(&oi->lock);
 	if (aufsng_cache_usable(pfs, inode, oi->cache)) {
 		cache = oi->cache;
@@ -793,11 +704,8 @@ int aufsng_check_empty_dir(struct dentry *dentry)
 	}
 
 	/*
-	 * One verdict-and-release tail for both cases: a freshly built probe
-	 * cache comes back at refcount 1, so the put releases it just as a
-	 * direct free would - without a second copy of the verdict, and
-	 * without bypassing the refcount protocol that keeps a shared cache
-	 * alive.
+	 * One tail for both cases: a fresh probe cache comes back at
+	 * refcount 1, so the put frees it while a shared one survives.
 	 */
 	err = cache->nr_visible ? -ENOTEMPTY : 0;
 	aufsng_cache_put(cache);
@@ -840,17 +748,12 @@ static bool aufsng_wh_sweep_actor(struct dir_context *ctx, const char *name,
 }
 
 /*
- * Remove every ".wh."-prefixed bookkeeping name physically present in
- * the rw branch's own @upperdir - per-entry whiteouts, the opaque
- * marker, AND any crash-leftover ".wh..wh." temp (a parked whiteout or
- * copy-up temp file) - so that a union-empty merged dir (see
- * aufsng_check_empty_dir()) can actually be vfs_rmdir'ed: rmdir fails
- * on a directory that still physically contains any of them, even
- * though every one is invisible to the merged view.  The on-disk names
- * are swept verbatim (raw scan of @upperdir alone, not the merged
- * cache): deriving them back from the readdir merge's tombstones would
- * miss exactly the ".wh..wh." bookkeeping class, which the merge
- * deliberately never records.
+ * Remove every ".wh." name physically present in @upperdir - per-entry
+ * whiteouts, the opaque marker and any ".wh..wh." leftover - so a
+ * union-empty directory can actually be vfs_rmdir'ed: rmdir fails
+ * while any remains, invisible to the merged view though they are.
+ * Swept by a raw scan, not from the merge's tombstones, which
+ * deliberately never record the ".wh..wh." class.
  */
 int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir)
 {
@@ -872,14 +775,10 @@ int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir)
 
 	if (!err) {
 		/*
-		 * One lock for the whole sweep.  I_MUTEX_CHILD, not the
-		 * dirop helpers' I_MUTEX_PARENT: the rmdir path already
-		 * holds the upper PARENT directory's lock at that
-		 * subclass while this runs on its child, and taking the
-		 * same subclass twice in the same i_rwsem class is a
-		 * lockdep splat even though the parent->child order
-		 * itself is fine (this mirrors the VFS's own
-		 * parent-PARENT/victim-plain convention in vfs_rmdir()).
+		 * One lock for the sweep, at I_MUTEX_CHILD: rmdir already
+		 * holds the parent at I_MUTEX_PARENT, and the same
+		 * subclass twice is a lockdep splat even though the
+		 * parent->child order is fine.
 		 */
 		int sweep_err = 0;
 
@@ -899,10 +798,9 @@ int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir)
 			if (d_is_positive(whd)) {
 				/*
 				 * ".wh..wh.plnk"/".wh..wh.orph" style
-				 * bookkeeping DIRS (real-AUFS branches,
-				 * live-distro boot scripts) at a branch
-				 * root can reach here via rename over a
-				 * union-empty dir; sweep them too.
+				 * bookkeeping DIRS at a branch root can
+				 * reach here via rename over a union-empty
+				 * dir; sweep them too.
 				 */
 				if (d_is_dir(whd))
 					e = vfs_rmdir(idmap,
@@ -915,13 +813,10 @@ int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir)
 			}
 			dput(whd);
 			/*
-			 * The FIRST failure is the sweep's result - a later
-			 * success must not overwrite it, or the caller sees
-			 * 0 with markers still on disk and the true cause
-			 * (EPERM from an immutable marker, EIO, ENOSPC) is
-			 * replaced by whatever the follow-up vfs op reports.
-			 * The sweep still continues: every marker removed
-			 * is one less to block the retry.
+			 * The FIRST failure is the result: a later success
+			 * must not hide it, or the caller sees 0 with
+			 * markers still on disk.  The sweep continues -
+			 * each one removed is one less blocking the retry.
 			 */
 			if (e && !sweep_err)
 				sweep_err = e;
@@ -973,13 +868,10 @@ static int aufsng_dir_fsync(struct file *file, loff_t start, loff_t end,
 	int err;
 
 	/*
-	 * Installers fsync a parent directory to make a create/rename
-	 * durable before committing a transaction; only the rw branch
-	 * can hold such dirty state (the lowers are read-only), and a
-	 * directory with no upper has had no union mutations at all.
-	 * The union keeps no long-lived real dir file (aufsng_dir_open
-	 * only builds the merged cache), so the upper dir is opened for
-	 * the sync, as original AUFS's au_do_fsync_dir_no_file does.
+	 * Only the rw branch can hold dirty directory state, and a dir
+	 * with no upper has seen no union mutation at all.  The union
+	 * keeps no long-lived real dir file, so the upper is opened for
+	 * the sync, as AUFS's au_do_fsync_dir_no_file does.
 	 */
 	if (!upper)
 		return 0;

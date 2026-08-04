@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * aufs-ng superblock and module setup.  Registers filesystem type
- * "aufs" (see aufs-ng.h) so real AUFS mount/remount invocations work
- * unmodified, and so the kernel's standard "mount -t aufs" module
- * auto-loading (request_module("fs-aufs")) picks up this module
- * instead of requiring any initrd/script changes.
+ * Superblock and module setup.  Registers filesystem type "aufs", so
+ * real AUFS mount commands and "mount -t aufs" auto-loading both find
+ * this module unchanged.
  */
 
 #include <linux/module.h>
@@ -24,6 +22,12 @@ MODULE_LICENSE("GPL");
 MODULE_ALIAS_FS(AUFSNG_NAME);
 
 static struct kmem_cache *aufsng_inode_cachep;
+
+/*
+ * Source of the "si=" id, one per mount.  A counter, not AUFS's masked
+ * sbinfo address: same uniqueness, no kernel address on show.
+ */
+static atomic_long_t aufsng_si_last = ATOMIC_LONG_INIT(0);
 
 struct aufsng_entry *aufsng_alloc_entry(unsigned int numlower)
 {
@@ -52,13 +56,9 @@ void aufsng_free_entry(struct aufsng_entry *oe)
 }
 
 /*
- * Wrap a resolved copy-up origin into the 0-or-1-entry stack that keys a
- * non-directory union inode.  ALWAYS consumes *@origin: the reference
- * moves into the returned entry, or is dropped if the allocation fails,
- * and @origin->dentry is left NULL either way.  One owner for that
- * handoff - lookup, create and the branch-removal re-point each used to
- * open-code it with a slightly different convention, which is how a
- * double-dput or a leak gets introduced by editing just one of them.
+ * Wrap a copy-up origin into the 0-or-1-entry stack that keys a
+ * non-directory inode.  ALWAYS consumes *@origin - the reference moves
+ * into the entry or is dropped - so the handoff has one owner.
  */
 struct aufsng_entry *aufsng_entry_from_origin(int found,
 					struct aufsng_path *origin)
@@ -78,15 +78,10 @@ struct aufsng_entry *aufsng_entry_from_origin(int found,
 }
 
 /*
- * Build a stack that puts @dentry (in @layer, reached through @mnt) on
- * top of the first @base_n entries of @cur, taking a reference per
- * copied dentry.  The branch mount is passed in rather than read from
- * @layer->mnt: the add path builds the new stack BEFORE publishing the
- * slot.  Deliberately no mntget - a live stack's mounts are pinned by
- * the layer itself (only a PARKED stack pins its own, see struct
- * aufsng_dyn_parked).  Shared by the root-stack rebuild of a branch add
- * and the per-directory splice, so what a lowerstack entry must carry is
- * defined in exactly one place.
+ * Put @dentry (in @layer, via @mnt) on top of @cur's first @base_n
+ * entries, one reference per copied dentry.  @mnt is passed in because
+ * the add path builds the stack before publishing the slot.  No mntget:
+ * a live stack's mounts are pinned by the branch itself.
  */
 struct aufsng_entry *aufsng_entry_prepend(struct aufsng_entry *cur,
 				     unsigned int base_n,
@@ -134,11 +129,9 @@ static void aufsng_destroy_inode(struct inode *inode)
 
 	dput(oi->upperdentry);
 	/*
-	 * The current stack's dentries must drop BEFORE the parked mount
-	 * pins: a deleted-but-open object whose branch was removed keeps
-	 * its stack in place, pinned only by a pin-only parked node
-	 * (aufsng_dyn_pin_stack) - releasing that node's mounts first
-	 * would tear the branch down under the stack's own dentries.
+	 * Stack dentries drop BEFORE the parked mount pins: a
+	 * deleted-but-open object's stack is pinned only by the parked
+	 * node, so the other order tears the branch down under it.
 	 */
 	if (oi->oe)
 		aufsng_stack_put(oi->oe->lowerstack, oi->oe->numlower);
@@ -151,12 +144,7 @@ static void aufsng_free_inode(struct inode *inode)
 {
 	struct aufsng_inode *oi = AUFSNG_I(inode);
 
-	/*
-	 * The aufsng_entry struct itself is freed here, an RCU grace
-	 * period after eviction: lockless readers of AUFSNG_I_E() may
-	 * still be dereferencing it (its dentry references were
-	 * already dropped in aufsng_destroy_inode()).
-	 */
+	/* A grace period after eviction: AUFSNG_I_E() readers are lockless */
 	aufsng_dyn_free_parked(oi);
 	kfree(oi->oe);
 	mutex_destroy(&oi->lock);
@@ -171,12 +159,7 @@ static int aufsng_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct path path;
 	int err;
 
-	/*
-	 * No lock: branch 0 is written exactly once, in
-	 * aufsng_fill_super() - runtime add/remove only ever touch
-	 * slots >= 1 - and every other aufsng_upper_mnt() reader is
-	 * already lockless on the same grounds.
-	 */
+	/* No lock: branch 0 is written once, at mount; adds touch slots >= 1 */
 	path.mnt = aufsng_upper_mnt(pfs);
 	path.dentry = path.mnt->mnt_root;
 	err = vfs_statfs(&path, buf);
@@ -191,49 +174,13 @@ static int aufsng_statfs(struct dentry *dentry, struct kstatfs *buf)
 static int aufsng_show_options(struct seq_file *m, struct dentry *dentry)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
-	struct aufsng_entry *oe;
-	unsigned int i;
 
 	/*
-	 * The full branch list in priority order, as real AUFS prints
-	 * it without sysfs: branch 0 (rw) first, then the root stack
-	 * top-down.  This is the only place branch PRIORITY is visible
-	 * to userspace (the branches' own mounts show membership, not
-	 * order).  Long lines are safe for every consumer PorteuX
-	 * actually runs: boot-time module adds pass explicit options
-	 * (no replay), the live system's mount is util-linux, and the
-	 * shutdown script only ever umounts - all verified against the
-	 * real scripts and BusyBox 1.37 under strace.  (BusyBox's
-	 * getmntent does truncate >1K lines on bare-mountpoint option
-	 * REPLAY, but the parse ignores a replayed br: on remount, so
-	 * even a manual `busybox mount -o remount` in an initrd rescue
-	 * shell cannot feed a truncated branch list back in.)
-	 *
-	 * RCU, not dyn_lock: the /proc/mounts reader already holds
-	 * namespace_sem, and dyn_lock ranks before the branch dirs'
-	 * i_rwsem (lookup), which ranks before namespace_sem
-	 * (lock_mount) - taking dyn_lock here would close that cycle
-	 * into a deadlock.  RCU is sufficient: a superseded root stack
-	 * is freed only after a grace period, and branch removal
-	 * releases the branch's path string after that same grace period
-	 * (aufsng_dyn_release_branch ordering in aufsng_dyn_del_branch),
-	 * so whichever stack this snapshot sees, its branches are intact.
-	 * The stack reaches each branch by pointer, so the slot table -
-	 * which a concurrent add may be reallocating - is not touched.
+	 * The mount id, and no branch list - as AUFS, which prints "br:"
+	 * only with its sysfs tree off.  Hundreds of branches would push
+	 * the line past 4 KB and break readers with fixed line buffers.
 	 */
-	rcu_read_lock();
-	seq_puts(m, ",br:");
-	seq_escape(m, pfs->upper->path, " \t\n\\");
-	seq_printf(m, "=%s", pfs->upper->perm);
-	oe = AUFSNG_E(dentry);
-	for (i = 0; oe && i < oe->numlower; i++) {
-		const struct aufsng_layer *layer = oe->lowerstack[i].layer;
-
-		seq_putc(m, ':');
-		seq_escape(m, layer->path, " \t\n\\");
-		seq_printf(m, "=%s", layer->perm);
-	}
-	rcu_read_unlock();
+	seq_printf(m, ",si=%lx", pfs->si_id);
 	if (pfs->config.xino_path)
 		seq_show_option(m, "xino", pfs->config.xino_path);
 	switch (pfs->config.udba) {
@@ -251,17 +198,10 @@ static int aufsng_show_options(struct seq_file *m, struct dentry *dentry)
 }
 
 /*
- * Make branch slot @idx exist and hand back the branch it holds,
- * growing the slot table if the mount has run out of them.  Both the
- * table and the branches survive until umount: the table because
- * nothing may find it half-copied, the branches because cached
- * aufsng_entry stacks point straight at them.  So a slot vacated by a
- * branch removal keeps its (mnt == NULL) branch object for the next
- * add to reuse, and a spare left behind by a FAILED add is picked up by
- * the following one instead of leaking.
- *
- * Callers hold sb->s_umount exclusively (mount or remount), which is
- * what serialises the table against the only other paths that read it.
+ * Make slot @idx exist and return its branch, growing the slot table if
+ * needed.  Table and branches live until umount, so a slot freed by a
+ * removal - or left behind by a failed add - is reused, not leaked.
+ * Callers hold sb->s_umount exclusively.
  */
 struct aufsng_layer *aufsng_layer_reserve(struct aufsng_fs *pfs,
 					  unsigned int idx)
@@ -269,11 +209,6 @@ struct aufsng_layer *aufsng_layer_reserve(struct aufsng_fs *pfs,
 	struct aufsng_layer **layers, *layer;
 	unsigned int cap;
 
-	/*
-	 * Not a preallocation limit - the table grew to here on demand -
-	 * but the point past which a slot number would no longer fit the
-	 * i_ino folding; see AUFSNG_MAXBRANCH.
-	 */
 	if (idx >= AUFSNG_MAXBRANCH) {
 		pr_err("aufs: too many branches, limit is %d\n",
 		       AUFSNG_MAXBRANCH);
@@ -283,7 +218,7 @@ struct aufsng_layer *aufsng_layer_reserve(struct aufsng_fs *pfs,
 	if (idx >= pfs->numlayer_cap) {
 		cap = min_t(unsigned int, max(2 * pfs->numlayer_cap, idx + 1),
 			    AUFSNG_MAXBRANCH);
-		/* kvcalloc: a 32767-branch table is past kmalloc's comfort */
+		/* kvcalloc: a table at the ceiling is past kmalloc's comfort */
 		layers = kvcalloc(cap, sizeof(*layers), GFP_KERNEL);
 		if (!layers)
 			return ERR_PTR(-ENOMEM);
@@ -311,14 +246,9 @@ static void aufsng_free_fs(struct aufsng_fs *pfs)
 	unsigned int i, nr = 0;
 
 	/*
-	 * Collect the branch mounts and tear them all down behind ONE
-	 * grace period: kern_unmount() is mnt_make_shortterm() +
-	 * synchronize_rcu() + mntput(), so unmounting them one at a time
-	 * costs a full grace period PER BRANCH - seconds of shutdown on a
-	 * live system with hundreds of modules loaded.  Same batching
-	 * aufsng_dyn_release_branch() already uses for a single branch.
-	 * The vector is a convenience, not a requirement: without it the
-	 * one-at-a-time path still works, and umount cannot fail.
+	 * All branches behind ONE grace period: kern_unmount() waits for
+	 * one per call, which is seconds with hundreds of branches.  The
+	 * vector is optional - without it the slower path still works.
 	 */
 	mnts = kvmalloc_array(pfs->numlayer_cap, sizeof(*mnts), GFP_KERNEL);
 	for (i = 0; i < pfs->numlayer_cap; i++) {
@@ -372,12 +302,7 @@ int aufsng_check_layer(struct super_block *sb, const struct path *path,
 		pr_err("aufs: %s is not a directory\n", name);
 		return -ENOTDIR;
 	}
-	/*
-	 * Branches whose dentries need revalidation (remote fs) are not
-	 * supported: revalidation of the real dentries is skipped, on
-	 * the same grounds as the dynamic-layers overlayfs patch this
-	 * design was ported from.
-	 */
+	/* Branches needing dentry revalidation (remote fs) are unsupported */
 	if (path->dentry->d_flags & (DCACHE_OP_REVALIDATE |
 				     DCACHE_OP_WEAK_REVALIDATE)) {
 		pr_err("aufs: %s is on a remote filesystem, not supported\n",
@@ -392,13 +317,10 @@ int aufsng_check_layer(struct super_block *sb, const struct path *path,
 }
 
 /*
- * A branch must not be the same directory as - or nest inside - any
- * other branch (real AUFS's test_overlap): with nesting, a whiteout
- * created in one branch's directory tree is simultaneously a live
- * marker inside the other branch, so deleting one union path silently
- * hides an unrelated one.  is_subdir() answers ancestry within one sb
- * (it also matches equal dentries); branches on different filesystems
- * cannot overlap on disk and need no check.
+ * No branch may equal or nest inside another (AUFS's test_overlap):
+ * nested, a whiteout in one branch is a live marker in the other, so
+ * one deletion hides an unrelated name.  is_subdir() answers ancestry
+ * within one sb; different filesystems cannot overlap.
  */
 int aufsng_check_overlap(struct aufsng_fs *pfs, struct dentry *dentry,
 		      const char *name)
@@ -418,19 +340,14 @@ int aufsng_check_overlap(struct aufsng_fs *pfs, struct dentry *dentry,
 }
 
 /*
- * The whiteout probe for a name turns it into ".wh.<name>" in the
- * same branch directory (see aufsng_wh_name()), so the advertised name
- * limit must leave room for that prefix, and must be the SMALLEST
- * limit across branches, not the largest - a name a shallower branch
- * cannot even store must not be accepted just because a deeper one
- * could.
+ * A whiteout adds ".wh." to the name, so the advertised limit must
+ * leave room for the prefix - and must be the SMALLEST across
+ * branches, or a name no shallow branch can store gets accepted.
  */
 /*
- * Make room for at least @need elements of @elemsize in *@arr, doubling
- * the capacity from a floor of 16.  One growth policy for the mount-time
- * parser's branch arrays and for dynlayer's inode-walk arrays alike;
- * they differ only in allocation context, which @gfp carries (the walks
- * grow under s_inode_list_lock + i_lock and must pass GFP_ATOMIC).
+ * Room for @need elements of @elemsize in *@arr, doubling from a floor
+ * of 16.  One growth policy for every caller; they differ only in
+ * allocation context, which @gfp carries.
  */
 int aufsng_grow_array(void **arr, size_t *cap, size_t need, size_t elemsize,
 		   gfp_t gfp)
@@ -494,11 +411,7 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		errorfc(fc, "the first branch (index 0) must be 'rw'");
 		return -EINVAL;
 	}
-	/*
-	 * Declaring branch 0 'rw' is not enough - it must actually be
-	 * writable, or every create/copy-up/whiteout would fail with
-	 * EROFS long after the mount reported success.
-	 */
+	/* Declaring branch 0 rw is not enough: EROFS later would be worse */
 	if (sb_rdonly(ctx->br[0].path.mnt->mnt_sb) ||
 	    (ctx->br[0].path.mnt->mnt_flags & MNT_READONLY)) {
 		errorfc(fc, "the rw branch '%s' is on a read-only filesystem or mount",
@@ -517,6 +430,7 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto out_free;
 	err = -ENOMEM;
 	atomic_long_set(&pfs->branch_gen, 0);
+	pfs->si_id = atomic_long_inc_return(&aufsng_si_last);
 	pfs->config.xino_path = ctx->config.xino_path;
 	ctx->config.xino_path = NULL;
 	pfs->config.udba = ctx->config.udba;
@@ -566,10 +480,8 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 			goto out_free;
 		}
 		/*
-		 * Only branch 0 is ever written (see README: "only the
-		 * first branch can be" rw); a lower branch declared rw is
-		 * accepted for AUFS grammar compatibility but its private
-		 * clone is read-only like every other lower.
+		 * Only branch 0 is ever written; a lower "=rw" is accepted
+		 * for AUFS grammar but cloned read-only anyway.
 		 */
 		if (i > 0 || ctx->br[i].perm != AUFSNG_BR_RW)
 			mnt->mnt_flags |= MNT_READONLY | MNT_NOATIME;
@@ -577,22 +489,10 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		layer->mnt = mnt;
 		layer->path = ctx->br[i].name;
 		ctx->br[i].name = NULL;
-		/*
-		 * Echo back the mode the branch actually HAS, not the one that
-		 * was asked for: a lower "=rw" is accepted but demoted above,
-		 * and /proc/mounts is the only place the branch modes are
-		 * exposed - reporting "=rw" for a branch aufs-ng will never
-		 * write would mislead every script that parses it.  Warn once
-		 * so the demotion is not silent either.
-		 */
-		if (i > 0 && ctx->br[i].perm == AUFSNG_BR_RW) {
+		/* The only notice: no branch mode is echoed to userspace. */
+		if (i > 0 && ctx->br[i].perm == AUFSNG_BR_RW)
 			pr_warn("aufs (aufs-ng): branch '%s' declared rw but only the first branch is writable; using ro\n",
 				layer->path);
-			strscpy(layer->perm, "ro", AUFSNG_PERM_LEN);
-		} else {
-			strscpy(layer->perm, ctx->br[i].permstr,
-				AUFSNG_PERM_LEN);
-		}
 		pfs->numlayer++;
 	}
 	pfs->upper = pfs->layers[0];
@@ -624,12 +524,9 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 	/* AUFS mounts always have root inode 2; scripts test for it */
 	root_inode->i_ino = AUFSNG_ROOT_INO;
 	/*
-	 * Through the one attribute-mirror helper, like every other inode
-	 * (aufsng_fill_inode): a partial open-coded copy here left the root
-	 * as the single inode reporting mount-time timestamps instead of the
-	 * rw branch's, and would silently miss any field later added to the
-	 * shared mirror.  The merged directory link count is computed at
-	 * stat time (aufsng_getattr), not from the stored i_nlink.
+	 * The shared mirror helper, as every other inode uses: an
+	 * open-coded copy here left the root reporting mount-time
+	 * timestamps.  The merged dir link count is computed in getattr.
 	 */
 	aufsng_copyattr_from(root_inode, rw_inode);
 	root_inode->i_op = &aufsng_dir_inode_operations;

@@ -1,40 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * aufs-ng dentry revalidation.
+ * Dentry revalidation.  Branch add/remove updates the stack surgically
+ * (dynlayer.c), so what can go stale is the relation to a branch edited
+ * out of band (udba=reval), plus one union-own case:
  *
- * The branch stack itself is updated surgically on runtime branch
- * add/remove (see dynlayer.c), so cached dentries never go stale from
- * the union's own operations.  What CAN go stale under udba=reval is
- * the relationship to the real branches when one is edited directly,
- * out of band:
+ *  - a cached negative hides a name a branch now provides;
+ *  - a cached positive serves an object whose real entry was unlinked
+ *    (free: the branch fs unhashes the very dentry pinned here);
+ *  - a lower-only positive misses an upper entry or whiteout created
+ *    out of band;
+ *  - a lower-only positive keeps an old branch after an add gave the
+ *    name to a higher-priority one.
  *
- *  - a cached negative dentry hides a name a branch now provides
- *    (typically a ".wh.<name>" whiteout removed by hand in the rw
- *    branch);
- *  - a cached positive dentry keeps serving an object whose real
- *    upper/lower entry was unlinked or renamed away;
- *  - a cached lower-only positive dentry misses an upper entry (or
- *    whiteout) created out-of-band in the rw branch directory;
- *  - a cached lower-only positive dentry keeps resolving an old branch
- *    after a runtime branch add handed the name to a higher-priority
- *    one (directory inodes are spliced in place by dynlayer.c, but a
- *    non-directory's winning branch can only change via re-lookup).
- *
- * The first is a per-branch rescan (aufsng_lookup_negative_valid); the
- * second is free, because the pinned real dentries share the branch
- * filesystem's own dcache, so the out-of-band edit unhashes the very
- * dentry cached here.  The third and fourth need real branch lookups,
- * gated by two INDEPENDENT signals so neither triggers the other's
- * probe: d_fsdata carries the upper dir's mtime/iversion stamp (gates
- * the upper probe), and the dentry's d_time carries the branch
- * generation (gates the winning-branch re-check) - an ordinary write
- * in a directory must not send every cached lower-only sibling on an
- * all-branch rescan.  Each probe runs once per observed change, not
- * once per access.  Positive revalidation also re-syncs the union
- * inode's permission-relevant attributes with the real inode, so an
- * out-of-band chmod/chown is enforced (there is no .permission hook;
- * the VFS checks the union inode's cached mode, while getattr already
- * passes through - without the re-sync the two disagree forever).
+ * The last two probe the branches, gated by two INDEPENDENT signals so
+ * neither fires the other's probe: d_fsdata holds the upper dir's
+ * change stamp, d_time the branch generation.  Each probe runs once
+ * per observed change.  Positive revalidation also re-syncs the union
+ * inode's mode/uid/gid: there is no .permission hook, so without it an
+ * out-of-band chmod is never enforced.
  */
 
 #include <linux/fs.h>
@@ -54,12 +37,9 @@ static unsigned long aufsng_dir_stamp(struct inode *dir)
 }
 
 /*
- * The d_fsdata stamp a child of @dir is revalidated against: the upper
- * dir's change signal (out-of-band creates/whiteouts, udba=reval
- * only).  The branch-change signal is deliberately NOT folded in - it
- * lives in the dentry's d_time, so the two probes stay
- * independently gated.  Also used by lookup to prime a fresh dentry
- * with the state it just resolved against.
+ * The d_fsdata stamp a child of @dir is revalidated against.  The
+ * branch-change signal is deliberately not folded in: it lives in
+ * d_time, keeping the two probes independently gated.
  */
 unsigned long aufsng_reval_stamp(struct aufsng_fs *pfs, struct inode *dir)
 {
@@ -69,11 +49,7 @@ unsigned long aufsng_reval_stamp(struct aufsng_fs *pfs, struct inode *dir)
 	       aufsng_dir_stamp(d_inode(pupper)) : 0;
 }
 
-/*
- * Re-sync the union inode's permission-relevant attributes with the
- * real inode when they drifted (out-of-band chmod/chown, or a branch
- * change that swapped the top real object).
- */
+/* Re-sync mode/uid/gid with the real inode when they drifted */
 static int aufsng_attrs_valid(struct inode *inode, struct inode *real,
 			      unsigned int flags)
 {
@@ -83,35 +59,20 @@ static int aufsng_attrs_valid(struct inode *inode, struct inode *real,
 		return 1;
 	if (flags & LOOKUP_RCU)
 		return -ECHILD;
-	/*
-	 * @real is the very object aufsng_path_real() would resolve, and the
-	 * one whose drift was just detected: re-deriving it through the
-	 * lockless upper/stack protocol (aufsng_copyattr) would only repeat
-	 * work the caller already did.
-	 */
+	/* @real is what aufsng_path_real() would resolve; don't re-derive it */
 	aufsng_copyattr_from(inode, real);
 	return 1;
 }
 
 /*
- * Does @upper carry @name inside @dir's own upper directory?  Lower
- * hardlink siblings share one union inode whose single upperdentry
- * holds whichever name was copied up first, so "the inode has an
- * upper" is a per-INODE fact while revalidation needs the per-NAME
- * one.
+ * Does @upper carry @name in @dir's upper directory?  "The inode has an
+ * upper" is per-INODE (hardlink siblings share it); revalidation needs
+ * the per-NAME answer.
  *
- * The compare is d_same_name(), the dcache's own: nothing here locks
- * @upper (RCU walk may not block, and even in ref-walk the pinning
- * reference stops the dentry from being freed but not from being
- * RENAMED), so a concurrent d_move() can swap d_name mid-compare -
- * switching a long external name for the short inline buffer and
- * kfree_rcu()ing the old one.  d_same_name() survives that by
- * construction (its dentry_cmp() stops at the NUL that cannot occur in
- * the search name, and external names are RCU-freed), and it honors a
- * branch fs's own ->d_compare; a hand-rolled len + memcmp pair does
- * neither and can read past the inline buffer or into freed memory.
- * The rcu_read_lock() is what makes the RCU-delayed free enough in
- * ref-walk too; in RCU walk it just nests.
+ * d_same_name() under RCU, not a hand-rolled len + memcmp: nothing
+ * locks @upper, so a concurrent d_move() can swap d_name mid-compare
+ * and kfree_rcu() the old external name.  d_same_name() survives that
+ * and honors the branch fs's own ->d_compare.
  */
 static bool aufsng_upper_carries_name(struct inode *dir, struct dentry *upper,
 				      const struct qstr *name)
@@ -148,12 +109,9 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	int wh = 0;
 
 	/*
-	 * An out-of-band unlink/rename of the real entry unhashes the
-	 * pinned real dentry itself - detectable without any lookup,
-	 * also in RCU walk.  All out-of-band signals (this, the attr
-	 * re-sync, the upper-dir probe below) are udba=reval only; the
-	 * branch-change signal further down applies in every mode, since
-	 * a runtime branch add is the union's own operation.
+	 * An out-of-band unlink/rename unhashes the pinned real dentry -
+	 * no lookup needed, RCU walk included.  Out-of-band signals are
+	 * udba=reval only; the branch-change signal below is not.
 	 */
 	if (upper) {
 		if (!reval)
@@ -161,14 +119,10 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 		if (!aufsng_dentry_alive(upper))
 			return 0;
 		/*
-		 * "No branch outranks the upper" is a per-NAME statement,
-		 * and the shared inode's upper may carry a DIFFERENT name
-		 * (a lower hardlink sibling of a copied-up name).  Only
-		 * the name the upper actually provides may return here;
-		 * a sibling name is still lower-provided and must run
-		 * the per-name whiteout/shadow gates below, or a branch
-		 * change that whites it out is never seen (the bug
-		 * commit acd6308 fixed, reachable again via copy-up).
+		 * Per-NAME: the shared inode's upper may carry a different
+		 * name (a hardlink sibling).  A sibling name is still
+		 * lower-provided and must run the gates below, or a branch
+		 * change whiting it out is never seen.
 		 */
 		if (!dir || aufsng_upper_carries_name(dir, upper, name))
 			return aufsng_attrs_valid(inode, d_inode(upper), flags);
@@ -183,26 +137,16 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	}
 
 	/*
-	 * Lower-only object: two signals can invalidate it, each gating
-	 * its own probe.  An upper entry or whiteout created out-of-band
-	 * in the rw branch would shadow or hide it (the upper dir's
-	 * mtime/iversion stamp in d_fsdata, udba=reval only), and a
-	 * runtime branch add can hand the name to a higher-priority
-	 * branch (branch_gen vs. the dentry's d_time).  Directories run
-	 * the generation re-check too: the in-place splice NORMALLY
-	 * keeps them right (so the re-check simply passes once and
-	 * re-stamps), but the splice legitimately skips a directory on
-	 * its documented fallbacks - resolve deeper than the replay
-	 * limit, a transient probe error, an allocation failure - and
-	 * branch_gen moves regardless.  An exemption made every skip
-	 * PERMANENT: the stale stack answered child lookups and readdir
-	 * forever while a cold-cache walk of the same path saw the new
-	 * branch.  The re-check turns a skip into one dropped dentry and
-	 * a fresh lookup instead.  The generation stamp lives on the
-	 * DENTRY: lower hardlink siblings share one union inode, but a
-	 * branch can whiteout or shadow one sibling name and not the
-	 * other, so each name re-checks for itself.  Each probe runs
-	 * once per observed change, not once per access.
+	 * Lower-only: two signals, each gating its own probe.  An upper
+	 * entry or whiteout created out of band would shadow it (d_fsdata
+	 * stamp, udba=reval only); a branch add can give the name to a
+	 * higher-priority branch (branch_gen vs. d_time).
+	 *
+	 * Directories run the generation re-check too.  The in-place
+	 * splice normally keeps them right, but it legitimately skips a
+	 * directory on its fallbacks while branch_gen moves anyway;
+	 * exempting them made every skip permanent.  The stamp is
+	 * per-DENTRY: a branch can hide one hardlink sibling name only.
 	 */
 	if (!dir)
 		return 1;
@@ -231,23 +175,15 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 		if (this) {
 			/*
 			 * The rw branch now provides the name.  A same-type
-			 * upper is adopted in place - this also refreshes a
-			 * directory's merged listing and preserves submounts
-			 * that a d_invalidate() would detach.  A different type
-			 * means the cached inode is the wrong object: drop it.
-			 * An OPAQUE upper directory is never adopted either:
-			 * fresh lookups honor the marker and hide every lower,
-			 * while an adopt would keep this cached dir's lower
-			 * stack (and its lower-only children) alive - a
-			 * per-path split brain until eviction.  Drop the
-			 * dentry so a fresh lookup rebuilds the upper-only
-			 * view, exactly as aufsng_lookup() would resolve it.
-			 *
-			 * Nor is an upper that claims no copy-up origin: this
-			 * one appeared out of band, so nothing marked it, and
-			 * adopting it would keep the cached inode keyed on a
-			 * lower that a fresh lookup - and readdir's d_ino -
-			 * would no longer use.  Same remedy, same reason.
+			 * upper is adopted in place, which also preserves
+			 * submounts a d_invalidate() would detach.  Not
+			 * adopted, and dropped so a fresh lookup rebuilds the
+			 * view: a different type, an OPAQUE directory (lookups
+			 * hide every lower, an adopt would keep this dir's
+			 * lower stack alive), and an upper claiming no copy-up
+			 * origin (it appeared out of band, so the cached
+			 * inode's key is not the one a fresh lookup and
+			 * readdir's d_ino would use).
 			 */
 			bool adopt = aufsng_origin_type_ok(this, inode->i_mode);
 
@@ -263,11 +199,8 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 				adopt = !opq;
 			} else if (adopt) {
 				/*
-				 * The directory arm above is what
-				 * aufsng_upper_claims_origin() would answer
-				 * for a directory, kept open-coded so a
-				 * failed probe can keep the dentry and
-				 * re-probe rather than drop it.
+				 * Open-coded for directories above so a
+				 * failed probe can keep the dentry.
 				 */
 				adopt = aufsng_upper_claims_origin(pfs, this,
 								name);
@@ -286,16 +219,11 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	}
 
 	/*
-	 * No upper claim, and the generation moved: re-run the merge's
-	 * "which branch wins this name" decision - a branch added above
-	 * the cached origin (or a whiteout it carries) means this dentry
-	 * resolves the wrong object now and must be dropped for a fresh
-	 * lookup.  For a directory the splice normally already updated
-	 * the stack, so the top-lower compare below passes and only
-	 * re-stamps; a mismatch means the splice skipped it (see the
-	 * gen_hit comment above) and dropping is the heal - the cost, a
-	 * detached subtree of cached dentries, is the same one the
-	 * splice's own unhash path pays for a hidden directory.
+	 * The generation moved: re-run the "which branch wins this name"
+	 * decision.  A branch added above the cached origin, or a whiteout
+	 * it carries, means this dentry resolves the wrong object.  For a
+	 * directory the compare normally just passes and re-stamps; a
+	 * mismatch means the splice skipped it, and dropping is the heal.
 	 */
 	if (!gen_hit) {
 		found = aufsng_find_origin(AUFSNG_I_E(dir), name, &origin);
@@ -326,12 +254,9 @@ static int aufsng_d_revalidate(struct inode *dir, const struct qstr *name,
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
 
 	/*
-	 * The root is never stale: its aufsng_entry is swapped in place
-	 * when the layer stack changes.  udba=none trusts the cache
-	 * for everything out-of-band, matching AUFS; the union's own
-	 * branch changes are still honored by the positive path (its
-	 * negative counterpart is aufsng_dyn_drop_neg_children(), which
-	 * the branch-change paths run in every udba mode).
+	 * The root is never stale: its entry is swapped in place on a
+	 * branch change.  udba=none trusts the cache out of band, as
+	 * AUFS; the union's own branch changes are still honored.
 	 */
 	if (unlikely(IS_ROOT(dentry)))
 		return 1;
@@ -343,12 +268,9 @@ static int aufsng_d_revalidate(struct inode *dir, const struct qstr *name,
 		if (!aufsng_udba_reval(pfs) || !dir)
 			return 1;
 		/*
-		 * Gate the per-branch rescan on the same two signals the
-		 * positive path uses (both primed by lookup): the upper
-		 * dir's change stamp and the branch generation.  Without
-		 * the gate every access to a cached miss (PATH/include
-		 * probes) pays an upper probe plus a whole-lower-stack
-		 * scan; with it the steady state is two integer compares.
+		 * Same two signals as the positive path.  Without the gate
+		 * every access to a cached miss pays an upper probe plus a
+		 * full lower-stack scan.
 		 */
 		stamp = aufsng_reval_stamp(pfs, dir);
 		gen = atomic_long_read(&pfs->branch_gen);

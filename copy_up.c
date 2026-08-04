@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * aufs-ng copy-up: give a lower-backed object an upper copy before
- * the first modification.  Regular file data is copied into a
- * uniquely named file in the workdir and renamed into place, so a
- * half-copied file is never visible under its real name; directories,
- * symlinks and special files are created in place (their "data" is
- * atomic by nature).  Runs with the mounter's credentials; ownership,
- * mode, times and xattrs are copied from the lower original.
+ * Copy-up: give a lower-backed object an upper copy before the first
+ * modification.  File data goes into a uniquely named temp and is
+ * renamed into place, so a half-copied file is never visible under its
+ * real name; everything else is created in place.  Runs with the
+ * mounter's credentials, copying mode, ownership, times and xattrs.
  */
 
 #include <linux/fs.h>
@@ -23,12 +21,9 @@
 static atomic_t aufsng_tmpfile_seq = ATOMIC_INIT(0);
 
 /*
- * Discard the invisible ".wh..wh.pxu" temp of a failed or superseded
- * copy-up.  With no write access (the rw branch went read-only between
- * prep and commit) the temp cannot be removed at all - it then stays
- * until a clear_whiteouts sweep of its directory, so leave a trace for
- * the admin.  The one policy for both the prep-side and commit-side
- * failure paths.
+ * Discard the ".wh..wh.pxu" temp of a failed copy-up.  With no write
+ * access left it cannot be removed at all and stays until a
+ * clear_whiteouts sweep, so log it.  One policy for both failure paths.
  */
 static void aufsng_discard_tmp(struct aufsng_fs *pfs, struct dentry *pupper,
 			    const struct qstr *tmp, const char *tmpbuf)
@@ -76,11 +71,7 @@ retry:
 		if (size == -ERANGE || (size > 0 && !value)) {
 			void *new_value;
 
-			/*
-			 * With no buffer yet the call above was already
-			 * the size probe; only -ERANGE (the value grew
-			 * past the buffer) needs a fresh one.
-			 */
+			/* The call above was the size probe; only -ERANGE needs a new one */
 			if (size == -ERANGE)
 				size = vfs_getxattr(old_idmap, oldpath->dentry,
 						    name, NULL, 0);
@@ -116,15 +107,9 @@ out:
 
 /*
  * Record on @upper that the lower called @name is its copy-up origin.
- *
- * Best effort: a branch fs that will not hold the xattr simply leaves
- * the object unmarked, which costs it a stable st_ino across cache
- * eviction and nothing else - far better than failing the copy-up over
- * bookkeeping.  Unlike the cp -a of a lower's own xattrs above, though,
- * EOPNOTSUPP is not silently fine here: it means every copy-up on this
- * branch loses that stability, which the admin should hear about.  One
- * line for the module either way - the condition is per rw branch, and
- * a mount has exactly one.
+ * Best effort: a branch that will not hold the xattr just loses a
+ * stable st_ino across eviction, which beats failing the copy-up.
+ * Warned once, since the condition is per rw branch.
  */
 static void aufsng_mark_origin(struct aufsng_fs *pfs, struct dentry *upper,
 			    const struct qstr *name)
@@ -139,11 +124,9 @@ static void aufsng_mark_origin(struct aufsng_fs *pfs, struct dentry *upper,
 }
 
 /*
- * Was @upper copied up under @name?  The stored name is what scopes an
- * inode-wide xattr to one name: a second link to the same inode, or the
- * same inode carrying a name it was renamed to, does not match and so
- * claims no origin.  A value that does not fit @buf comes back as
- * -ERANGE and fails the compare, like any other mismatch.
+ * Was @upper copied up under @name?  The stored name scopes an
+ * inode-wide xattr to one name, so a second link or a renamed name
+ * does not match.  A value too big for @buf fails the compare.
  */
 bool aufsng_has_origin(struct aufsng_fs *pfs, struct dentry *upper,
 		    const struct qstr *name)
@@ -172,11 +155,8 @@ static int aufsng_set_attr_from(struct aufsng_fs *pfs, struct dentry *upper,
 	int err;
 
 	/*
-	 * A symlink carries no meaningful mode and there is no lchmod:
-	 * notify_change() with ATTR_MODE on one fails (EOPNOTSUPP on the
-	 * branch fs), which would abort the whole copy-up.  Set every
-	 * other attribute and skip the mode for symlinks, exactly as
-	 * overlayfs does on copy-up.
+	 * There is no lchmod: ATTR_MODE on a symlink fails and would
+	 * abort the copy-up.  Set everything else and skip the mode.
 	 */
 	if (!S_ISLNK(stat->mode)) {
 		attr.ia_valid |= ATTR_MODE;
@@ -213,15 +193,11 @@ static int aufsng_copy_data(struct aufsng_fs *pfs, const struct path *lowerpath,
 	}
 
 	/*
-	 * COPY_FILE_SPLICE (kernel-internal) makes the VFS handle the
-	 * cross-sb case itself, falling back to an in-kernel splice
-	 * that moves pages through a pipe - no bounce buffer, and the
-	 * fallback policy stays maintained with the VFS instead of a
-	 * hand-picked errno list here (this is what nfsd and overlayfs
-	 * do).  No fsync: the union offers no crash consistency across
-	 * the copy-up + rename pair anyway, and neither AUFS nor
-	 * overlayfs flush here - it only serializes every copy-up
-	 * against the branch device.
+	 * COPY_FILE_SPLICE lets the VFS handle the cross-sb case, falling
+	 * back to an in-kernel splice - no bounce buffer, and the policy
+	 * stays with the VFS instead of an errno list here.  No fsync:
+	 * the copy-up + rename pair has no crash consistency anyway, and
+	 * flushing would serialize every copy-up on the device.
 	 */
 	while (pos_in < len) {
 		ssize_t bytes = vfs_copy_file_range(in, pos_in, out, pos_out,
@@ -241,24 +217,17 @@ static int aufsng_copy_data(struct aufsng_fs *pfs, const struct path *lowerpath,
 }
 
 /*
- * Phase one of a regular-file copy-up, run with NO locks held: create
- * a uniquely named temp file inside the SAME directory as the final
- * target and fill in the lower file's data.  AUFS has no separate
- * workdir; the temp lives in AUFS's own ".wh..wh." bookkeeping
- * namespace (".wh..wh.pxu<seq>"), so it is invisible to lookup and
- * readdir for the whole duration of the copy (and a crash leftover is
- * cleaned up like any other stale marker: rmdir's clear_whiteouts
- * sweep removes it with the directory).
+ * Phase one of a file copy-up, with NO locks held: create a uniquely
+ * named temp in the target's own directory and fill it.  AUFS has no
+ * workdir, so the temp lives in the ".wh..wh." namespace and is
+ * invisible to lookup and readdir; a crash leftover is swept like any
+ * other stale marker.
  *
- * This phase must run outside both oi->lock and mnt_want_write():
- * vfs_copy_file_range() takes the upper sb's own write protection
- * (file_start_write), which is the same sb_writers level as
- * mnt_want_write() - holding it across the copy recurses and
- * deadlocks against a concurrent freeze of the upper fs - and
- * sb_writers ranks BEFORE oi->lock everywhere else (mutations take
- * mnt_want_write, then dyn_lock, then oi->lock).  Nothing is
- * committed here; publication happens under oi->lock in
- * aufsng_copy_up_one().
+ * It must run outside oi->lock and mnt_want_write():
+ * vfs_copy_file_range() takes the upper sb's write protection, the
+ * same sb_writers level, so holding it recurses and deadlocks against
+ * a freeze - and sb_writers ranks before oi->lock everywhere else.
+ * Nothing is committed here.
  */
 static struct dentry *aufsng_copy_up_prep_regular(struct aufsng_fs *pfs,
 					       const struct path *lowerpath,
@@ -310,9 +279,7 @@ out_drop:
 
 /*
  * Phase two, under mnt_want_write() + oi->lock: dress the temp in the
- * lower's metadata and rename it over the real name - the commit
- * point.  On success @work is hashed under the final name and is the
- * live upper.
+ * lower's metadata and rename it over the real name - the commit.
  */
 static int aufsng_copy_up_commit_regular(struct aufsng_fs *pfs,
 				      const struct qstr *name,
@@ -326,13 +293,10 @@ static int aufsng_copy_up_commit_regular(struct aufsng_fs *pfs,
 	int err;
 
 	/*
-	 * Re-stat the lower NOW so ownership/mode/times land from the
-	 * same point in time as the xattrs read below - one coherent
-	 * commit-era metadata snapshot.  The prep-era stat served only
-	 * to size the data copy; if the lower was mutated out-of-band
-	 * mid-copy-up the data is stale either way (a window as old as
-	 * the unlocked data copy itself), but the metadata should not
-	 * additionally be stitched from a third instant.
+	 * Re-stat now so mode, ownership and times come from the same
+	 * instant as the xattrs below.  The prep-era stat only sized the
+	 * data copy; the metadata should not be stitched from two
+	 * instants on top of that.
 	 */
 	err = vfs_getattr(lowerpath, &stat,
 			  STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT);
@@ -347,16 +311,13 @@ static int aufsng_copy_up_commit_regular(struct aufsng_fs *pfs,
 	aufsng_mark_origin(pfs, work, name);
 
 	/*
-	 * No whiteout can sit at the target: the name was visible to
-	 * the lookup that triggered this copy-up (a whiteout would
-	 * have hidden it), and one appearing since means a completed
-	 * unlink - aufsng_copy_up_one() re-checks for that under
-	 * oi->lock before calling here, and aufsng_do_remove() holds
-	 * the same lock for its whole whiteout + unlink sequence.
+	 * No whiteout can sit at the target: the name was visible to the
+	 * lookup that triggered this copy-up, and one appearing since
+	 * means a completed unlink, which the caller re-checks under
+	 * oi->lock - the same lock remove holds for its whole sequence.
 	 *
-	 * vfs_rename() moves the file onto @work (the source dentry)
-	 * via d_move() and leaves rd.new_dentry negative -
-	 * end_renaming() drops the helper's own refs.
+	 * vfs_rename() moves the file onto @work and leaves rd.new_dentry
+	 * negative; end_renaming() drops the helper's refs.
 	 */
 	rd.mnt_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	rd.old_parent = pupper;
@@ -365,14 +326,11 @@ static int aufsng_copy_up_commit_regular(struct aufsng_fs *pfs,
 	if (err)
 		return err;
 	/*
-	 * A POSITIVE target is a foreign object that claimed the name
-	 * while the copy-up ran: rename(2) moving another file onto it
-	 * is the one mutation oi->lock cannot see coming (the rename
-	 * serializes on the VICTIM's locks, not this inode's).  Renaming
-	 * the temp over it would replace that freshly renamed file with
-	 * this inode's stale lower content - silent data loss reported
-	 * as success.  Abort instead; the caller cleans up the temp and
-	 * the opener retries against the new state of the name.
+	 * A POSITIVE target claimed the name while the copy-up ran: a
+	 * rename onto it is the one mutation oi->lock cannot see, since
+	 * it serializes on the VICTIM's locks.  Renaming the temp over it
+	 * would replace that file with stale lower content and report
+	 * success.  Abort; the opener retries against the new state.
 	 */
 	if (d_is_positive(rd.new_dentry)) {
 		end_renaming(&rd);
@@ -384,11 +342,8 @@ static int aufsng_copy_up_commit_regular(struct aufsng_fs *pfs,
 }
 
 /*
- * Create the upper copy of a non-regular object directly in the rw
- * parent dir.  No whiteout can occupy the name here for the same
- * reason as in the regular-file path: the name was visible to the
- * lookup that led here, and copy_up_one aborts under oi->lock if a
- * delete slipped in since.
+ * Create the upper copy of a non-regular object in place.  No whiteout
+ * can hold the name, for the same reason as in the file path.
  */
 static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 					  const struct qstr *name,
@@ -445,29 +400,20 @@ static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 	err = aufsng_copy_xattr(pfs, lowerpath, upper);
 	if (!err)
 		err = aufsng_set_attr_from(pfs, upper, stat);
-	/*
-	 * Directories are keyed by their merged stack, not by an origin,
-	 * so nothing ever reads a marker on one - leave it off rather
-	 * than carry a claim no code path honours.
-	 */
+	/* Directories are keyed by their merged stack; a marker is never read */
 	if (!err && !S_ISDIR(stat->mode))
 		aufsng_mark_origin(pfs, upper, name);
 	if (err) {
 		/*
-		 * Same cleanup duty the regular-file path gets from its
-		 * temp+rename scheme: a half-attributed object left
-		 * under the real name would be adopted with wrong
-		 * metadata and make every retry fail with EEXIST.
+		 * The cleanup the temp+rename scheme gives the file path
+		 * for free: a half-attributed object under the real name
+		 * would be adopted with wrong metadata and fail every
+		 * retry with EEXIST.
 		 *
-		 * When the compensating removal ALSO fails - likely, since
-		 * whatever broke the metadata (a full or failing branch)
-		 * tends to break this too - the leftover is live under the
-		 * real name with the mounter's ownership and none of the
-		 * lower's xattrs, and no sweep removes it (clear_whiteouts
-		 * only knows ".wh." names).  Report -EIO rather than the
-		 * original errno then: "ENOSPC, nothing changed" would be a
-		 * lie about a branch that now needs the admin.  This is
-		 * AUFS's own escalation in au_cpup_single()'s error path.
+		 * If the removal ALSO fails - likely, since whatever broke
+		 * the metadata tends to break this too - the leftover is
+		 * live and no sweep removes it.  Report -EIO then, as AUFS
+		 * does: "nothing changed" would be a lie.
 		 */
 		int rerr;
 
@@ -502,39 +448,28 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 	int err;
 
 	/*
-	 * The caller's walk saw the parent's upper, but nothing pins it
-	 * between that check and this sample: under udba=reval a lookup of
-	 * the parent can shed a just-created upper dir that was removed
-	 * out-of-band (aufsng_dyn_shed_upper), which no lock here excludes.
-	 * -ESTALE, not a WARN: this is reachable from an ordinary open, and
-	 * aufsng_copy_up()'s retry loop re-drives the ancestor walk and
-	 * copies the parent up again - the heal, rather than a panic on the
-	 * panic_on_warn kernels this ships on.
+	 * Nothing pins the parent's upper between the caller's walk and
+	 * this sample: under udba=reval a lookup can shed it.  -ESTALE,
+	 * not a WARN - this is reachable from an ordinary open, and the
+	 * retry loop copies the parent up again.
 	 */
 	if (!pupper)
 		return -ESTALE;
 	if (READ_ONCE(oi->upperdentry))
 		return 0;
 	/*
-	 * Best-effort early out for a name already dead (concurrent
-	 * unlink/rename won): purely advisory - the same checks re-run
-	 * authoritatively under oi->lock below - but it spares building
-	 * and copying a full temp that the commit would only discard.
+	 * Advisory early out for an already dead name; the same checks
+	 * re-run under oi->lock, but this spares a whole temp copy.
 	 */
 	if (d_unhashed(dentry) || !inode->i_nlink)
 		return -ENOENT;
 
 	/*
-	 * The lower source is sampled without oi->lock - safe to READ
-	 * (a superseded stack stays parked on the inode until eviction,
-	 * its dentries and mounts pinned) but no longer guaranteed
-	 * CURRENT: a branch removal re-points even a non-directory's
-	 * stack to a surviving branch (aufsng_dyn_prep_repoint).  The
-	 * commit below re-reads the stack under oi->lock - which the
-	 * re-point's publisher (aufsng_dyn_commit_rebuild) also takes -
-	 * and aborts with -ESTALE if this sample went stale, so a
-	 * copy-up can never publish content from a branch whose removal
-	 * already reported success.
+	 * The lower source is sampled without oi->lock: safe to READ (a
+	 * superseded stack stays parked until eviction) but not
+	 * guaranteed current, since a removal re-points the stack.  The
+	 * commit re-reads it under oi->lock and aborts with -ESTALE, so a
+	 * copy-up can never publish content from a removed branch.
 	 */
 	oe = AUFSNG_I_E(inode);
 	if (!oe || !oe->numlower)
@@ -556,19 +491,13 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 	}
 
 	/*
-	 * From here the name is read through a snapshot, exactly as
-	 * aufsng_dyn_prep_repoint() does and for the same reason: neither
-	 * oi->lock nor the caller's locks keep @dentry's d_name stable
-	 * across the sleeping branch operations below.  d_splice_alias() can
-	 * __d_move() a DIRECTORY alias (same-parent __d_unalias takes none
-	 * of the locks held here) when a fresh lookup keys the same cached
-	 * inode - after an out-of-band rename inside the branch, or after a
-	 * failed revalidation unhashed this alias - which rewrites d_name in
-	 * place or kfree_rcu()s the external one.  Worse than a torn read:
-	 * the whiteout re-check, the create and the compensating removal
-	 * would each act on whatever the name happened to be at that
-	 * instant, so a failed copy-up could unlink an unrelated upper
-	 * object.  One snapshot makes all three agree on one string.
+	 * From here the name is read through a snapshot: no lock held
+	 * keeps d_name stable across the sleeping operations below, and
+	 * d_splice_alias() can __d_move() a directory alias, rewriting
+	 * d_name or kfree_rcu()ing the external one.  Without one
+	 * snapshot the whiteout re-check, the create and the
+	 * compensating removal could each act on a different name - and
+	 * unlink an unrelated object.
 	 */
 	take_dentry_name_snapshot(&ns, dentry);
 
@@ -582,11 +511,9 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 		goto out;	/* lost the race: another copy-up committed */
 
 	/*
-	 * A branch removal re-pointed the stack while the temp was being
-	 * filled: the data (and the metadata snapshot taken at commit)
-	 * would come from the REMOVED branch, moving the file's content
-	 * backwards after the removal reported success.  Abort; the
-	 * caller retries against the new stack.
+	 * A removal re-pointed the stack while the temp was filling, so
+	 * the data would come from the REMOVED branch.  Abort; the caller
+	 * retries against the new stack.
 	 */
 	if (AUFSNG_I_E(inode) != oe) {
 		err = -ESTALE;
@@ -594,12 +521,9 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 	}
 
 	/*
-	 * The lookup that led here saw the name alive, but an unlink or
-	 * rename may have won oi->lock first: the whiteout it left (and
-	 * the dropped link count / unhashed dentry) mark the name dead.
-	 * Copying up regardless would recreate the name with full upper
-	 * content - and destroy the whiteout - silently undoing a
-	 * delete that already returned success to userspace.
+	 * An unlink or rename may have won oi->lock first, leaving the
+	 * name dead.  Copying up regardless would recreate it and destroy
+	 * the whiteout, undoing a delete that already returned success.
 	 */
 	if (d_unhashed(dentry) || !inode->i_nlink) {
 		err = -ENOENT;
@@ -648,18 +572,12 @@ out_tmp:
 }
 
 /*
- * Make sure @dentry has an upper copy, copying up any ancestors that
- * lack one first (top-down).  Write access on the rw branch is taken
- * inside the per-object helpers, NOT here for the whole walk: the
- * regular-file data copy must run outside mnt_want_write(), because
- * vfs_copy_file_range() takes the upper sb's own write protection and
- * same-level sb_writers nesting deadlocks against an upper-fs freeze.
- * The trade is that the walk is no longer atomic against a rw->ro
- * flip: ancestors copied up before the flip stay - benign, since an
- * upper dir mirroring its lower is the same state any sibling's
- * copy-up produces - and the walk still fails cleanly with EROFS.
- * Callers performing their own mutation afterwards take their own
- * mnt_want_write(), sequentially, as before.
+ * Give @dentry an upper copy, copying up any ancestors that lack one
+ * first.  Write access is taken inside the per-object helpers, not
+ * across the walk: the data copy must run outside mnt_want_write() or
+ * sb_writers nesting deadlocks against a freeze.  The trade is that
+ * the walk is not atomic against a rw->ro flip - ancestors copied up
+ * before it stay, which is benign, and the walk still fails EROFS.
  */
 int aufsng_copy_up(struct dentry *dentry)
 {
@@ -684,10 +602,8 @@ int aufsng_copy_up(struct dentry *dentry)
 
 		err = aufsng_copy_up_one(next);
 		/*
-		 * -ESTALE: a branch removal re-pointed the source stack
-		 * mid-copy.  The loop re-samples the (new) stack, so a
-		 * retry copies the surviving branch's content; branch
-		 * changes are rare, the cap only guards a livelock.
+		 * -ESTALE: a removal re-pointed the source stack mid-copy.
+		 * The retry copies the survivor; the cap guards a livelock.
 		 */
 		if (err == -ESTALE && ++retries <= 3)
 			err = 0;
@@ -699,23 +615,18 @@ int aufsng_copy_up(struct dentry *dentry)
 }
 
 /*
- * Copy up @dentry and hand back its upper WITH A REFERENCE - the form
- * every mutation that then operates on the upper needs.
+ * Copy up @dentry and return its upper WITH A REFERENCE, the form
+ * every mutation needs.
  *
- * aufsng_copy_up() alone is not enough for that: it early-outs the
- * moment an upper exists, taking no lock, so a caller re-reading
- * oi->upperdentry afterwards can find the NULL a concurrent
- * aufsng_dyn_shed_upper() just published (udba=reval, out-of-band
- * unlink of the rw copy) and dereference it.  Nothing the callers hold
- * excludes that heal: it runs from a lookup, under the parent's
- * i_rwsem and only oi->lock.
+ * aufsng_copy_up() alone will not do: it early-outs unlocked the
+ * moment an upper exists, so a caller re-reading oi->upperdentry can
+ * find the NULL a concurrent shed-upper just published, and nothing
+ * the callers hold excludes that heal.
  *
- * So re-read under oi->lock and pin the result; a shed upper stays
- * parked (and thus valid) until the inode is evicted, so acting on one
- * shed a moment ago is just the operation landing before the
- * out-of-band unlink.  Only a genuine NULL loops back into copy-up,
- * which recreates the upper - the same converge-by-retry protocol
- * aufsng_copy_up() already uses for -ESTALE.
+ * So re-read under oi->lock and pin the result.  A shed upper stays
+ * parked until eviction, so acting on one just shed is the operation
+ * landing before the out-of-band unlink; only a real NULL loops back
+ * into copy-up.
  */
 struct dentry *aufsng_copy_up_upper(struct dentry *dentry)
 {
