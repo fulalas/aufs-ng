@@ -14,7 +14,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=99; PASS=0; FAIL=0
+	N=0; TOTAL=105; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -590,6 +590,46 @@ for e in os.scandir(sys.argv[1]):
 	rm -f $L1/bin/hardrun $L1/bin/hardsib $L1/bin/mvold
 	rm -f $W/cumark $W/mvtarget $W/lnname $W/lnsrc $W/.wh.lnname
 	rm -f $W/bin/hardrun $W/bin/mvold $W/bin/.wh.hardrun
+
+	echo "=== 32. many branches (a live system loads hundreds) ==="
+	# The slot table used to be sized once at mount, so add number 127
+	# failed with ENOSPC ("No space left on device" out of mount) on a
+	# real boot that loads that many modules.  MANY crosses that old
+	# limit; the branches are plain sibling directories, which is all a
+	# branch has to be (they may not nest inside one another).
+	MANY=140
+	mkdir -p /mnt/many
+	i=1
+	while [ $i -le $MANY ]; do
+		mkdir -p /mnt/many/b$i
+		echo "b$i" > /mnt/many/b$i/manyfile
+		$M aufs aufs $U "add=1:/mnt/many/b$i=rr" 32 || break
+		i=$((i+1))
+	done
+	[ $i -gt $MANY ] \
+		&& ok "$MANY branches added past the old fixed slot table" \
+		|| bad "$MANY branches added past the old fixed slot table (add $i failed)"
+	# add=1 always inserts on top, so the last one added owns the name
+	check "the newest of many branches wins the shared name" \
+		grep -q "^b$MANY\$" $U/manyfile
+	grep -q ":/mnt/many/b1=rr" /proc/mounts \
+		&& ok "the first added branch is still listed in /proc/mounts" \
+		|| bad "the first added branch is still listed in /proc/mounts"
+	i=$MANY
+	while [ $i -ge 1 ]; do
+		$M aufs aufs $U "del=/mnt/many/b$i" 32 || break
+		i=$((i-1))
+	done
+	[ $i -eq 0 ] \
+		&& ok "all $MANY branches removed again" \
+		|| bad "all $MANY branches removed again (del $i failed)"
+	checkfail "the shared name is gone with the branches" test -e $U/manyfile
+	# every slot is free now: the next add must reuse one, not grow
+	$M aufs aufs $U "add=1:/mnt/many/b1=rr" 32 \
+		&& ok "a freed slot is reused by a later add" \
+		|| bad "a freed slot is reused by a later add"
+	$M aufs aufs $U "del=/mnt/many/b1" 32
+	rm -rf /mnt/many
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.

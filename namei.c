@@ -414,7 +414,6 @@ struct inode *aufsng_get_inode(struct super_block *sb,
 			    struct dentry *upperdentry,
 			    struct aufsng_entry *oe)
 {
-	struct aufsng_fs *pfs = AUFSNG_FS(sb);
 	struct inode *realinode;
 	struct inode *key;
 	struct inode *inode;
@@ -422,7 +421,7 @@ struct inode *aufsng_get_inode(struct super_block *sb,
 
 	realinode = upperdentry ? d_inode(upperdentry) :
 				  d_inode(oe->lowerstack[0].dentry);
-	key = aufsng_hash_key(pfs, oe, upperdentry, &key_idx);
+	key = aufsng_hash_key(oe, upperdentry, &key_idx);
 
 	inode = iget5_locked(sb, (unsigned long)key, aufsng_inode_test,
 			     aufsng_inode_set, key);

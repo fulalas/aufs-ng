@@ -3,9 +3,10 @@
  * Runtime branch add/remove for aufs-ng ("add=N:PATH=MODE" /
  * "del=PATH" on remount), matching AUFS semantics.
  *
- *  - Fixed-capacity layers[] array so struct aufsng_layer addresses stay
- *    stable for the mount's lifetime (aufsng_entry stacks reference them
- *    by pointer); freed slots (mnt == NULL) are reused.
+ *  - Branches are allocated one by one and never moved or freed before
+ *    umount, so their addresses stay stable for the mount's lifetime
+ *    (aufsng_entry stacks reference them by pointer); only the slot
+ *    TABLE grows, and freed slots (mnt == NULL) are reused first.
  *
  *  - A new branch is inserted at the front of the root's lowerstack
  *    (matching AUFS's "add=1:" - always immediately below branch 0),
@@ -267,12 +268,10 @@ out:
  * slot could otherwise mint a different file with the identical
  * (st_dev, st_ino), which archivers treat as a hardlink.
  */
-static void aufsng_dyn_rekey_inode(struct aufsng_fs *pfs, struct inode *inode,
-				struct aufsng_entry *oe)
+static void aufsng_dyn_rekey_inode(struct inode *inode, struct aufsng_entry *oe)
 {
 	unsigned int key_idx;
-	struct inode *key = aufsng_hash_key(pfs, oe,
-					    aufsng_upperdentry(inode),
+	struct inode *key = aufsng_hash_key(oe, aufsng_upperdentry(inode),
 					    &key_idx);
 
 	if (inode->i_private == key)
@@ -293,7 +292,7 @@ static struct aufsng_layer *aufsng_dyn_find_branch(struct aufsng_fs *pfs,
 	unsigned int i;
 
 	for (i = 1; i < pfs->numlayer; i++) {
-		struct aufsng_layer *l = &pfs->layers[i];
+		struct aufsng_layer *l = pfs->layers[i];
 
 		if (l->mnt && l->mnt->mnt_root == dentry)
 			return l;
@@ -306,7 +305,7 @@ static unsigned int aufsng_find_free_slot(struct aufsng_fs *pfs)
 	unsigned int i;
 
 	for (i = 1; i < pfs->numlayer; i++) {
-		if (!pfs->layers[i].mnt)
+		if (!pfs->layers[i]->mnt)
 			return i;
 	}
 	return pfs->numlayer;
@@ -770,8 +769,6 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	int err;
 
 	idx = aufsng_find_free_slot(pfs);
-	if (idx == pfs->numlayer && pfs->numlayer >= pfs->numlayer_cap)
-		return -ENOSPC;
 
 	err = aufsng_check_layer(sb, path, name);
 	if (err)
@@ -796,6 +793,18 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	if (err)
 		return err;
 
+	/*
+	 * The branch slot, grown into existence if this is the first add
+	 * past the table's current size.  Done before the point of no
+	 * return like everything else here, and idempotent: the slot (and
+	 * its branch object) outlives a failed add and the next one reuses
+	 * it, so a fixed table size - and the ENOSPC a live system hit
+	 * after ~128 module loads - is gone.
+	 */
+	layer = aufsng_layer_reserve(pfs, idx);
+	if (IS_ERR(layer))
+		return PTR_ERR(layer);
+
 	dup_name = kstrdup(name, GFP_KERNEL);
 	if (!dup_name)
 		return -ENOMEM;
@@ -819,7 +828,6 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	 * is passed explicitly because layer->mnt is only published below,
 	 * once the locks are held.
 	 */
-	layer = &pfs->layers[idx];
 	new_oe = aufsng_entry_prepend(cur_oe, cur_oe->numlower, layer,
 				  path->dentry, mnt);
 	if (!new_oe) {
@@ -841,8 +849,8 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 
 	layer->mnt = mnt;
 	pfs->namelen = min(pfs->namelen, namelen);
-	pfs->config.br_paths[idx] = dup_name;
-	strscpy(pfs->config.br_perms[idx], permstr, AUFSNG_PERM_LEN);
+	layer->path = dup_name;
+	strscpy(layer->perm, permstr, AUFSNG_PERM_LEN);
 	if (idx == pfs->numlayer)
 		pfs->numlayer++;
 
@@ -1342,7 +1350,7 @@ static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode
 	/* release-publish for lockless READ_ONCE readers, as in swap_root */
 	smp_store_release(&oi->oe, new_oe);
 	atomic64_inc(&oi->version);
-	aufsng_dyn_rekey_inode(pfs, inode, new_oe);
+	aufsng_dyn_rekey_inode(inode, new_oe);
 	/*
 	 * The top real object may have changed (a spliced-in branch's
 	 * directory, or the surviving top after a removal); the union
@@ -1403,13 +1411,11 @@ static int aufsng_dyn_check_rekey(struct super_block *sb,
 			       struct aufsng_entry **new_oes, unsigned int i,
 			       const char *brname)
 {
-	struct aufsng_fs *pfs = AUFSNG_FS(sb);
 	struct inode *inode = scan->pinned[i];
 	struct inode *key, *dup = NULL;
 	unsigned int k;
 
-	key = aufsng_hash_key(pfs, new_oes[i], aufsng_upperdentry(inode),
-			      NULL);
+	key = aufsng_hash_key(new_oes[i], aufsng_upperdentry(inode), NULL);
 	if (!key || key == inode->i_private)
 		return 0;
 
@@ -1421,7 +1427,7 @@ static int aufsng_dyn_check_rekey(struct super_block *sb,
 	for (k = 0; k < i; k++) {
 		if (!new_oes[k])
 			continue;
-		if (aufsng_hash_key(pfs, new_oes[k],
+		if (aufsng_hash_key(new_oes[k],
 				    aufsng_upperdentry(scan->pinned[k]),
 				    NULL) == key)
 			goto busy;
@@ -1434,13 +1440,11 @@ busy:
 	return -EBUSY;
 }
 
-static void aufsng_dyn_release_branch(struct aufsng_fs *pfs, struct aufsng_layer *layer)
+static void aufsng_dyn_release_branch(struct aufsng_layer *layer)
 {
-	unsigned int idx = aufsng_layer_idx(pfs, layer);
-
-	kfree(pfs->config.br_paths[idx]);
-	pfs->config.br_paths[idx] = NULL;
-	pfs->config.br_perms[idx][0] = '\0';
+	kfree(layer->path);
+	layer->path = NULL;
+	layer->perm[0] = '\0';
 	/*
 	 * clone_private_mount() clones are "longterm" mounts
 	 * (mnt_ns == MNT_NS_INTERNAL): mntput()'s fast path only
@@ -1482,7 +1486,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 	 * knows the branch by.  Freed only in aufsng_dyn_release_branch(),
 	 * after the last message below.
 	 */
-	brname = pfs->config.br_paths[aufsng_layer_idx(pfs, layer)];
+	brname = layer->path;
 
 	if (AUFSNG_I_E(root_inode)->numlower < 1)
 		return -EINVAL;	/* no lower branch to remove */
@@ -1698,7 +1702,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 	 * same reason - it cannot begin before this removal (and its
 	 * grace period) completes.
 	 */
-	aufsng_dyn_release_branch(pfs, layer);
+	aufsng_dyn_release_branch(layer);
 
 	return 0;
 
