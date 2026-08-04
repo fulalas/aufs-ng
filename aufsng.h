@@ -1,18 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * aufs-ng - standalone union filesystem for live Linux distributions,
- * semantically compatible with AUFS: registers as filesystem type
- * "aufs", accepts
- * genuine AUFS mount option syntax (br:, add=N:PATH=MODE, del=PATH,
- * xino=, udba=, dirperm1, nowarn_perm), and uses AUFS's own on-disk
- * whiteout format (".wh.<name>" regular files, ".wh..wh..opq" opaque
- * directory markers) so that scripts which mount, remount, or scan a
- * branch directly (as live-boot core-scripts do) need no changes.
+ * aufs-ng - standalone union filesystem, semantically compatible with
+ * AUFS: registers as filesystem type "aufs", takes AUFS's mount option
+ * syntax and uses its on-disk whiteout format, so scripts that mount,
+ * remount or scan a branch directly need no changes.
  *
- * Branch 0 is always the single writable branch; branches 1.. are
- * read-only, highest priority first ("add=1:" always inserts
- * immediately below branch 0, so the most recently added module has
- * highest priority - the same "last-added-wins" semantics as AUFS).
+ * Branch 0 is the single writable branch; 1.. are read-only, highest
+ * priority first ("add=1:" inserts just below branch 0, so the newest
+ * branch wins - AUFS's own "last-added-wins").
  */
 #ifndef AUFSNG_H
 #define AUFSNG_H
@@ -35,12 +30,9 @@
 
 #define AUFSNG_MAX_STACK		500
 /*
- * Ceiling on the total branch count, the same one real AUFS's largest
- * build-time setting allows (AUFS_BRANCH_MAX_32767).  It is not a
- * preallocation size - the slot table grows on demand - only the point
- * past which a branch slot would no longer fit the inode-number folding
- * in aufsng_map_ino(): a slot is shifted to bit 40 and up, and must
- * stay clear of AUFSNG_ROOT_INO_EVADE at bit 62.
+ * Branch ceiling: AUFS's own maximum, and the widest slot number
+ * aufsng_map_ino() can still fold into i_ino.  Not a preallocation
+ * size - the slot table grows on demand.
  */
 #define AUFSNG_MAXBRANCH	32767
 
@@ -51,31 +43,22 @@
 #define AUFSNG_WH_MODE		0444
 
 /*
- * The one piece of bookkeeping AUFS itself has no on-disk equivalent
- * for (it keeps the same knowledge in its xino tables instead): an
- * xattr set on an upper non-directory by copy-up, holding the NAME the
- * object was copied up under - "the lower called this is what I was
- * copied from".
+ * The one piece of bookkeeping AUFS keeps in xino tables instead: an
+ * xattr copy-up sets on an upper non-directory, holding the NAME it
+ * was copied up under.
  *
- * A union inode is keyed by that lower so its st_ino survives copy-up
- * and cache eviction, and only a real copy-up may claim the link.  A
- * file that merely happens to share a name with a lower - created over
- * a whiteout, or renamed onto the name - is an independent object and
- * gets its own identity, the way it would on any real filesystem.
- * Guessing the link from the name instead handed such a file the
- * deleted one's inode, including the write block exec puts on a
- * running binary (ETXTBSY on the first write to its replacement).
+ * A union inode is keyed by that lower so st_ino survives copy-up and
+ * eviction, and only a real copy-up may claim the link.  A file that
+ * merely shares a name - created over a whiteout, or renamed onto it -
+ * is an independent object with its own identity; guessing from the
+ * name handed it the deleted file's inode, ETXTBSY included.
  *
- * The name is what makes the claim per-NAME on a per-inode xattr, and
- * nothing else would: link(2) gives a second name to the very inode
- * copy-up marked, and rename gives that inode a name it was never
- * copied up under.  Both then stop matching, with no cleanup pass to
- * get wrong - and a rename of one hardlink cannot silently revoke its
- * siblings' claim either.
+ * Storing the NAME is what makes a per-inode xattr answer a per-NAME
+ * question: link(2) and rename give the inode names it was never
+ * copied up under, and both then simply stop matching.
  *
- * "trusted." keeps it out of reach of unprivileged users, and the
- * handlers in inode.c hide it from the union so it never leaks into a
- * listing or a cp -a.
+ * "trusted." keeps it from unprivileged users; inode.c hides it from
+ * the union so it never leaks into a listing or a cp -a.
  */
 #define AUFSNG_XATTR_PFX	"trusted.aufs_ng."
 #define AUFSNG_XATTR_ORIGIN	AUFSNG_XATTR_PFX "origin"
@@ -86,56 +69,33 @@ enum aufsng_br_perm {
 };
 
 /*
- * Sized to AUFS's own maximum mode-token length (AuBrPermStrSz covers
- * "rw+coo_reg+fhsm+unpin+icexsec+icexsys+icexusr+icexoth+nolwh"):
- * aufsng_parse_perm() accepts any '+'-suffix chain a real aufs command
- * may carry, so the stored token - echoed back verbatim through
- * /proc/mounts - must never be silently truncated into a malformed one.
- */
-#define AUFSNG_PERM_LEN	64
-
-/*
- * One branch.  Allocated individually and never moved or freed before
- * umount, because aufsng_entry stacks reference it by pointer: the slot
- * TABLE (aufsng_fs.layers) grows as branches are added, the branches
- * themselves stay put.  @path and @perm live here rather than in
- * slot-indexed side arrays so a reader that already holds a layer
- * pointer needs no table lookup at all (aufsng_show_options()).
+ * One branch.  Never moved or freed before umount: aufsng_entry stacks
+ * reference it by pointer.  Only the slot table grows.
  */
 struct aufsng_layer {
 	struct vfsmount *mnt;	/* private clone; NULL marks a free slot */
 	unsigned int idx;	/* stable slot number, see aufsng_layer_idx() */
-	/*
-	 * The branch path as given and the mode as it actually applies,
-	 * only consumed by show_options: the private clone mounts have no
-	 * namespace path to resolve at print time, and the mode is echoed
-	 * back exactly as given ("rr" stays "rr"), so both are kept
-	 * verbatim.  @path is NULL on a free slot.
-	 */
+	/* path as given, for log messages; the clone has none.  NULL if free */
 	char *path;
-	char perm[AUFSNG_PERM_LEN];
 };
 
 struct aufsng_path {
 	struct aufsng_layer *layer;
 	struct dentry *dentry;
 	/*
-	 * The branch mount, captured when the entry was built.  Lockless
-	 * readers (aufsng_path_real()) must reach the mount through this
-	 * copy, never through layer->mnt: a branch removal blanks
-	 * layer->mnt (and a later add may reuse the slot for a different
-	 * branch) while a superseded-but-parked stack is still being
-	 * dereferenced.  The parked stack pins the vfsmount object
-	 * (aufsng_dyn_parked.mnts), and this pointer stays valid with it
-	 * until the inode is evicted.
+	 * The branch mount as captured when the entry was built.
+	 * Lockless readers must use this copy, never layer->mnt: a
+	 * removal blanks that (and a later add may reuse the slot) while
+	 * a parked stack is still being dereferenced.  The park pins the
+	 * vfsmount, so this stays valid until the inode is evicted.
 	 */
 	struct vfsmount *mnt;
 };
 
 /*
- * Lower (read-only) branch stack of a dentry/inode.  Priority is the
- * order of this array, top first.  Swapped under RCU by dynamic
- * branch changes; readers hold rcu_read_lock() or aufsng_fs.dyn_lock.
+ * Lower branch stack of a dentry/inode, top priority first.  Swapped
+ * under RCU by branch changes; readers hold rcu_read_lock() or
+ * dyn_lock.
  */
 struct aufsng_entry {
 	unsigned int numlower;
@@ -153,44 +113,31 @@ struct aufsng_fs {
 	unsigned int numlayer;		/* used slots incl. [0] = branch 0 */
 	unsigned int numlayer_cap;	/* slots the table can hold; grows */
 	/*
-	 * Branch slot table: [0] the rw branch, [1..] the ro branches.  A
-	 * table of POINTERS, so adding the 129th branch can grow it (real
-	 * live systems load hundreds of modules, each one a branch) without
-	 * moving any struct aufsng_layer - those are referenced by pointer
-	 * from every cached aufsng_entry and must never be relocated.
-	 *
-	 * Only ever read and written by the mount, umount and branch
-	 * add/remove paths, all of which hold sb->s_umount exclusively, so
-	 * the table itself needs no RCU: nothing on a lookup, readdir or
-	 * stat path touches it (branch 0 is reached through @upper, and a
-	 * slot number through layer->idx).
+	 * Branch slots: [0] rw, [1..] ro.  Pointers, so the table can grow
+	 * without relocating a branch.  Touched only by mount, umount and
+	 * branch add/remove, all under s_umount, so it needs no RCU: no
+	 * lookup, readdir or stat path reads it.
 	 */
 	struct aufsng_layer **layers;
 	struct aufsng_layer *upper;	/* == layers[0], the only rw branch */
+	unsigned long si_id;		/* the "si=" mount id in /proc/mounts */
 	const struct cred *creator_cred;
 	/*
-	 * Bumped once per runtime branch add/remove (AUFS's "sigen"):
-	 * compared against each dentry's d_time stamp so positive
-	 * revalidation re-runs the merge decision exactly once per
-	 * branch change (dcache.c), never on ordinary mutations.  The
-	 * stamp is per-DENTRY, not per-inode: lower hardlink siblings
-	 * share one union inode, but the winning-branch decision is
-	 * per-name, so each name must re-check for itself.  Kept at
-	 * unsigned-long width (the d_time stamp it is compared against,
-	 * see aufsng_store_reval_stamps()) so no bits are silently
-	 * dropped on 32-bit; a false match needs 2^32 branch mutations.
+	 * Bumped once per branch add/remove (AUFS's "sigen") and compared
+	 * against each dentry's d_time, so revalidation re-runs the merge
+	 * decision once per branch change and never on ordinary
+	 * mutations.  Per-DENTRY: hardlink siblings share one inode, but
+	 * the winning branch is per-name.  Unsigned-long wide, the width
+	 * of d_time, so no bits are dropped on 32-bit.
 	 */
 	atomic_long_t branch_gen;
 	/*
-	 * Excludes lookup/readdir during runtime branch add/remove.
-	 * Per-cpu: the read side is taken by every uncached lookup, every
-	 * merged-readdir build and every directory mutation, so on a
-	 * live system's parallel path walks a plain rwsem would have all
-	 * CPUs trading one cacheline; percpu_down_read() touches only
-	 * this CPU's counter.  The whole cost moves to the write side -
-	 * an rcu_sync grace period per branch change - which already
-	 * stalls the world for a shrink_dcache_sb() and a
-	 * synchronize_rcu_expedited().
+	 * Excludes lookup/readdir during a branch add/remove.  Per-cpu
+	 * because the read side is taken by every uncached lookup,
+	 * readdir build and directory mutation, where a plain rwsem would
+	 * have all CPUs trading one cacheline.  The cost moves to the
+	 * write side, which already stalls for a shrink and a grace
+	 * period.
 	 */
 	struct percpu_rw_semaphore dyn_lock;
 	struct backing_file_ctx backing_ctx;
@@ -219,10 +166,9 @@ static inline struct aufsng_fs *AUFSNG_FS(struct super_block *sb)
 }
 
 /*
- * udba=reval (and =notify, a superset) re-examine the real branches on
- * access so that a direct, out-of-band change to a branch - most
- * commonly a ".wh.<name>" whiteout removed by hand in the rw branch -
- * is reflected in the merged view; udba=none trusts the cache instead.
+ * udba=reval (and =notify) re-examine the branches on access, so an
+ * out-of-band change shows up in the merged view; =none trusts the
+ * cache instead.
  */
 static inline bool aufsng_udba_reval(struct aufsng_fs *pfs)
 {
@@ -252,11 +198,8 @@ static inline struct dentry *aufsng_upperdentry(struct inode *inode)
 
 /*
  * A dentry's two revalidation stamps: the upper dir's change signal in
- * d_fsdata (see aufsng_reval_stamp()) and the branch generation in
- * d_time (see branch_gen).  Stored and compared through this single
- * pair so the storage convention - both are unsigned-long-wide, the
- * width of d_time - lives in one place; positive, negative and
- * fresh-lookup paths all prime and gate through these.
+ * d_fsdata and the branch generation in d_time.  Stored and compared
+ * through this one pair so the width convention lives in one place.
  */
 static inline void aufsng_store_reval_stamps(struct dentry *dentry,
 					     unsigned long stamp,
@@ -279,22 +222,16 @@ static inline struct vfsmount *aufsng_upper_mnt(struct aufsng_fs *pfs)
 	return pfs->upper->mnt;
 }
 
-/*
- * A layer's stable slot number.  Stored, not derived from its address
- * in the slot table: the table is reallocated when it grows, and a
- * reader here may hold nothing but the layer pointer.
- */
+/* Stored, not derived from the slot table: the table moves when it grows. */
 static inline unsigned int aufsng_layer_idx(const struct aufsng_layer *layer)
 {
 	return layer->idx;
 }
 
 /*
- * Is a pinned real dentry still a live entry in its branch?  Unhashed
- * or turned negative means an out-of-band unlink/rename removed it -
- * the udba=reval staleness signal, and the survivor test for branch
- * removal.  One definition so the liveness rule cannot drift between
- * revalidation, shed-upper and the removal scan.
+ * Is a pinned real dentry still live in its branch?  Unhashed or
+ * negative means an out-of-band unlink/rename took it.  One definition
+ * for revalidation, shed-upper and the removal scan alike.
  */
 static inline bool aufsng_dentry_alive(const struct dentry *dentry)
 {
@@ -302,13 +239,11 @@ static inline bool aufsng_dentry_alive(const struct dentry *dentry)
 }
 
 /*
- * The single definition of what keys a union inode in the inode hash:
- * the top lower inode when a lower exists (stable across copy-up),
- * else the upper's.  @key_idx (optional) is the providing branch's
- * slot, folded into i_ino by aufsng_map_ino().  Fresh lookup
- * (aufsng_get_inode), branch-removal rekey and its duplicate check all
- * derive the key here - hardlink-aliasing correctness depends on them
- * never disagreeing.
+ * What keys a union inode in the inode hash: the top lower when one
+ * exists (stable across copy-up), else the upper.  @key_idx is the
+ * providing slot, folded into i_ino.  Lookup, the branch-removal rekey
+ * and its duplicate check all derive it here - hardlink-aliasing
+ * correctness depends on them never disagreeing.
  */
 static inline struct inode *aufsng_hash_key(const struct aufsng_entry *oe,
 					    struct dentry *upper,
@@ -333,24 +268,19 @@ static inline void aufsng_path_real(struct inode *inode, struct path *path)
 
 		if (oe && oe->numlower) {
 			/*
-			 * The entry's own mnt copy, NOT layer->mnt: this read
-			 * is lockless and @oe may be a superseded stack whose
-			 * branch was since removed - its layer->mnt is NULL
-			 * (or reused by a later add), while the entry's copy
-			 * stays pinned with the parked stack until eviction.
+			 * The entry's own copy, NOT layer->mnt: this read is
+			 * lockless and @oe may be a superseded stack whose
+			 * branch is gone.
 			 */
 			path->mnt = oe->lowerstack[0].mnt;
 			path->dentry = oe->lowerstack[0].dentry;
 			return;
 		}
 		/*
-		 * NULL upper combined with an empty stack is a torn
-		 * snapshot: a branch removal emptied the stack after
-		 * copying the object up, and it published upperdentry
-		 * before releasing the new stack (same thread), so a
-		 * re-read behind a read barrier must find it.  Pairs
-		 * with the smp_store_release() publishing the stack in
-		 * aufsng_dyn_commit_rebuild().
+		 * NULL upper plus an empty stack is a torn snapshot: the
+		 * removal published upperdentry before the new stack, so a
+		 * re-read behind a barrier must find it.  Pairs with the
+		 * smp_store_release() in aufsng_dyn_commit_rebuild().
 		 */
 		smp_rmb();
 		upper = aufsng_upperdentry(inode);
@@ -359,11 +289,7 @@ static inline void aufsng_path_real(struct inode *inode, struct path *path)
 	path->dentry = upper;
 }
 
-/*
- * aufsng_path_real() owns the lockless upper/stack read protocol (the
- * torn-snapshot re-read behind smp_rmb); a second open-coding here
- * would silently miss any future change to it.
- */
+/* aufsng_path_real() owns the lockless upper/stack read protocol */
 static inline struct inode *aufsng_inode_real(struct inode *inode)
 {
 	struct path path;
@@ -373,10 +299,9 @@ static inline struct inode *aufsng_inode_real(struct inode *inode)
 }
 
 /*
- * Is the lower @origin a valid copy-up origin for an object of type
- * @mode?  Only when they are the same file type: a same-named lower of
- * a different type is an independent object shadowed by the upper, not
- * its origin, and must not be aliased onto the lower's identity.
+ * Is @origin a valid copy-up origin for type @mode?  Only at the same
+ * file type: a same-named lower of another type is an independent
+ * object, and must not be aliased onto the lower's identity.
  */
 static inline bool aufsng_origin_type_ok(struct dentry *origin, umode_t mode)
 {
@@ -384,17 +309,12 @@ static inline bool aufsng_origin_type_ok(struct dentry *origin, umode_t mode)
 }
 
 /*
- * The single definition of "the union inode mirrors the real inode's
- * attributes", shared by first instantiation (aufsng_fill_inode) and
- * every later refresh (aufsng_copyattr).
+ * "The union inode mirrors the real inode's attributes", shared by
+ * first instantiation and every later refresh.
  *
- * i_lock serializes concurrent refreshers: they arrive under different
- * sleeping locks (oi->lock for copy-up/adopt, i_rwsem for setattr,
- * none for revalidation and write completion), so without a common
- * lock two multi-field copies interleave and a permission check can
- * read a (mode, uid) pair spliced from two generations.  The source
- * fields are read inside the same section, so the last writer wins
- * with a coherent snapshot.
+ * i_lock serializes refreshers: they arrive under different sleeping
+ * locks, so without a common one two multi-field copies interleave and
+ * a permission check reads a (mode, uid) pair from two generations.
  */
 static inline void aufsng_copyattr_from(struct inode *inode,
 					struct inode *realinode)
@@ -417,9 +337,8 @@ static inline void aufsng_copyattr(struct inode *inode)
 }
 
 /*
- * Is @name (length @len) reserved for AUFS bookkeeping?  Any such
- * name must never be exposed to userspace via readdir, and must
- * never be treated as a "real" file matched by lookup.
+ * Is @name reserved for AUFS bookkeeping?  Such names are never shown
+ * by readdir nor matched by lookup.
  */
 static inline bool aufsng_is_wh_name(const char *name, int len)
 {
@@ -428,11 +347,9 @@ static inline bool aufsng_is_wh_name(const char *name, int len)
 }
 
 /*
- * Is @name in aufs-ng's own xattr namespace?  Nothing in it is ever
- * exposed through the union or copied up from a branch.  The test is on
- * the namespace, not the one name in it today, so a branch that once
- * WAS a rw branch (a squashfs module built from one) cannot smuggle any
- * of this bookkeeping into a new upper.
+ * Is @name in aufs-ng's own xattr namespace?  Nothing in it is exposed
+ * or copied up.  The test is on the namespace, not today's one name,
+ * so a branch built from an old rw branch cannot smuggle any in.
  */
 static inline bool aufsng_is_private_xattr(const char *name)
 {
@@ -440,11 +357,9 @@ static inline bool aufsng_is_private_xattr(const char *name)
 }
 
 /*
- * Build the on-disk whiteout name ".wh.<name>" into @buf (which must
- * hold at least NAME_MAX + 1 bytes).  The single definition of the
- * format shared by lookup, mutation and readdir.  A name too long to
- * ever have a whiteout is rejected here, which also caps the length
- * pfs->namelen advertises (see aufsng_get_namelen()).
+ * Build ".wh.<name>" into @buf (at least NAME_MAX + 1 bytes) - the one
+ * definition of the format.  A name too long to have a whiteout is
+ * rejected here, which also caps what namelen advertises.
  */
 static inline int aufsng_wh_name(char *buf, const struct qstr *name,
 			      struct qstr *wh)
@@ -458,25 +373,20 @@ static inline int aufsng_wh_name(char *buf, const struct qstr *name,
 }
 
 /*
- * Branch filesystems (one squashfs per module) number their inodes
- * independently, so raw i_ino values collide across branches while
- * st_dev is the union's for all of them - breaking hardlink detection
- * in cp -a/tar/mksquashfs and find's loop check.  Disambiguate the
- * way overlayfs's xino does: fold the branch's stable slot index into
- * the high bits.  Branch 0 and any filesystem already using the high
- * bits are left untouched.
+ * Branch filesystems number inodes independently, so raw i_ino values
+ * collide while st_dev is the union's for all - breaking hardlink
+ * detection in cp -a/tar and find's loop check.  Fold the branch's
+ * slot into the high bits, as overlayfs's xino does.  Branch 0, and
+ * any fs already using those bits, are left alone.
  */
 #define AUFSNG_XINO_SHIFT	40
 
 /*
- * The union root's inode number (AUFSNG_ROOT_INO) is invented, not taken
- * from any branch, so a branch-0 object whose raw number happens to be
- * the same (a fresh tmpfs rw branch hands out 2 to the very first object
- * created in it) would otherwise report the root's exact (st_dev,
- * st_ino) - making find report a filesystem loop and archive tools
- * hardlink the two.  Move that one number out of the way instead;
- * bit 62 is above every slot-folded value (idx << 40) and practically
- * above any raw branch number.
+ * AUFSNG_ROOT_INO is invented, not taken from a branch, so a branch-0
+ * object with the same raw number would report the root's exact
+ * (st_dev, st_ino) - a filesystem loop to find, a hardlink to
+ * archivers.  Move that one number aside; bit 62 is above every
+ * slot-folded value and any plausible raw number.
  */
 #define AUFSNG_ROOT_INO_EVADE	(1ULL << 62)
 
@@ -491,27 +401,21 @@ static inline u64 aufsng_map_ino(u64 ino, unsigned int idx)
 }
 
 /*
- * A lower stack superseded by a dynamic branch change (or a replaced
- * upper), kept until the inode is evicted: an operation that resolved
- * a lower path before the change may still hold pointers into it, and
- * it holds the inode for its duration.
+ * A stack superseded by a branch change or a replaced upper, kept
+ * until the inode is evicted: an operation that resolved a path
+ * before the change may still hold pointers into it.
  */
 struct aufsng_dyn_parked {
 	struct aufsng_dyn_parked *next;
 	struct aufsng_entry *oe;
 	struct dentry *upper;
 	/*
-	 * EVERY branch mount the parked stack's dentries point into,
-	 * pinned for the park's lifetime: dropping a branch's last
-	 * mount reference while an older parked stack still held
-	 * dentries in that branch's sb would tear the branch down
-	 * under them ("Dentry still in use" panic on umount).  Each
-	 * node pins its own referenced mounts (@nr_mnts of them - one
-	 * per @oe lower, or, for a pin-only node with no @oe, one per
-	 * lower of the inode's CURRENT stack: a deleted-but-open
-	 * object keeps its stack in place across the removal of the
-	 * branch serving it, see aufsng_dyn_pin_stack()), and nodes
-	 * are safe to release in any order.
+	 * EVERY mount the parked dentries point into, pinned for the
+	 * park's lifetime: dropping a branch's last reference while an
+	 * older park still holds dentries in its sb tears the branch down
+	 * under them.  Each node pins its own (@nr_mnts: one per @oe
+	 * lower, or per lower of the CURRENT stack for a pin-only node),
+	 * so nodes release in any order.
 	 */
 	unsigned int nr_mnts;
 	struct vfsmount *mnts[];
@@ -522,7 +426,6 @@ struct aufsng_ctx_branch {
 	char *name;
 	struct path path;
 	enum aufsng_br_perm perm;
-	char permstr[AUFSNG_PERM_LEN];	/* the mode as given, for show_options */
 };
 
 struct aufsng_fs_context {
@@ -660,7 +563,7 @@ unsigned long aufsng_reval_stamp(struct aufsng_fs *pfs, struct inode *dir);
 
 /* dynlayer.c */
 int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
-		       const struct path *path, const char *permstr);
+		       const struct path *path);
 int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path);
 bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 			 struct dentry *upperdentry);

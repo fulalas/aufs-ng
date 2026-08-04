@@ -33,21 +33,14 @@ static int aufsng_getattr(struct mnt_idmap *idmap, const struct path *path,
 	stat->dev = inode->i_sb->s_dev;
 	stat->ino = inode->i_ino;
 	/*
-	 * Directories report a merged link count the way AUFS does
-	 * (au_cpup_attr_nlink): the top branch's, plus each additional
-	 * branch's subdirectory links with its own "."/".." discounted.
-	 * find-style tools use nlink-2 as the subdirectory count.
+	 * Merged dir link count, as AUFS (au_cpup_attr_nlink): top branch
+	 * plus each other branch's, less its own "."/"..".
 	 */
 	if (S_ISDIR(inode->i_mode)) {
 		struct aufsng_entry *oe;
 		unsigned int i;
 
-		/*
-		 * RCU-protect the walk: the ROOT's superseded entry is
-		 * freed one grace period after a branch change, and
-		 * nothing else pins it for this lockless reader (non-root
-		 * stacks are instead parked on the inode until eviction).
-		 */
+		/* RCU: the root's superseded entry is freed after a grace period */
 		rcu_read_lock();
 		oe = AUFSNG_I_E(inode);
 		i = aufsng_upperdentry(inode) ? 0 : 1;
@@ -105,12 +98,9 @@ static int aufsng_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 }
 
 /*
- * Whiteouts and the opaque marker are plain files, not xattrs (see
- * namei.c/dir.c), exactly as in AUFS - so all the passthrough below has
- * to filter out is aufs-ng's own xattr namespace (AUFSNG_XATTR_PFX).
- * Nothing in it may show up in a listing, be readable or writable
- * through the union, or ride along on a cp -a into a file that was
- * never copied up.
+ * Whiteouts are files, not xattrs, so the passthrough below only has to
+ * hide aufs-ng's own namespace (AUFSNG_XATTR_PFX) - from listings,
+ * reads, writes and cp -a alike.
  */
 static ssize_t aufsng_listxattr(struct dentry *dentry, char *list, size_t size)
 {
@@ -125,12 +115,7 @@ static ssize_t aufsng_listxattr(struct dentry *dentry, char *list, size_t size)
 	old_cred = override_creds(pfs->creator_cred);
 	res = vfs_listxattr(realpath.dentry, list, size);
 	revert_creds(old_cred);
-	/*
-	 * A size probe (@list NULL) may over-report by the marker's
-	 * length; the buffered call below then returns the real, shorter
-	 * length.  Reporting a bound that is too large is what the VFS
-	 * expects here, and what overlayfs's ovl_listxattr does too.
-	 */
+	/* A size probe may over-report; the VFS expects an upper bound */
 	if (res <= 0 || !list)
 		return res;
 

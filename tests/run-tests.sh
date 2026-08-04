@@ -14,7 +14,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=105; PASS=0; FAIL=0
+	N=0; TOTAL=107; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -419,27 +419,30 @@ guest_main() {
 	exec 8<&-
 	rmdir $L3/dgone 2>/dev/null; rm -f $W/.wh.dgone
 
-	echo "=== 28. lower branch declared rw is demoted, and reported so ==="
+	echo "=== 28. lower branch declared rw is demoted, and warned about ==="
 	# AUFS grammar allows "=rw" on any branch; aufs-ng only ever writes
-	# branch 0, so a lower "=rw" is accepted but clamped read-only.
-	# /proc/mounts is the only place branch modes are exposed, so it
-	# must show the mode the branch actually HAS - it used to echo back
-	# the "=rw" that was asked for.
+	# branch 0, so a lower "=rw" is accepted but clamped read-only.  The
+	# branch modes are not echoed to userspace anywhere, so the kernel
+	# log warning is the only notice the demotion happened.
 	mkdir -p /mnt/dw /mnt/dl /mnt/du
 	$M tmpfs tmpfs /mnt/dw; $M tmpfs tmpfs /mnt/dl
 	echo lowerdata > /mnt/dl/lf
+	# counted, not matched: the ring buffer is never cleared, so only a
+	# NEW line proves this mount warned
+	warned_before=$(dmesg | grep -c "branch '/mnt/dl' declared rw")
 	$M aufs aufs /mnt/du "br:/mnt/dw=rw:/mnt/dl=rw" \
 		&& ok "lower =rw accepted (AUFS grammar)" \
 		|| bad "lower =rw accepted (AUFS grammar)"
-	grep " /mnt/du " /proc/mounts | grep -q '/mnt/dl=ro' \
-		&& ok "/proc/mounts reports the demoted lower as ro" \
-		|| bad "/proc/mounts reports the demoted lower as ro (got: $(grep ' /mnt/du ' /proc/mounts))"
+	warned=$(dmesg | grep -c "branch '/mnt/dl' declared rw")
+	[ "${warned:-0}" -gt "${warned_before:-0}" ] \
+		&& ok "the demoted lower is warned about in the kernel log" \
+		|| bad "the demoted lower is warned about in the kernel log"
 	echo new > /mnt/du/lf
 	check "write to a lower-=rw name lands in branch 0" grep -q new /mnt/dw/lf
 	check "the demoted lower branch stays untouched"    grep -q lowerdata /mnt/dl/lf
 	$M -u /mnt/du
 
-	echo "=== 29. noxino accepted at mount time (aufs compatibility) ==="
+	echo "=== 29. noxino and si= accepted at mount time (aufs compatibility) ==="
 	# aufs-ng keeps no inode table, so xino=/noxino are accepted and
 	# ignored rather than rejected - real aufs commands carry them.
 	mkdir -p /mnt/nxw /mnt/nxu
@@ -447,6 +450,12 @@ guest_main() {
 	$M aufs aufs /mnt/nxu "br:/mnt/nxw=rw:$L1=ro,noxino" \
 		&& ok "noxino accepted at mount time" \
 		|| bad "noxino accepted at mount time"
+	$M -u /mnt/nxu
+	# si= is our own show_options output: a tool re-mounting from
+	# /proc/mounts feeds it straight back, so it must parse
+	$M aufs aufs /mnt/nxu "br:/mnt/nxw=rw:$L1=ro,si=deadbeef" \
+		&& ok "si= accepted at mount time" \
+		|| bad "si= accepted at mount time"
 	$M -u /mnt/nxu
 
 	# helpers shared by the identity checks below
@@ -592,11 +601,9 @@ for e in os.scandir(sys.argv[1]):
 	rm -f $W/bin/hardrun $W/bin/mvold $W/bin/.wh.hardrun
 
 	echo "=== 32. many branches (a live system loads hundreds) ==="
-	# The slot table used to be sized once at mount, so add number 127
-	# failed with ENOSPC ("No space left on device" out of mount) on a
-	# real boot that loads that many modules.  MANY crosses that old
-	# limit; the branches are plain sibling directories, which is all a
-	# branch has to be (they may not nest inside one another).
+	# The slot table used to be sized once at mount, so adds past 128
+	# failed with ENOSPC.  MANY crosses that old limit; the branches are
+	# plain sibling directories, which is all a branch has to be.
 	MANY=140
 	mkdir -p /mnt/many
 	i=1
@@ -612,9 +619,15 @@ for e in os.scandir(sys.argv[1]):
 	# add=1 always inserts on top, so the last one added owns the name
 	check "the newest of many branches wins the shared name" \
 		grep -q "^b$MANY\$" $U/manyfile
-	grep -q ":/mnt/many/b1=rr" /proc/mounts \
-		&& ok "the first added branch is still listed in /proc/mounts" \
-		|| bad "the first added branch is still listed in /proc/mounts"
+	# Readers with fixed line buffers fail once a mountinfo line fills
+	# 4096 bytes, which printing every branch used to do.
+	len=$(awk -v m=$U '$5 == m { print length($0); exit }' /proc/self/mountinfo)
+	[ -n "$len" ] && [ "$len" -lt 4096 ] \
+		&& ok "the mountinfo line stays short with $MANY branches ($len bytes)" \
+		|| bad "the mountinfo line stays short with $MANY branches (got ${len:-no line})"
+	grep " $U " /proc/mounts | grep -q 'si=' \
+		&& ok "the union reports an si= mount id, as aufs does" \
+		|| bad "the union reports an si= mount id, as aufs does"
 	i=$MANY
 	while [ $i -ge 1 ]; do
 		$M aufs aufs $U "del=/mnt/many/b$i" 32 || break
@@ -628,11 +641,9 @@ for e in os.scandir(sys.argv[1]):
 	$M aufs aufs $U "add=1:/mnt/many/b1=rr" 32 \
 		&& ok "a freed slot is reused by a later add" \
 		|| bad "a freed slot is reused by a later add"
-	$M aufs aufs $U "del=/mnt/many/b1" 32
-	# Only once nothing is attached any more: deleting the directory
-	# tree of a branch the union still holds would bury the real
-	# failure under unrelated noise in the kernel log.
-	grep -q ":/mnt/many/b" /proc/mounts || rm -rf /mnt/many
+	# Only once every del= succeeded: wiping a still-attached branch's
+	# tree would bury the real failure in unrelated noise.
+	$M aufs aufs $U "del=/mnt/many/b1" 32 && [ $i -eq 0 ] && rm -rf /mnt/many
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.

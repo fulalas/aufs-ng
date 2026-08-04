@@ -1,17 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * aufs-ng layered lookup, AUFS-compatible whiteout semantics.
- *
- * Unlike overlayfs (where a whiteout occupies the SAME name as the
- * file it hides), AUFS marks a name deleted in a branch with a
- * SEPARATE sibling file named ".wh.<name>" (a plain 0444 regular
- * file, verified against fs/aufs/whout.c in the upstream source).  A
- * branch lookup for "foo" is therefore always paired with a lookup
- * for ".wh.foo" in the same parent: if the whiteout is found, "foo"
- * is considered deleted from that branch downward and the search
- * stops; only then is "foo" itself looked up.  A directory is
- * "opaque" (nothing below it in lower branches is visible) if it
- * contains a file named ".wh..wh..opq".
+ * Layered lookup with AUFS whiteout semantics.  AUFS marks a name
+ * deleted with a SEPARATE sibling ".wh.<name>" (a 0444 regular file),
+ * not with the name itself as overlayfs does.  So a branch lookup for
+ * "foo" always probes ".wh.foo" first: found, the name is deleted from
+ * that branch down and the search stops.  A directory holding
+ * ".wh..wh..opq" is opaque and hides every lower branch.
  */
 
 #include <linux/fs.h>
@@ -22,11 +16,9 @@
 #include "aufsng.h"
 
 /*
- * Probe @dir (in @mnt) for the AUFS bookkeeping marker @name.
- * Returns 1 if present as a regular file, 0 if absent, negative errno
- * on lookup error.  @strict maps a positive non-regular occupant to
- * -EIO (a corrupt marker must fail the operation) instead of treating
- * it as absent.
+ * Probe @dir for the marker @name: 1 present as a regular file, 0
+ * absent, negative errno on error.  @strict maps a non-regular
+ * occupant to -EIO instead of treating it as absent.
  */
 static int aufsng_probe_marker(struct vfsmount *mnt, struct dentry *dir,
 			    struct qstr *name, bool strict)
@@ -44,9 +36,8 @@ static int aufsng_probe_marker(struct vfsmount *mnt, struct dentry *dir,
 }
 
 /*
- * Does @parent (in @mnt) contain a whiteout for @name?  Returns 1 if
- * yes, 0 if no, negative errno on error.  This is a lookup for the
- * SIBLING name ".wh.<name>", not a property of @name's own dentry.
+ * Does @parent hold a whiteout for @name?  1/0, or negative errno.
+ * A lookup of the SIBLING ".wh.<name>", not of @name's own dentry.
  */
 int aufsng_check_whiteout(struct vfsmount *mnt, struct dentry *parent,
 		       const struct qstr *name)
@@ -56,12 +47,9 @@ int aufsng_check_whiteout(struct vfsmount *mnt, struct dentry *parent,
 	int ret;
 
 	/*
-	 * A name too long to have a ".wh." sibling at all cannot be
-	 * whited out - the branch fs could never store the marker - so
-	 * the probe answers "no whiteout" rather than failing lookups
-	 * of legally existing long lower names with ENAMETOOLONG.
-	 * (Deleting such a name still fails in aufsng_create_whiteout(),
-	 * as it does on real AUFS.)
+	 * A name too long for a ".wh." sibling cannot be whited out, so
+	 * answer "no whiteout" rather than fail lookups of long lower
+	 * names.  Deleting one still fails, as on real AUFS.
 	 */
 	ret = aufsng_wh_name(buf, name, &wh);
 	if (ret)
@@ -80,10 +68,9 @@ int aufsng_check_diropq(struct vfsmount *mnt, struct dentry *dir)
 }
 
 /*
- * Look up @name in one real branch directory.  Returns NULL for a
- * negative result, the referenced dentry for a positive one, or
- * (via *whiteout) 1 if this branch whites the name out (in which
- * case NULL is always returned and the search must stop here).
+ * Look up @name in one branch dir: NULL if negative, a referenced
+ * dentry if positive, or *whiteout = 1 (and NULL) if this branch
+ * whites it out, in which case the search must stop here.
  */
 struct dentry *aufsng_lookup_once(struct vfsmount *mnt,
 			       struct dentry *base,
@@ -109,22 +96,16 @@ struct dentry *aufsng_lookup_once(struct vfsmount *mnt,
 }
 
 /*
- * Find the topmost lower branch entry still visibly providing @name
- * under the parent stack @poe: the copy-up origin of an upper object,
- * and the entry that would resurface if the upper name were removed.
- * Returns 1 with a reference in @out, 0 if no lower provides the name
- * (absent or whited out), negative errno on error.  Caller must hold
- * pfs->dyn_lock (any mode).
+ * The topmost lower still visibly providing @name under @poe: an upper
+ * object's copy-up origin, and what resurfaces if the upper name goes.
+ * 1 with a reference in @out, 0 if no lower provides it, negative
+ * errno on error.  Caller holds pfs->dyn_lock (any mode).
  *
- * @skip_layer, when set, is ignored during the walk (branch removal
- * re-resolves a name against the surviving branches only).  @mode,
- * when non-zero, requires the first positive hit to be of the same
- * file type: a same-named lower of a different type is an independent
- * object, not this one's origin - and, exactly as in lookup, it hides
- * anything deeper, so the walk STOPS there rather than continuing (all
- * callers historically stopped at the first positive; keeping that
- * single behavior here prevents the merge rule from drifting apart
- * between lookup, mutation and branch removal).
+ * @skip_layer is ignored during the walk (branch removal re-resolves
+ * against survivors only).  @mode, when non-zero, requires the first
+ * positive hit to be that type: a same-named lower of another type is
+ * an independent object, and it hides anything deeper, so the walk
+ * STOPS there rather than continuing.
  */
 int aufsng_find_origin_ex(struct aufsng_entry *poe, const struct qstr *name,
 		       const struct aufsng_layer *skip_layer, umode_t mode,
@@ -160,33 +141,25 @@ int aufsng_find_origin_ex(struct aufsng_entry *poe, const struct qstr *name,
 }
 
 /*
- * The per-level merge rule, in ONE place: walk @poe's lowers from index
- * @from looking for @name, appending every visible DIRECTORY to @m's
- * stack, and stop where the merged view ends - at a whiteout (the name
- * is deleted from here down), at a same-named non-directory (it shadows
- * anything deeper), or at an opaque directory (it hides every branch
- * below it).  @skip, when set, is ignored entirely: branch removal
- * re-merges against the surviving branches only.
+ * The per-level merge rule, in ONE place: walk @poe's lowers from
+ * @from for @name, append every visible DIRECTORY to @m's stack, and
+ * stop where the merged view ends - a whiteout, a same-named
+ * non-directory, or an opaque directory.  @skip is ignored entirely.
  *
- * Both callers that build a directory stack come through here - lookup
- * and the branch-removal tail merge - so a pinned directory and a fresh
- * lookup of the same path cannot answer differently, which is the whole
- * point of the rule having a single owner.  (aufsng_find_origin_ex()
- * stays separate: it wants the FIRST provider, not a merged stack.)
+ * Both stack builders come through here - lookup and the
+ * branch-removal tail merge - so a pinned directory and a fresh lookup
+ * cannot answer differently.  (aufsng_find_origin_ex() stays separate:
+ * it wants the FIRST provider, not a merged stack.)
  *
- * @m->oe is allocated lazily - on the first hit, sized to the branches
- * still to come - so an all-negative lookup, the common case for PATH
- * and include probes, allocates nothing.  A caller that already holds a
- * stack to append to passes it in @m->oe with @m->n set and must have
- * reserved room for the rest of @poe.  @m->allow_top_nondir lets a
- * non-directory become the whole stack when nothing precedes it (that is
- * what keys a lower-only file); a directory stack being rebuilt never
- * wants that.
+ * @m->oe is allocated on the first hit, so an all-negative lookup
+ * allocates nothing.  A caller appending to its own stack passes it in
+ * @m->oe with @m->n set, having reserved room for the rest of @poe.
+ * @m->allow_top_nondir lets a non-directory be the whole stack when
+ * nothing precedes it; a rebuilt directory stack never wants that.
  *
- * Returns 0 or negative errno.  On either outcome the caller publishes
- * @m->n into @m->oe->numlower, so freeing the entry drops exactly the
- * references taken here.  Caller holds pfs->dyn_lock and runs under
- * creator credentials.
+ * 0 or negative errno; either way the caller publishes @m->n into
+ * @m->oe->numlower, so freeing the entry drops exactly what was taken
+ * here.  Caller holds pfs->dyn_lock, under creator credentials.
  */
 int aufsng_merge_dirs(struct aufsng_merge *m, struct aufsng_entry *poe,
 		   unsigned int from, const struct qstr *name,
@@ -232,11 +205,7 @@ int aufsng_merge_dirs(struct aufsng_merge *m, struct aufsng_entry *poe,
 		m->oe->lowerstack[m->n].mnt = lower->mnt;
 		m->n++;
 
-		/*
-		 * On the last branch the opaque verdict changes nothing
-		 * (break == falling out of the loop), so don't pay a branch
-		 * lookup for it.
-		 */
+		/* On the last branch the opaque verdict changes nothing */
 		if (i + 1 >= poe->numlower)
 			break;
 		opq = aufsng_check_diropq(lower->mnt, this);
@@ -249,24 +218,19 @@ int aufsng_merge_dirs(struct aufsng_merge *m, struct aufsng_entry *poe,
 }
 
 /*
- * May the object @upper provides as @name be keyed on a lower - the
- * question every caller of aufsng_find_origin_ex() has to answer first,
- * in ONE place so lookup, readdir, revalidation and branch removal
- * cannot drift apart (they must not: a disagreement shows up directly
- * as readdir's d_ino contradicting stat's st_ino).
+ * May the object @upper provides as @name be keyed on a lower?  In ONE
+ * place so lookup, readdir, revalidation and branch removal cannot
+ * drift apart - a disagreement shows up as readdir's d_ino
+ * contradicting stat's st_ino.
  *
- * No upper at all is a pure lower object and always may.  A directory
- * may unless it is opaque: it is keyed by its merged stack, which is
- * why copy-up never marks one - but ".wh..wh..opq" ends that stack, and
- * lookup then keys it on the upper alone.  Everything else may only if
- * copy-up recorded it as the copy of the lower called @name - see
- * AUFSNG_XATTR_ORIGIN.
+ * No upper is a pure lower object and always may.  A directory may
+ * unless it is opaque, which is why copy-up never marks one.  Anything
+ * else may only if copy-up recorded it as the copy of the lower called
+ * @name - see AUFSNG_XATTR_ORIGIN.
  *
- * @upper must be NULL or positive; a dead one (unhashed by an
- * out-of-band branch edit, pending the shed heal) has no inode to read.
- * Must run under creator credentials (the marker lives in "trusted."),
- * and not from an RCU walk.  A probe that fails answers "no", the
- * conservative side: the object keeps its own identity.
+ * @upper must be NULL or positive.  Runs under creator credentials,
+ * not from an RCU walk.  A failed probe answers "no": the object keeps
+ * its own identity.
  */
 bool aufsng_upper_claims_origin(struct aufsng_fs *pfs, struct dentry *upper,
 			     const struct qstr *name)
@@ -279,18 +243,14 @@ bool aufsng_upper_claims_origin(struct aufsng_fs *pfs, struct dentry *upper,
 }
 
 /*
- * Does any lower branch of @dir still visibly provide @name?  The
- * boolean form of aufsng_find_origin() for callers that only need the
- * verdict, not the origin itself.  Returns 1/0, negative errno on
- * error - each call site decides its own error policy (mutations must
- * treat an error as fatal, or a delete silently skips its whiteout;
- * revalidation keeps the dentry instead of thrashing it).
+ * Does any lower of @dir still visibly provide @name?  The boolean
+ * form of aufsng_find_origin().  1/0, or negative errno - each caller
+ * picks its error policy (fatal for mutations, keep-the-dentry for
+ * revalidation).
  *
- * A caller pairing this verdict with a mutation must hold
- * pfs->dyn_lock across BOTH: a branch spliced in or out between the
- * two would make the verdict stale (a deleted name would resurrect
- * uncovered, or a stray whiteout would mask nothing).  Must run under
- * credentials able to search the branch dirs (creator creds).
+ * A caller pairing the verdict with a mutation must hold dyn_lock
+ * across BOTH, or a branch change between them makes it stale.  Runs
+ * under creator credentials.
  */
 int aufsng_lower_covers(struct inode *dir, const struct qstr *name)
 {
@@ -304,14 +264,10 @@ int aufsng_lower_covers(struct inode *dir, const struct qstr *name)
 }
 
 /*
- * udba=reval negative-dentry revalidation.  A cached negative name may
- * have been resurrected by a direct branch change the union never saw
- * (typically a ".wh.<name>" whiteout removed by hand in the rw branch).
- * Re-run the merge's "does any branch still provide this name" decision
- * for @name under parent @dir: return true if it is still absent (the
- * negative dentry remains valid), false if some branch now provides it
- * (the dentry must be dropped and looked up again).  On error, keep the
- * dentry valid rather than thrash it.  Caller must not be in RCU walk.
+ * udba=reval negative-dentry revalidation: an out-of-band branch edit
+ * may have resurrected the name.  True if it is still absent, false if
+ * some branch now provides it and the dentry must be dropped.  On
+ * error keep it valid.  Not from an RCU walk.
  */
 bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name)
 {
@@ -327,16 +283,11 @@ bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name)
 
 	pupper = aufsng_upperdentry(dir);
 	/*
-	 * No upper: whiteouts live only in the rw branch, and the lowers are
-	 * read-only, so a name absent when this negative dentry was created
-	 * stays absent until the branch set changes - and both add and remove
-	 * drop affected negative children through the dynamic path (a removed
-	 * branch may have carried a whiteout that hid a lower-priority name,
-	 * so removal calls aufsng_dyn_drop_neg_children() too).  A surviving
-	 * negative is therefore still absent: skip the per-branch rescan.
-	 * This is the common case for read-only system directories, where
-	 * repeated misses (PATH, include and library probes) would otherwise
-	 * scan every lower.
+	 * No upper: whiteouts live only in the rw branch and the lowers are
+	 * read-only, so an absent name stays absent until the branch set
+	 * changes - and both add and remove drop affected negatives
+	 * themselves.  So skip the rescan; repeated misses are the common
+	 * case in read-only system directories.
 	 */
 	if (!pupper)
 		goto out;
@@ -351,11 +302,7 @@ bool aufsng_lookup_negative_valid(struct inode *dir, const struct qstr *name)
 		goto out;
 	}
 
-	/*
-	 * Same "does any lower still provide this name" decision the
-	 * merge itself makes; errors keep the dentry valid rather than
-	 * thrash it.
-	 */
+	/* The merge's own decision; errors keep the dentry valid */
 	if (aufsng_lower_covers(dir, name) > 0)
 		valid = false;	/* a lower branch now provides it */
 
@@ -402,13 +349,10 @@ static void aufsng_fill_inode(struct inode *inode, struct inode *realinode)
 }
 
 /*
- * Find or create the union inode for a resolved branch stack.  The
- * inode hash key is the top lower inode when a lower exists (stable
- * across copy-up), the rw-branch inode for pure-rw files.  Consumes
- * @upperdentry and @oe on both success and failure.  Callers must hold
- * pfs->dyn_lock (read): the upper-adoption heal parks the superseded
- * upper on dyn_parked, which is otherwise mutated only under dyn_lock
- * for writing (aufsng_dyn_commit_rebuild).
+ * Find or create the union inode for a resolved stack, keyed on the
+ * top lower (stable across copy-up) or the rw inode.  Consumes
+ * @upperdentry and @oe either way.  Callers hold dyn_lock (read): the
+ * adoption heal parks the superseded upper on dyn_parked.
  */
 struct inode *aufsng_get_inode(struct super_block *sb,
 			    struct dentry *upperdentry,
@@ -438,29 +382,20 @@ struct inode *aufsng_get_inode(struct super_block *sb,
 		bool ok = cached_u == new_u;
 
 		/*
-		 * Upper mismatches on a shared hash key are usually
-		 * healable, not fatal.  This lookup found no upper while
-		 * the cached inode has one: a copy-up racing this
-		 * lookup, or a lower hardlink sibling of a copied-up
-		 * name - the cached state wins (matching AUFS, where
-		 * pseudo-links keep such names on one inode), but ONLY
-		 * while the cached upper is still alive.  A dead one
-		 * (unhashed by an out-of-band unlink/rename in the rw
-		 * branch - the exact udba=reval scenario) must be shed
-		 * instead: re-adopting it would serve the deleted upper's
-		 * content forever, and an open for write would skip
-		 * copy-up and write into the unlinked inode.  Shedding
-		 * lets the lower resurface, as the reval contract
-		 * promises.  This lookup found an upper the cached inode
-		 * lacks, or a different one (an app that saves by
-		 * writing a temp file and renaming it over the name
-		 * gives the rw copy a new inode on every save, and the
-		 * union inode - keyed by the stable lower origin - must
-		 * follow it instead of failing with ESTALE): adopt it
-		 * via the shared adopt-or-park machinery in dynlayer.c,
-		 * which also handles type mismatches (not adopted, fall
-		 * through to ESTALE) and parking the superseded upper
-		 * for lockless aufsng_path_real() readers.
+		 * Upper mismatches on a shared key are usually healable.
+		 *
+		 * No upper here but one cached: a racing copy-up, or a
+		 * hardlink sibling of a copied-up name - the cached state
+		 * wins, as in AUFS, but only while that upper is alive.  A
+		 * dead one is shed instead, or it would serve the deleted
+		 * upper's content forever and a write would land in the
+		 * unlinked inode.
+		 *
+		 * An upper the cached inode lacks, or a different one (a
+		 * save-by-rename gives the rw copy a new inode each time,
+		 * and the union inode must follow it rather than go
+		 * ESTALE): adopt it through dynlayer.c, which also parks
+		 * the superseded upper for lockless readers.
 		 */
 		if (!ok && !new_u && oe->numlower) {
 			if (aufsng_dentry_alive(cached))
@@ -509,21 +444,14 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 	int wh, err = 0;
 
 	/*
-	 * ".wh."-prefixed names are AUFS bookkeeping: refusing them here
-	 * (as real AUFS does) also blocks every way of creating one
-	 * through the union, since creation needs the lookup to return
-	 * a negative dentry first.  A user-created ".wh.<x>" would
-	 * otherwise land on disk as a real file and permanently hide
-	 * "<x>".
+	 * ".wh." names are bookkeeping.  Refusing them here, as AUFS
+	 * does, also blocks creating one: creation needs a negative
+	 * dentry from lookup first.
 	 */
 	if (aufsng_is_wh_name(dentry->d_name.name, dentry->d_name.len))
 		return ERR_PTR(-EPERM);
 
-	/*
-	 * The parent's branch stack (and the root stack every lookup
-	 * ultimately derives from) may be swapped by a runtime branch
-	 * add/remove; exclude that for the whole lookup.
-	 */
+	/* A branch add/remove may swap the stacks; exclude it for the lookup */
 	percpu_down_read(&pfs->dyn_lock);
 	old_cred = override_creds(pfs->creator_cred);
 
@@ -545,12 +473,7 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 			stopped = true;
 		} else if (this) {
 			upper = this;
-			/*
-			 * @stopped is only ever consumed when a lower stack
-			 * exists to stop: with no parent lowers the marker
-			 * probe would be a wasted branch lookup whose result
-			 * nothing reads.
-			 */
+			/* @stopped only matters when there is a lower stack to stop */
 			if (d_is_dir(upper) && poe && poe->numlower) {
 				int opq = aufsng_check_diropq(aufsng_upper_mnt(pfs),
 							   upper);
@@ -566,21 +489,15 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 
 	if (!stopped && upper && !d_is_dir(upper)) {
 		/*
-		 * A non-directory upper ends the merge, but its copy-up
-		 * origin (the topmost lower still visibly providing this
-		 * name) is still collected: the union inode is hashed by
-		 * the origin, which keeps the inode - and st_ino -
-		 * stable across copy-up and cache eviction.
+		 * A non-directory upper ends the merge, but its origin is
+		 * still collected: the inode is hashed by it, which keeps
+		 * st_ino stable across copy-up and eviction.
 		 *
-		 * Only a real copy-up gets that link
-		 * (aufsng_upper_claims_origin): sharing a name with a lower
-		 * is not enough, or a file created over that name's
-		 * whiteout, renamed onto it, or hardlinked to a copied-up
-		 * inode would inherit the identity of the file it replaced.
-		 * A same-named lower of a *different* type is excluded on
-		 * top of that, so a marker that outlived its object (an
-		 * out-of-band swap in the rw branch under udba=reval) still
-		 * cannot alias two conflicting types.
+		 * Only a real copy-up gets that link; sharing a name is not
+		 * enough, or a file created over a whiteout, renamed onto
+		 * the name or hardlinked would inherit the identity of what
+		 * it replaced.  A different-type lower is excluded too, so
+		 * a marker outliving its object cannot alias two types.
 		 */
 		struct aufsng_path origin = { NULL, NULL };
 		int found = 0;
@@ -603,9 +520,8 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 		}
 	} else if (!stopped && poe && poe->numlower) {
 		/*
-		 * Merge the parent's lowers by the shared rule: only a
-		 * non-directory at the very top can stand alone as the stack,
-		 * and only when no upper already holds that place.
+		 * The shared rule: only a top non-directory can stand alone
+		 * as the stack, and only with no upper in that place.
 		 */
 		struct aufsng_merge m = { .allow_top_nondir = !upper };
 
@@ -645,16 +561,11 @@ out:
 		return ERR_PTR(err);
 
 	/*
-	 * Prime both revalidation stamps with the state this lookup
-	 * just resolved against (sampled before the branch probes, so a
-	 * change landing mid-lookup still forces a re-check): the
-	 * upper-dir stamp in d_fsdata and the branch generation in
-	 * d_time.  Both are per-dentry - the generation deliberately so,
-	 * because lower hardlink siblings share one union inode while
-	 * the winning-branch decision is per-name (dcache.c).  Negative
-	 * dentries are primed too: their revalidation gates the
-	 * per-branch rescan on the same two stamps, so a cached miss
-	 * costs no branch lookups until something observable changes.
+	 * Prime both stamps with what this lookup resolved against,
+	 * sampled before the probes so a change landing mid-lookup still
+	 * forces a re-check.  Both are per-dentry: the winning-branch
+	 * decision is per-name.  Negatives are primed too, so a cached
+	 * miss costs no branch lookups until something changes.
 	 */
 	aufsng_store_reval_stamps(dentry, stamp, gen);
 
@@ -669,11 +580,7 @@ const char *aufsng_get_link(struct dentry *dentry, struct inode *inode,
 	if (!dentry)
 		return ERR_PTR(-ECHILD);
 
-	/*
-	 * aufsng_path_real() owns the lockless upper/stack read protocol
-	 * (torn-snapshot re-read behind smp_rmb); open-coding the reads
-	 * here would silently miss any future change to that protocol.
-	 */
+	/* aufsng_path_real() owns the lockless upper/stack read protocol */
 	aufsng_path_real(inode, &realpath);
 	if (!realpath.dentry)
 		return ERR_PTR(-ESTALE);

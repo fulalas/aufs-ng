@@ -1,25 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * aufs-ng mount parameter handling (fs_context), speaking genuine
- * AUFS option syntax so that scripts issuing real AUFS mount/remount
- * commands need no changes:
+ * Mount parameters (fs_context), in genuine AUFS option syntax:
  *
  *   mount -t aufs -o br:PATH=rw[:PATH=MODE...],xino=PATH,udba=MODE,
  *                    dirperm1,nowarn_perm  aufs <mountpoint>
  *   mount -o remount,dirperm1,add=N:PATH=MODE  <mountpoint>
  *   mount -t aufs -o remount,del=PATH          <mountpoint>
  *
- * AUFS accepts "keyword:value" as an alternate spelling of
- * "keyword=value" for a handful of options whose value itself
- * contains further ':'/'=' structure (br, add, del, ...).  The
- * generic mount-option splitter (generic_parse_monolithic) only
- * splits on commas and then the first '=' within each segment, so
- * "br:/path=rw" would otherwise be parsed as key="br:/path",
- * value="rw" - wrong.  We replicate AUFS's own fix: before handing
- * the raw option string to the generic splitter, rewrite the FIRST
- * colon following one of these keywords into '=', exactly as AUFS's
- * is_colonopt()/au_fsctx_parse_monolithic() do (verified against
- * fs/aufs/fsctx.c in the upstream aufs-standalone source).
+ * AUFS spells some options "keyword:value".  generic_parse_monolithic()
+ * splits on the first '=' instead, turning "br:/path=rw" into
+ * key="br:/path" - so, as AUFS's is_colonopt() does, the first colon
+ * after such a keyword is rewritten to '=' first.
  */
 
 #include <linux/module.h>
@@ -39,6 +30,7 @@ enum aufsng_opt {
 	Opt_udba,
 	Opt_dirperm1,
 	Opt_nowarn_perm,
+	Opt_si,
 };
 
 const struct fs_parameter_spec aufsng_parameter_spec[] = {
@@ -50,6 +42,7 @@ const struct fs_parameter_spec aufsng_parameter_spec[] = {
 	fsparam_string("udba",		Opt_udba),
 	fsparam_flag("dirperm1",	Opt_dirperm1),
 	fsparam_flag("nowarn_perm",	Opt_nowarn_perm),
+	fsparam_string("si",		Opt_si),
 	{}
 };
 
@@ -107,12 +100,9 @@ static int aufsng_mount_dir(struct fs_context *fc, const char *name,
 }
 
 /*
- * Parse an AUFS branch mode: a base permission "rw"/"ro"/"rr",
- * optionally followed by "+attr" suffixes ("ro+wh", "rw+nolwh", ...).
- * "rr" (real-readonly, e.g. squashfs) and "ro" are equivalent here -
- * neither is ever written to - and the attributes tune whiteout
- * handling that aufs-ng applies uniformly, so they parse but have no
- * further effect.  Returns -EINVAL if @s is not a mode at all.
+ * A branch mode: "rw"/"ro"/"rr" plus optional "+attr" suffixes.  "rr"
+ * and "ro" are equivalent here, and the suffixes parse but have no
+ * effect.  -EINVAL if @s is not a mode at all.
  */
 static int aufsng_parse_perm(const char *s, enum aufsng_br_perm *perm)
 {
@@ -128,25 +118,19 @@ static int aufsng_parse_perm(const char *s, enum aufsng_br_perm *perm)
 }
 
 /*
- * Split "PATH=MODE" (MODE optional, defaults to ro) into a resolved
- * path and a permission.  @spec is consumed (NUL bytes inserted).
- * The suffix after the last '=' is treated as a mode only when it
- * actually parses as one; otherwise the '=' belongs to the branch
- * path itself ("br:/data/a=b" is a path, not a mode "b").
+ * Split "PATH=MODE" (MODE optional, default ro); @spec is consumed.
+ * The tail after the last '=' counts as a mode only if it parses as
+ * one - "br:/data/a=b" is a path, not a mode "b".
  */
 static int aufsng_parse_branch_spec(struct fs_context *fc, char *spec,
 				 struct aufsng_ctx_branch *out)
 {
 	char *eq = strrchr(spec, '=');
 	enum aufsng_br_perm perm = AUFSNG_BR_RO;
-	const char *permstr = "ro";
 	int err;
 
-	if (eq && !aufsng_parse_perm(eq + 1, &perm)) {
+	if (eq && !aufsng_parse_perm(eq + 1, &perm))
 		*eq = '\0';
-		permstr = eq + 1;
-	}
-	strscpy(out->permstr, permstr, sizeof(out->permstr));
 
 	out->name = kstrdup(spec, GFP_KERNEL);
 	if (!out->name)
@@ -204,14 +188,10 @@ static int aufsng_parse_add(struct fs_context *fc, char *value)
 	if (kstrtouint(value, 10, &pos))
 		return invalfc(fc, "add= index must be numeric");
 	/*
-	 * Only "add=1:" (insert immediately below the writable branch,
-	 * i.e. as the new TOP lower) is implemented: the in-place splice
-	 * into cached directories has no notion of a deeper insert
-	 * position, so accepting another index would honor it in the
-	 * root stack only and leave cached directories merged in a
-	 * different priority order (and "0" would mean outranking the
-	 * writable branch, which a single-rw design cannot do).  Reject
-	 * rather than silently misplace.
+	 * Only add=1: (new top lower) is implemented: the in-place splice
+	 * has no deeper insert position, so another index would apply to
+	 * the root stack only and leave cached dirs in a different order.
+	 * Reject rather than silently misplace.
 	 */
 	if (pos != 1)
 		return invalfc(fc, "add=%u: is not supported, only add=1: (top of the read-only stack)",
@@ -264,10 +244,8 @@ static int aufsng_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	opt = fs_parse(fc, aufsng_parameter_spec, param, &result);
 	if (opt < 0) {
 		/*
-		 * Tools replay a mount's current options on "-o
-		 * remount"; tolerate anything unknown there instead of
-		 * failing the whole remount (matches how overlayfs and
-		 * real aufs both behave on legacy remounts).
+		 * Tools replay the current options on "-o remount";
+		 * tolerate unknowns there, as AUFS and overlayfs do.
 		 */
 		if (fc->purpose == FS_CONTEXT_FOR_RECONFIGURE &&
 		    opt == -ENOPARAM)
@@ -296,11 +274,9 @@ static int aufsng_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		return 0;
 	case Opt_udba:
 		/*
-		 * The value set real AUFS accepts (au_udba_val); anything
-		 * else is rejected, as AUFS rejects it - a typo silently
-		 * mapping to "none" would disable revalidation while the
-		 * user believes it is on (worse on remount, where the
-		 * explicit value overrides the mount-time choice).
+		 * AUFS's own value set; anything else is rejected, as AUFS
+		 * rejects it.  A typo mapping to "none" would disable
+		 * revalidation behind the user's back.
 		 */
 		if (!strcmp(param->string, "notify") ||
 		    !strcmp(param->string, "fsnotify"))
@@ -317,6 +293,8 @@ static int aufsng_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	case Opt_dirperm1:
 	case Opt_nowarn_perm:
 		return 0;	/* accepted, no functional effect needed */
+	case Opt_si:
+		return 0;	/* our own output, replayed back; ignored as in AUFS */
 	}
 
 	return -EINVAL;

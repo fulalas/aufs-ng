@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * aufs-ng regular file I/O: passthrough to the real file via the
- * kernel's backing-file API (the same infrastructure FUSE passthrough
- * and overlayfs use), so reads, writes, splice and mmap run at native
- * speed on the layer filesystem with no per-superblock locking.
+ * Regular file I/O: passthrough to the real file via the kernel's
+ * backing-file API, so reads, writes, splice and mmap run at native
+ * speed with no per-superblock locking.
  */
 
 #include <linux/fs.h>
@@ -71,13 +70,9 @@ static loff_t aufsng_llseek(struct file *file, loff_t offset, int whence)
 	loff_t ret;
 
 	/*
-	 * Position queries and a plain rewind need neither the real fs
-	 * nor a lock: the union file's f_pos is the master copy (every
-	 * I/O path passes iocb->ki_pos explicitly, and the delegated
-	 * path below resyncs realfile->f_pos from it before seeking).
-	 * Answering them here keeps an exclusive i_rwsem acquire - which
-	 * fallocate/truncate/setattr contend on - off a pure query path,
-	 * exactly as overlayfs's ovl_llseek does.
+	 * Queries and a plain rewind need neither the real fs nor a lock:
+	 * the union file's f_pos is the master copy.  Answering here keeps
+	 * an exclusive i_rwsem acquire off a pure query path.
 	 */
 	if (offset == 0) {
 		if (whence == SEEK_CUR)
@@ -86,10 +81,7 @@ static loff_t aufsng_llseek(struct file *file, loff_t offset, int whence)
 			return vfs_setpos(file, 0, 0);
 	}
 
-	/*
-	 * Delegate to the real fs so SEEK_END/SEEK_DATA/SEEK_HOLE see
-	 * the authoritative file size, keeping the positions in sync.
-	 */
+	/* SEEK_END/DATA/HOLE need the real fs; keep the positions in sync */
 	inode_lock(inode);
 	realfile->f_pos = file->f_pos;
 	ret = vfs_llseek(realfile, offset, whence);
@@ -170,10 +162,7 @@ static int aufsng_fsync(struct file *file, loff_t start, loff_t end,
 	struct path upperpath;
 	int err;
 
-	/*
-	 * No upper at all: every lower branch is read-only (and may be
-	 * fsync-less, e.g. squashfs), so nothing can be dirty.
-	 */
+	/* No upper: every lower is read-only, so nothing can be dirty */
 	if (!upper)
 		return 0;
 
@@ -182,19 +171,10 @@ static int aufsng_fsync(struct file *file, loff_t start, loff_t end,
 		return vfs_fsync_range(realfile, start, end, datasync);
 
 	/*
-	 * This fd's backing file is NOT the current upper: it was opened
-	 * before the copy-up (so it still points at the lower), or an
-	 * adopt/shed replaced the upper under it (udba=reval).  fsync(2) is
-	 * a barrier for the FILE, not for the descriptor it is called on, so
-	 * returning 0 here would report durability for data that was never
-	 * written back - the upper's dirty pages after a copy-up, or, when
-	 * the upper was replaced, even this fd's OWN writes.
-	 *
-	 * Sync both halves: the fd's backing file when it could have been
-	 * written through (a superseded upper stays pinned while the fd
-	 * lives), and the current upper - opened for the sync exactly as
-	 * aufsng_dir_fsync() opens it, and as overlayfs's ovl_fsync does for
-	 * this same case, rather than skipping the sync.
+	 * The fd predates a copy-up, or an adopt/shed replaced the upper
+	 * under it.  fsync(2) is a barrier for the FILE, so returning 0
+	 * would claim durability for the upper's dirty pages - or for this
+	 * fd's own writes.  Sync both halves instead.
 	 */
 	if (realfile->f_mode & FMODE_WRITE) {
 		err = vfs_fsync_range(realfile, start, end, datasync);
@@ -232,10 +212,9 @@ static long aufsng_fallocate(struct file *file, int mode, loff_t offset,
 	long ret;
 
 	/*
-	 * The VFS only allows fallocate on a write-opened fd, and a
-	 * write open already copied up (aufsng_open), so the backing
-	 * file is the upper one - a plain passthrough, like original
-	 * AUFS's aufs_fallocate.  The size may change; re-mirror.
+	 * fallocate needs a write-opened fd, and a write open already
+	 * copied up, so the backing file is the upper: plain passthrough.
+	 * The size may change; re-mirror.
 	 */
 	inode_lock(inode);
 	old_cred = override_creds(pfs->creator_cred);

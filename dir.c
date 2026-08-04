@@ -1,22 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * aufs-ng directory mutations.
+ * Directory mutations.  All of them happen in branch 0 with the
+ * mounter's capabilities but the caller's fsuid/fsgid, after copying
+ * up the parent chain.
  *
- * Every mutation is performed in branch 0 (the rw branch) with the
- * mounter's capabilities but the caller's fsuid/fsgid (so new objects
- * get the right owner), after copying up the parent chain.  Removing
- * a name still provided by a lower branch leaves a ".wh.<name>"
- * whiteout marker behind (a plain 0444 regular file - the real AUFS
- * on-disk format, verified against fs/aufs/whout.c), created BEFORE
- * the removal so a failure or crash between the two steps preserves
- * the delete rather than resurrecting the lower name.  Creating over
- * a whiteout parks the marker under a hidden temp name and restores
- * it if the create fails.  Creating - or renaming - a directory onto
- * a name that would otherwise still show a same-named lower
- * directory's content marks the directory opaque via ".wh..wh..opq".
- * Renaming a merged directory returns -EXDEV, making mv fall back to
- * copy+delete - AUFS itself has no cross-branch atomic directory
- * rename either.
+ * Removing a name a lower still provides leaves a ".wh.<name>" marker,
+ * created BEFORE the removal so a crash between the two preserves the
+ * delete.  Creating over a whiteout parks the marker and restores it
+ * if the create fails.  A directory created or renamed onto a name a
+ * lower directory also provides is marked opaque.  Renaming a merged
+ * directory returns -EXDEV, so mv falls back to copy+delete - AUFS has
+ * no cross-branch directory rename either.
  */
 
 #include <linux/fs.h>
@@ -27,9 +21,8 @@
 #include "aufsng.h"
 
 /*
- * Credentials for creating objects: the mounter's capabilities with
- * the caller's fsuid/fsgid, so ownership lands on the caller.
- * Returns the cred to revert to; *newp must be put after reverting.
+ * Creation credentials: the mounter's capabilities with the caller's
+ * fsuid/fsgid.  Returns the cred to revert to; *newp is put after.
  */
 static const struct cred *aufsng_override_create_creds(struct aufsng_fs *pfs,
 						    struct cred **newp)
@@ -112,11 +105,7 @@ static int aufsng_remove_whiteout(struct aufsng_fs *pfs,
 
 	slot = start_removing_noperm(upperdir, &wh);
 	if (IS_ERR(slot)) {
-		/*
-		 * start_removing_noperm() returns -ENOENT (not a negative
-		 * dentry) when the name does not exist: no whiteout to remove
-		 * is the common, expected case, not an error.
-		 */
+		/* -ENOENT here means no whiteout to remove: the common case */
 		return PTR_ERR(slot) == -ENOENT ? 0 : PTR_ERR(slot);
 	}
 	err = vfs_unlink(idmap, d_inode(upperdir), slot, NULL);
@@ -125,10 +114,9 @@ static int aufsng_remove_whiteout(struct aufsng_fs *pfs,
 }
 
 /*
- * Get a locked negative dentry for creating @name in @upperdir; a
- * positive occupant means EEXIST.  A stale whiteout for @name is the
- * caller's business: it is parked via aufsng_park_whiteout() first so
- * that it can be restored if the create then fails.
+ * A locked negative dentry for creating @name in @upperdir; a positive
+ * occupant means EEXIST.  A stale whiteout is the caller's business:
+ * it parks it first, so a failed create can restore it.
  */
 struct dentry *aufsng_create_slot(struct dentry *upperdir,
 			       const struct qstr *name)
@@ -145,11 +133,9 @@ struct dentry *aufsng_create_slot(struct dentry *upperdir,
 }
 
 /*
- * Remove one upper entry by name, sweeping a directory's own
- * bookkeeping markers first: a leftover directory may already carry
- * them - a failed mkdir-over-lower dies AFTER its ".wh..wh..opq"
- * marker was created - and vfs_rmdir() on a physically non-empty dir
- * is ENOTEMPTY.  Error policy (log level, message) stays with the
+ * Remove one upper entry by name, sweeping a directory's own markers
+ * first: a leftover dir may carry them, and vfs_rmdir() on a
+ * physically non-empty dir is ENOTEMPTY.  Error policy stays with the
  * callers.
  */
 static int aufsng_do_remove_object(struct aufsng_fs *pfs,
@@ -176,16 +162,11 @@ static int aufsng_do_remove_object(struct aufsng_fs *pfs,
 }
 
 /*
- * Best-effort removal of an upper object that a failed or superseded
- * multi-step operation left behind (a partially created object, a
- * copy-up temp, a parked whiteout).  Left in place it would leak:
- * hidden behind a restored whiteout it makes every retry fail with
- * EEXIST, and visible it shadows lower content with a half-built
- * object.  A removal failure means the branch fs is in serious
- * trouble: it is logged here and the leftover stays, and the errno is
- * returned for the callers that must escalate rather than report the
- * original failure as if nothing had been left behind (see
- * aufsng_copy_up_inplace()); the best-effort callers ignore it.
+ * Best-effort removal of what a failed multi-step operation left
+ * behind.  Left in place it leaks: hidden behind a restored whiteout
+ * it fails every retry with EEXIST, visible it shadows lower content.
+ * A failure is logged and returned, for the callers that must escalate
+ * rather than report the original error; the rest ignore it.
  */
 int aufsng_remove_object(struct aufsng_fs *pfs, struct dentry *upperdir,
 		       const struct qstr *name, bool is_dir)
@@ -199,12 +180,9 @@ int aufsng_remove_object(struct aufsng_fs *pfs, struct dentry *upperdir,
 }
 
 /*
- * Rename one entry inside the rw branch: @src (under @src_parent) to
- * @dst (under @dst_parent).  The single home of the renamedata +
- * start_renaming()/vfs_rename()/end_renaming() convention, shared by
- * whiteout parking and the rename-undo paths.  Metadata-only, needs no
- * space, so it works on the full branch that typically made an undo
- * caller want it.
+ * Rename one entry inside the rw branch - the single home of the
+ * renamedata convention, shared by whiteout parking and rename undo.
+ * Metadata-only, so it still works on a full branch.
  */
 static int aufsng_branch_rename(struct aufsng_fs *pfs,
 			     struct dentry *src_parent,
@@ -231,10 +209,9 @@ static int aufsng_branch_rename(struct aufsng_fs *pfs,
 static atomic_t aufsng_whtmp_seq = ATOMIC_INIT(0);
 
 /*
- * Mint a fresh hidden ".wh..wh.tmp.<seq>" name into @buf (NAME_MAX + 1
- * bytes).  The single definition of the parked-entry temp-name format,
- * inside AUFS's own ".wh..wh." bookkeeping namespace so readdir and
- * lookup never show it and clear_whiteouts sweeps a leftover.
+ * Mint a hidden ".wh..wh.tmp.<seq>" name into @buf (NAME_MAX + 1) -
+ * one definition of the parked-entry format, inside the ".wh..wh."
+ * namespace so lookup and readdir never show it.
  */
 static void aufsng_whtmp_name(char *buf, struct qstr *tmp)
 {
@@ -243,19 +220,15 @@ static void aufsng_whtmp_name(char *buf, struct qstr *tmp)
 }
 
 /*
- * Move an existing ".wh.<name>" whiteout aside to a hidden temp name
- * (".wh..wh.tmp.<seq>", inside AUFS's own ".wh..wh." bookkeeping
- * namespace, so it is invisible to lookup and readdir) instead of
- * deleting it up front: if the operation that is about to take over
- * the name then fails - ENOSPC being the everyday case - the whiteout
- * is renamed back, so a failed create/rename can never cancel an
- * earlier, successful delete.  Deleting it outright would need a new
- * inode to restore it, exactly what a full branch cannot provide;
- * renaming back allocates nothing.  Real AUFS parks whiteouts the
- * same way (au_whtmp).
+ * Move a ".wh.<name>" whiteout aside to a hidden temp name instead of
+ * deleting it: if the operation taking over the name then fails, it is
+ * renamed back, so a failed create can never cancel an earlier
+ * successful delete.  Restoring a deleted one would need a new inode -
+ * exactly what a full branch cannot give; renaming back allocates
+ * nothing.  AUFS parks whiteouts the same way.
  *
- * Returns 1 with @tmp/@tmpbuf (NAME_MAX + 1 bytes) filled if parked,
- * 0 if there was no whiteout, negative errno.
+ * 1 with @tmp/@tmpbuf (NAME_MAX + 1) filled if parked, 0 if there was
+ * no whiteout, negative errno.
  */
 static int aufsng_park_whiteout(struct aufsng_fs *pfs, struct dentry *upperdir,
 			     const struct qstr *name, struct qstr *tmp,
@@ -298,11 +271,7 @@ static void aufsng_unpark_whiteout(struct aufsng_fs *pfs,
 	err = aufsng_wh_name(whbuf, name, &wh);
 	if (!err)
 		err = aufsng_branch_rename(pfs, upperdir, tmp, upperdir, &wh);
-	/*
-	 * A metadata-only operation on an entry this call just parked;
-	 * failure means the branch fs is in serious trouble.  The
-	 * parked name stays hidden either way.
-	 */
+	/* Metadata-only, on an entry just parked; the temp stays hidden */
 	if (err)
 		pr_err("aufs (aufs-ng): failed to restore parked whiteout '%.*s' (%d)\n",
 		       tmp->len, tmp->name, err);
@@ -350,15 +319,11 @@ static int aufsng_create_object(struct dentry *dentry,
 
 	/*
 	 * Would a lower resurface under this name?  Only a new DIRECTORY
-	 * cares - it must hide it with an opaque marker.  Nothing created
-	 * here is ever a copy-up, so nothing takes a lower into its stack
-	 * or sets AUFSNG_XATTR_ORIGIN: a new object is keyed by itself.
-	 * (->create only ever runs on a negative dentry, so a lower
-	 * providing this name means the upper whites it out - the
-	 * delete-then-recreate case, which used to hand the new file the
-	 * deleted one's identity.)  dyn_lock stays held from the verdict
-	 * through the mutation that consumes it, so a concurrent branch
-	 * add/remove cannot invalidate it in between.
+	 * cares, to hide it with an opaque marker.  Nothing created here
+	 * is a copy-up, so nothing takes a lower into its stack: a new
+	 * object is keyed by itself, or a delete-then-recreate would hand
+	 * it the deleted file's identity.  dyn_lock is held from the
+	 * verdict through the mutation that consumes it.
 	 */
 	percpu_down_read(&pfs->dyn_lock);
 	if (is_dir) {
@@ -441,10 +406,8 @@ static int aufsng_create_object(struct dentry *dentry,
 
 out_remove:
 	/*
-	 * The object was created but the operation failed after it:
-	 * without this removal it stays behind - hidden by the restored
-	 * whiteout it turns every retry into EEXIST, and unhidden it is
-	 * a directory missing its opaque marker.
+	 * Created, then the operation failed: left behind it turns every
+	 * retry into EEXIST, or is a directory missing its marker.
 	 */
 	aufsng_remove_object(pfs, pupper, &dentry->d_name, is_dir);
 out_unpark:
@@ -495,12 +458,9 @@ int aufsng_symlink(struct mnt_idmap *idmap, struct inode *dir,
 }
 
 /*
- * Hardlink @old to @new.  Real AUFS supports link(2) via its pseudo-
- * link mechanism when the two names would otherwise land in different
- * branches; that mechanism is explicitly out of scope here (see
- * project notes), so aufs-ng only ever links within the rw branch,
- * after copying @old up if needed - a plain vfs_link, same as linking
- * two names already in the same real directory tree.
+ * Hardlink @old to @new.  AUFS uses pseudo-links when the names would
+ * land in different branches; that is out of scope here, so aufs-ng
+ * links within the rw branch only, after copying @old up.
  */
 int aufsng_link(struct dentry *old, struct inode *dir, struct dentry *new)
 {
@@ -607,11 +567,9 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	old_cred = override_creds(pfs->creator_cred);
 
 	/*
-	 * dyn_lock is held from the coverage verdict through the
-	 * mutation it decides: a branch spliced in between the two
-	 * could provide the name being deleted, and skipping the
-	 * whiteout against the old stack would resurrect it the moment
-	 * the delete returns.
+	 * dyn_lock spans the verdict and the mutation it decides: a
+	 * branch spliced in between could provide the name, and the
+	 * skipped whiteout would resurrect it.
 	 */
 	percpu_down_read(&pfs->dyn_lock);
 	covered = aufsng_lower_covers(dir, &dentry->d_name);
@@ -621,28 +579,21 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	}
 
 	/*
-	 * Serialize against a concurrent copy-up of this same inode
-	 * (aufsng_copy_up_one() also takes oi->lock around its own
-	 * oi->upperdentry read/write): without it, an in-flight copy-up
-	 * that hasn't set oi->upperdentry yet is invisible here, so this
-	 * removal skips the real unlink and only writes a whiteout,
-	 * while the copy-up goes on to give the name fresh upper content
-	 * right after - both a whiteout and a real entry for the same
-	 * name end up in the branch at once.
+	 * Serialize against a copy-up of this inode: one that has not set
+	 * oi->upperdentry yet is invisible here, so the removal would
+	 * write only a whiteout while the copy-up gives the name fresh
+	 * upper content - both in the branch at once.
 	 */
 	mutex_lock(&oi->lock);
 	pupper = aufsng_upperdentry(dir);
 	upper = oi->upperdentry;
 
 	/*
-	 * Whiteout FIRST, removal second - AUFS's own ordering.  If the
-	 * whiteout cannot be created (ENOSPC), the object is untouched
-	 * and the delete fails cleanly; the reverse order would destroy
-	 * the upper copy and then fail, silently replacing the file
-	 * with its stale lower version.  In the transient window where
-	 * both the whiteout and the real entry exist, the whiteout wins
-	 * in both lookup and readdir, so a crash between the two steps
-	 * preserves the delete.
+	 * Whiteout FIRST, removal second - AUFS's ordering.  If the
+	 * whiteout fails the object is untouched and the delete fails
+	 * cleanly; the reverse would destroy the upper copy and then
+	 * fail, leaving the stale lower version.  While both exist the
+	 * whiteout wins, so a crash between them preserves the delete.
 	 */
 	if (covered) {
 		err = aufsng_create_whiteout(pfs, pupper, &dentry->d_name);
@@ -656,21 +607,13 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 		int werr;
 
 		/*
-		 * Rename the victim aside to a hidden whtmp name FIRST -
-		 * the union-level delete commits at this rename, before a
-		 * single marker inside is touched.  Sweeping the markers
-		 * in place and rmdir-ing under the real name (the old
-		 * order) is not restartable: a sweep that fails halfway
-		 * (immutable marker, EIO) has already destroyed some
-		 * ".wh.<child>" entries, so the surviving, still-visible
-		 * directory RESURRECTS every lower name they were hiding -
-		 * and losing ".wh..wh..opq" republishes an opaque dir's
-		 * whole lower subtree.  Parked under ".wh..wh." the dir is
-		 * invisible to lookup and readdir whatever happens next;
-		 * this is AUFS's own renwh_and_rmdir/whtmp ordering.  The
-		 * rename is metadata-only (no new inode, works on a full
-		 * branch); it fails with ENOENT when the upper entry
-		 * vanished out-of-band, exactly as the removal always has.
+		 * Rename the victim aside FIRST: the delete commits at this
+		 * rename, before a marker inside is touched.  Sweeping in
+		 * place is not restartable - a sweep failing halfway has
+		 * already destroyed ".wh.<child>" entries, so the surviving
+		 * directory resurrects every name they hid.  Parked, it is
+		 * invisible whatever happens next; AUFS's own ordering.
+		 * The rename is metadata-only and works on a full branch.
 		 */
 		aufsng_whtmp_name(tmpbuf, &tmp);
 		err = aufsng_branch_rename(pfs, pupper, &dentry->d_name,
@@ -678,12 +621,9 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 		if (!err) {
 			real_removed = true;
 			/*
-			 * Best-effort teardown of the parked dir, exactly
-			 * as AUFS ignores its whtmp rmdir failures: the
-			 * delete is already committed, a leftover is
-			 * invisible and only costs branch space (a later
-			 * clear_whiteouts sweep of the parent removes an
-			 * EMPTY leftover; a non-empty one needs the admin).
+			 * Best effort, as AUFS ignores its whtmp rmdir
+			 * failures: the delete is committed and a leftover
+			 * is invisible, costing only branch space.
 			 */
 			werr = aufsng_do_remove_object(pfs, pupper, &tmp, true);
 			if (werr)
@@ -697,12 +637,9 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 			real_removed = true;
 		else if (err == -ENOENT)
 			/*
-			 * No upper entry under THIS name: the inode's
-			 * upperdentry is a copied-up lower hardlink sibling
-			 * (lower links share one union inode, whose single
-			 * upperdentry carries whichever name was copied up
-			 * first).  The name itself is lower-only, so the
-			 * whiteout created above is the whole removal.
+			 * No upper under THIS name: the upperdentry belongs
+			 * to a copied-up hardlink sibling.  This name is
+			 * lower-only, so the whiteout is the whole removal.
 			 */
 			err = 0;
 	}
@@ -712,12 +649,7 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 			int wherr = aufsng_remove_whiteout(pfs, pupper,
 						&dentry->d_name);
 
-			/*
-			 * Unrecoverable: the whiteout now masks a
-			 * name whose removal just failed, so still-
-			 * live content is hidden until the marker is
-			 * removed from the branch by hand.
-			 */
+			/* Unrecoverable: live content stays hidden by the marker */
 			if (wherr)
 				pr_err("aufs (aufs-ng): failed to roll back whiteout '%.*s' (%d), the name stays hidden\n",
 				       dentry->d_name.len,
@@ -727,15 +659,10 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	}
 
 	/*
-	 * The union inode mirrors the real inode's attributes, so its
-	 * link count only moves when a real link was actually removed.
-	 * A whiteout-only removal (lower-only name, or a copied-up
-	 * hardlink sibling's other name) changed no real inode: an
-	 * unconditional drop would push a live shared union inode
-	 * (lower hardlink siblings share one) to nlink 0 while the other
-	 * name is still linked - and wrap to UINT_MAX with a WARN when
-	 * that name is removed later.  Directories cannot be hardlinked,
-	 * so a really-removed dir is simply dead.
+	 * The link count only moves when a real link went away.  A
+	 * whiteout-only removal changed no real inode: dropping anyway
+	 * would take a shared union inode to nlink 0 while another name
+	 * is still linked, then wrap to UINT_MAX when that one goes.
 	 */
 	if (is_dir) {
 		if (real_removed || !upper)
@@ -744,20 +671,14 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 		drop_nlink(inode);
 	} else if (!upper) {
 		/*
-		 * A lower-only name.  No real link went away, but if that
-		 * lower had only this one, the single way this union inode
-		 * could be reached just did, so it is as dead as a
-		 * really-removed one.  (The other whiteout-only case - a
-		 * copied-up hardlink sibling's other name, the -ENOENT arm
-		 * above - keeps an upper and is excluded here; its inode is
-		 * still reachable through the name that was copied up.)
+		 * A lower-only name: no real link went away, but if the
+		 * lower had only this one, the only way to reach this union
+		 * inode just did, so it is as dead as a real removal.
 		 *
-		 * Ask the lower itself, not the union inode's mirror of it:
-		 * the mirror is only refreshed when something notices the
-		 * attributes drift, so under udba=reval a link made directly
-		 * in the branch after this inode was cached would leave it
-		 * reading 1 while a sibling name resolves to it - and
-		 * retiring it would strip the sibling of its inode.
+		 * Ask the lower, not the union inode's mirror: the mirror
+		 * only refreshes when drift is noticed, so a link made
+		 * directly in the branch would leave it reading 1 while a
+		 * sibling name still resolves to it.
 		 */
 		struct inode *real = aufsng_inode_real(inode);
 
@@ -766,22 +687,17 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	}
 
 	/*
-	 * The last name is gone: take the union inode out of the inode hash.
+	 * The last name is gone: take the inode out of the hash.
 	 *
-	 * The hash key is the copy-up origin - the topmost lower providing
-	 * the name - and aufsng_create_object() re-derives that origin by
-	 * name, so without this a re-create of the same name hands the NEW
-	 * file the dead inode of the one just deleted, along with everything
-	 * the VFS still holds against it.  Most visibly a running executable:
-	 * exec takes deny_write_access() on the union inode, so the first
-	 * write-open of the replacement fails with ETXTBSY and leaves behind
-	 * the empty file ->create() had already made - which is what
-	 * unpacking a package over its own running binaries produced.  A real
-	 * filesystem gives the re-created name a new inode; so must this one.
+	 * The key is the copy-up origin, re-derived by name on create, so
+	 * without this a re-create of the same name gets the dead inode -
+	 * and everything the VFS still holds against it.  Most visibly a
+	 * running executable: deny_write_access() makes the first write
+	 * to the replacement fail with ETXTBSY.  A real filesystem gives
+	 * a re-created name a new inode.
 	 *
-	 * Eviction is not enough on its own: it unhashes only once the last
-	 * reference is dropped, and the deleted object still being open (or
-	 * still executing) is precisely the case that needs this.
+	 * Eviction alone is not enough: it unhashes only on the last
+	 * reference, and a deleted-but-open object is exactly the case.
 	 */
 	if (!inode->i_nlink)
 		remove_inode_hash(inode);
@@ -809,13 +725,11 @@ int aufsng_rmdir(struct inode *dir, struct dentry *dentry)
 }
 
 /*
- * Compensate a committed upper rename whose follow-up marker failed:
- * drop the whiteout just created for the old name (@drop_whiteout),
- * then rename the entry back - both metadata-only, so they work on the
- * full branch that typically brought the caller here.  Returns 0 only
- * when the rename was fully undone; otherwise it stands and the caller
- * reports success with a warning (the VFS would never retry the marker
- * on its own).
+ * Compensate a committed rename whose follow-up marker failed: drop
+ * the new whiteout, then rename back - both metadata-only, so they
+ * work on the full branch that brought the caller here.  0 only if
+ * fully undone; otherwise the rename stands and is reported as
+ * success with a warning.
  */
 static int aufsng_rename_undo(struct aufsng_fs *pfs, struct inode *olddir,
 			   struct dentry *old, struct dentry *newupperdir,
@@ -844,16 +758,12 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	struct aufsng_entry *oe = AUFSNG_I_E(d_inode(old));
 	struct dentry *newupperdir;
 	/*
-	 * Rollback safety hinges on whether the underlying upper rename
-	 * destroyed something, not on union visibility: a victim that
-	 * exists only in a lower branch has no upper entry, so the
-	 * rename created the upper name and undoing it is loss-free.
-	 * Decided from the branch rename's own target lookup, under the
-	 * branch parent locks, right before vfs_rename() - not sampled
-	 * at entry: the union inode's upperdentry is a per-inode proxy
-	 * that lies for lower hardlink siblings (the shared inode holds
-	 * the OTHER name's upper), and a copy-up racing the long window
-	 * before the locks could create or reuse an upper meanwhile.
+	 * Rollback safety hinges on whether the upper rename destroyed
+	 * something, not on union visibility: a lower-only victim has no
+	 * upper entry, so undoing is loss-free.  Decided from the branch
+	 * rename's own target lookup under the parent locks, not sampled
+	 * at entry: the upperdentry is a per-inode proxy that lies for
+	 * hardlink siblings, and a copy-up could race the window.
 	 */
 	bool had_victim = false;
 	bool replace_dir = d_is_positive(new) && d_is_dir(new);
@@ -867,10 +777,8 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 		return -EINVAL;
 
 	/*
-	 * Renaming a directory still merged with lower branches would
-	 * detach it from its lower content; AUFS has no cross-branch
-	 * redirect mechanism either, so tell mv to fall back to
-	 * copy+delete.
+	 * Renaming a still-merged directory would detach it from its
+	 * lower content; AUFS has no redirect either, so mv falls back.
 	 */
 	if (d_is_dir(old) && oe && oe->numlower)
 		return -EXDEV;
@@ -898,22 +806,16 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	old_cred = override_creds(pfs->creator_cred);
 
 	/*
-	 * dyn_lock is held from both coverage verdicts (does the old
-	 * name need a whiteout? would lower content show through the
-	 * new name?) through the rename and markers they decide, so a
-	 * concurrent branch add/remove cannot make either stale.
+	 * dyn_lock spans both coverage verdicts and the rename and
+	 * markers they decide, so no branch change can make them stale.
 	 */
 	percpu_down_read(&pfs->dyn_lock);
 
 	/*
-	 * Re-derive the merged-directory -EXDEV verdicts now that
-	 * dyn_lock is held: the entry checks above ran before the
-	 * copy-ups, and a runtime branch add in that window can splice
-	 * a lower into either directory's stack
-	 * (aufsng_dyn_splice_cached mutates exactly oe->numlower under
-	 * dyn_lock for writing, taking no i_rwsem this rename holds).
-	 * Renaming such a directory would detach it from freshly merged
-	 * lower content and then mark it opaque - hiding the just-added
+	 * Re-derive the -EXDEV verdicts under dyn_lock: the entry checks
+	 * ran before the copy-ups, and a branch add in that window can
+	 * splice a lower into either stack.  Renaming such a directory
+	 * would detach it and then mark it opaque, hiding the new
 	 * branch's subtree for good.
 	 */
 	err = -EXDEV;
@@ -944,18 +846,12 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	newupperdir = aufsng_upperdentry(newdir);
 
 	/*
-	 * A stale ".wh.<newname>" from an earlier delete of a name a
-	 * lower branch also provides would otherwise keep hiding the
-	 * name after this rename gives it fresh upper content.  It is
-	 * parked, not deleted: if the rename then fails, it is renamed
-	 * back, so the earlier delete survives.  A union-empty target
-	 * directory being replaced still physically contains its own
-	 * whiteouts/opaque marker; vfs_rename() would fail with
-	 * -ENOTEMPTY on the real upper directory otherwise.  (Those
-	 * marker deletions cannot be parked without AUFS's whole-dir
-	 * whtmp machinery; the residual window is a rename that fails
-	 * AFTER clear_whiteouts succeeded, resurrecting lower names
-	 * inside the surviving, union-empty target dir.)
+	 * A stale ".wh.<newname>" would keep hiding the name after this
+	 * rename gives it fresh content.  Parked, not deleted, so a
+	 * failed rename can restore the earlier delete.  A union-empty
+	 * target dir still physically holds its own markers, or
+	 * vfs_rename() fails -ENOTEMPTY.  (Those cannot be parked; the
+	 * residual window is a rename failing after they were cleared.)
 	 */
 	parked = aufsng_park_whiteout(pfs, newupperdir, &new->d_name,
 				   &whtmp, whtmpbuf);
@@ -997,16 +893,11 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 		int wherr = aufsng_create_whiteout(pfs, aufsng_upperdentry(olddir),
 						&old->d_name);
 		/*
-		 * Without the whiteout, lower content the old name was
-		 * shadowing resurfaces beside the renamed file.  Undo the
-		 * rename - metadata-only, needs no space even on the ENOSPC
-		 * that typically lands here - and fail cleanly.  Only
-		 * possible when the rename replaced nothing: a replaced
-		 * victim is already destroyed, so undoing would lose the
-		 * new name too; then (or if the undo itself fails) the
-		 * rename stands, is reported as success (the VFS would
-		 * never retry the whiteout on its own), and the resurfacing
-		 * is warned about.
+		 * Without the whiteout, what the old name shadowed
+		 * resurfaces beside the renamed file.  Undo and fail
+		 * cleanly - but only if the rename replaced nothing: a
+		 * destroyed victim would be lost too.  Otherwise the rename
+		 * stands, is reported as success, and is warned about.
 		 */
 		if (wherr && !had_victim &&
 		    !aufsng_rename_undo(pfs, olddir, old, newupperdir, new,
@@ -1020,16 +911,12 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	}
 
 	/*
-	 * A directory moved onto a name that lower branches still
-	 * provide must be marked opaque, exactly as mkdir over that
-	 * name would be (AUFS's rename DIROPQ): without the marker the
-	 * deleted lower directory's content would merge into - and
-	 * "resurrect" inside - the renamed directory.  A marker failure
-	 * is unwound like a whiteout failure above, one step deeper:
-	 * remove the whiteout just created for the old name, then undo
-	 * the rename (AUFS's rename reverts here too).  If any undo
-	 * step fails, the rename stands and is reported as success with
-	 * a warning.
+	 * A directory moved onto a name lowers still provide is marked
+	 * opaque, as mkdir over it would be, or the lower directory's
+	 * content merges into the renamed one.  A marker failure unwinds
+	 * like the whiteout above, one step deeper: drop the new
+	 * whiteout, then undo the rename.  If an undo step fails the
+	 * rename stands, reported as success with a warning.
 	 */
 	if (covered_new) {
 		int opqerr = aufsng_mark_diropq(pfs,
