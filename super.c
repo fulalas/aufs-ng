@@ -307,18 +307,37 @@ struct aufsng_layer *aufsng_layer_reserve(struct aufsng_fs *pfs,
 
 static void aufsng_free_fs(struct aufsng_fs *pfs)
 {
-	unsigned int i;
+	struct vfsmount **mnts;
+	unsigned int i, nr = 0;
 
+	/*
+	 * Collect the branch mounts and tear them all down behind ONE
+	 * grace period: kern_unmount() is mnt_make_shortterm() +
+	 * synchronize_rcu() + mntput(), so unmounting them one at a time
+	 * costs a full grace period PER BRANCH - seconds of shutdown on a
+	 * live system with hundreds of modules loaded.  Same batching
+	 * aufsng_dyn_release_branch() already uses for a single branch.
+	 * The vector is a convenience, not a requirement: without it the
+	 * one-at-a-time path still works, and umount cannot fail.
+	 */
+	mnts = kvmalloc_array(pfs->numlayer_cap, sizeof(*mnts), GFP_KERNEL);
 	for (i = 0; i < pfs->numlayer_cap; i++) {
 		struct aufsng_layer *layer = pfs->layers[i];
 
 		if (!layer)
 			continue;
-		if (layer->mnt)
-			kern_unmount(layer->mnt);
+		if (layer->mnt) {
+			if (mnts)
+				mnts[nr++] = layer->mnt;
+			else
+				kern_unmount(layer->mnt);
+		}
 		kfree(layer->path);
 		kfree(layer);
 	}
+	if (nr)
+		kern_unmount_array(mnts, nr);
+	kvfree(mnts);
 	kvfree(pfs->layers);
 	/* safe on a never-initialized (kzalloc'd) lock, by design */
 	percpu_free_rwsem(&pfs->dyn_lock);
