@@ -77,6 +77,9 @@ the only insert position `aufs-ng` implements: any other index is
 rejected at mount time rather than silently merged in the wrong order.
 Branches must not overlap — a branch that is the same directory as, or
 nested inside, another branch is rejected, as original `aufs` does.
+There is no preset number of branches: room for more is made as they are
+added, so a system that loads hundreds of modules keeps going, up to the
+32767 branches original `aufs` allows at most.
 
 Each branch gets a mode: `rw` (writable — only the first branch can be)
 or `ro` (read-only). For compatibility, `aufs-ng` also accepts `aufs`'s

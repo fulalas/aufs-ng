@@ -215,22 +215,23 @@ static int aufsng_show_options(struct seq_file *m, struct dentry *dentry)
 	 * (lock_mount) - taking dyn_lock here would close that cycle
 	 * into a deadlock.  RCU is sufficient: a superseded root stack
 	 * is freed only after a grace period, and branch removal
-	 * releases the config strings after that same grace period
+	 * releases the branch's path string after that same grace period
 	 * (aufsng_dyn_release_branch ordering in aufsng_dyn_del_branch),
-	 * so whichever stack this snapshot sees, its slots are intact.
+	 * so whichever stack this snapshot sees, its branches are intact.
+	 * The stack reaches each branch by pointer, so the slot table -
+	 * which a concurrent add may be reallocating - is not touched.
 	 */
 	rcu_read_lock();
 	seq_puts(m, ",br:");
-	seq_escape(m, pfs->config.br_paths[0], " \t\n\\");
-	seq_printf(m, "=%s", pfs->config.br_perms[0]);
+	seq_escape(m, pfs->upper->path, " \t\n\\");
+	seq_printf(m, "=%s", pfs->upper->perm);
 	oe = AUFSNG_E(dentry);
 	for (i = 0; oe && i < oe->numlower; i++) {
-		unsigned int idx = aufsng_layer_idx(pfs,
-						    oe->lowerstack[i].layer);
+		const struct aufsng_layer *layer = oe->lowerstack[i].layer;
 
 		seq_putc(m, ':');
-		seq_escape(m, pfs->config.br_paths[idx], " \t\n\\");
-		seq_printf(m, "=%s", pfs->config.br_perms[idx]);
+		seq_escape(m, layer->path, " \t\n\\");
+		seq_printf(m, "=%s", layer->perm);
 	}
 	rcu_read_unlock();
 	if (pfs->config.xino_path)
@@ -249,19 +250,76 @@ static int aufsng_show_options(struct seq_file *m, struct dentry *dentry)
 	return 0;
 }
 
+/*
+ * Make branch slot @idx exist and hand back the branch it holds,
+ * growing the slot table if the mount has run out of them.  Both the
+ * table and the branches survive until umount: the table because
+ * nothing may find it half-copied, the branches because cached
+ * aufsng_entry stacks point straight at them.  So a slot vacated by a
+ * branch removal keeps its (mnt == NULL) branch object for the next
+ * add to reuse, and a spare left behind by a FAILED add is picked up by
+ * the following one instead of leaking.
+ *
+ * Callers hold sb->s_umount exclusively (mount or remount), which is
+ * what serialises the table against the only other paths that read it.
+ */
+struct aufsng_layer *aufsng_layer_reserve(struct aufsng_fs *pfs,
+					  unsigned int idx)
+{
+	struct aufsng_layer **layers, *layer;
+	unsigned int cap;
+
+	/*
+	 * Not a preallocation limit - the table grew to here on demand -
+	 * but the point past which a slot number would no longer fit the
+	 * i_ino folding; see AUFSNG_MAXBRANCH.
+	 */
+	if (idx >= AUFSNG_MAXBRANCH) {
+		pr_err("aufs: too many branches, limit is %d\n",
+		       AUFSNG_MAXBRANCH);
+		return ERR_PTR(-ENOSPC);
+	}
+
+	if (idx >= pfs->numlayer_cap) {
+		cap = min_t(unsigned int, max(2 * pfs->numlayer_cap, idx + 1),
+			    AUFSNG_MAXBRANCH);
+		/* kvcalloc: a 32767-branch table is past kmalloc's comfort */
+		layers = kvcalloc(cap, sizeof(*layers), GFP_KERNEL);
+		if (!layers)
+			return ERR_PTR(-ENOMEM);
+		if (pfs->layers)
+			memcpy(layers, pfs->layers,
+			       pfs->numlayer_cap * sizeof(*layers));
+		kvfree(pfs->layers);
+		pfs->layers = layers;
+		pfs->numlayer_cap = cap;
+	}
+
+	if (!pfs->layers[idx]) {
+		layer = kzalloc(sizeof(*layer), GFP_KERNEL);
+		if (!layer)
+			return ERR_PTR(-ENOMEM);
+		layer->idx = idx;
+		pfs->layers[idx] = layer;
+	}
+	return pfs->layers[idx];
+}
+
 static void aufsng_free_fs(struct aufsng_fs *pfs)
 {
 	unsigned int i;
 
-	for (i = 0; i < pfs->numlayer; i++) {
-		if (pfs->layers[i].mnt)
-			kern_unmount(pfs->layers[i].mnt);
-		if (pfs->config.br_paths)
-			kfree(pfs->config.br_paths[i]);
+	for (i = 0; i < pfs->numlayer_cap; i++) {
+		struct aufsng_layer *layer = pfs->layers[i];
+
+		if (!layer)
+			continue;
+		if (layer->mnt)
+			kern_unmount(layer->mnt);
+		kfree(layer->path);
+		kfree(layer);
 	}
-	kfree(pfs->layers);
-	kfree(pfs->config.br_paths);
-	kfree(pfs->config.br_perms);
+	kvfree(pfs->layers);
 	/* safe on a never-initialized (kzalloc'd) lock, by design */
 	percpu_free_rwsem(&pfs->dyn_lock);
 	if (pfs->creator_cred)
@@ -329,7 +387,7 @@ int aufsng_check_overlap(struct aufsng_fs *pfs, struct dentry *dentry,
 	unsigned int i;
 
 	for (i = 0; i < pfs->numlayer; i++) {
-		struct vfsmount *mnt = pfs->layers[i].mnt;
+		struct vfsmount *mnt = pfs->layers[i]->mnt;
 
 		if (mnt && (is_subdir(dentry, mnt->mnt_root) ||
 			    is_subdir(mnt->mnt_root, dentry))) {
@@ -444,20 +502,6 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 	ctx->config.xino_path = NULL;
 	pfs->config.udba = ctx->config.udba;
 
-	pfs->numlayer_cap = max_t(size_t, ctx->nr, AUFSNG_MAXBRANCH_DEF) + 1;
-	pfs->layers = kcalloc(pfs->numlayer_cap, sizeof(*pfs->layers),
-			      GFP_KERNEL);
-	if (!pfs->layers)
-		goto out_free;
-	pfs->config.br_paths = kcalloc(pfs->numlayer_cap, sizeof(char *),
-				       GFP_KERNEL);
-	if (!pfs->config.br_paths)
-		goto out_free;
-	pfs->config.br_perms = kcalloc(pfs->numlayer_cap, AUFSNG_PERM_LEN,
-				       GFP_KERNEL);
-	if (!pfs->config.br_perms)
-		goto out_free;
-
 	pfs->creator_cred = prepare_creds();
 	if (!pfs->creator_cred)
 		goto out_free;
@@ -475,6 +519,8 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 
 	for (i = 0; i < ctx->nr; i++) {
+		struct aufsng_layer *layer;
+
 		err = aufsng_check_layer(sb, &ctx->br[i].path, ctx->br[i].name);
 		if (err)
 			goto out_free;
@@ -486,6 +532,12 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		err = aufsng_get_namelen(pfs, &ctx->br[i].path);
 		if (err)
 			goto out_free;
+
+		layer = aufsng_layer_reserve(pfs, i);
+		if (IS_ERR(layer)) {
+			err = PTR_ERR(layer);
+			goto out_free;
+		}
 
 		mnt = clone_private_mount(&ctx->br[i].path);
 		err = PTR_ERR(mnt);
@@ -503,8 +555,8 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		if (i > 0 || ctx->br[i].perm != AUFSNG_BR_RW)
 			mnt->mnt_flags |= MNT_READONLY | MNT_NOATIME;
 
-		pfs->layers[i].mnt = mnt;
-		pfs->config.br_paths[i] = ctx->br[i].name;
+		layer->mnt = mnt;
+		layer->path = ctx->br[i].name;
 		ctx->br[i].name = NULL;
 		/*
 		 * Echo back the mode the branch actually HAS, not the one that
@@ -516,14 +568,15 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		 */
 		if (i > 0 && ctx->br[i].perm == AUFSNG_BR_RW) {
 			pr_warn("aufs (aufs-ng): branch '%s' declared rw but only the first branch is writable; using ro\n",
-				pfs->config.br_paths[i]);
-			strscpy(pfs->config.br_perms[i], "ro", AUFSNG_PERM_LEN);
+				layer->path);
+			strscpy(layer->perm, "ro", AUFSNG_PERM_LEN);
 		} else {
-			strscpy(pfs->config.br_perms[i], ctx->br[i].permstr,
+			strscpy(layer->perm, ctx->br[i].permstr,
 				AUFSNG_PERM_LEN);
 		}
 		pfs->numlayer++;
 	}
+	pfs->upper = pfs->layers[0];
 
 	sb->s_magic = AUFSNG_SUPER_MAGIC;
 	sb->s_op = &aufsng_super_operations;
@@ -537,10 +590,11 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (!oe)
 		goto out_free;
 	for (i = 1; i < pfs->numlayer; i++) {
-		oe->lowerstack[i - 1].layer = &pfs->layers[i];
-		oe->lowerstack[i - 1].dentry =
-			dget(pfs->layers[i].mnt->mnt_root);
-		oe->lowerstack[i - 1].mnt = pfs->layers[i].mnt;
+		struct aufsng_layer *layer = pfs->layers[i];
+
+		oe->lowerstack[i - 1].layer = layer;
+		oe->lowerstack[i - 1].dentry = dget(layer->mnt->mnt_root);
+		oe->lowerstack[i - 1].mnt = layer->mnt;
 	}
 
 	root_inode = new_inode(sb);

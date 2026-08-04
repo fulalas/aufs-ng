@@ -579,8 +579,7 @@ static struct aufsng_dir_cache *aufsng_cache_build(struct inode *inode,
 		realpath.mnt = oe->lowerstack[i].mnt;
 		realpath.dentry = oe->lowerstack[i].dentry;
 		err = aufsng_dir_read_layer(pfs, &realpath, cache,
-					 aufsng_layer_idx(pfs,
-							  oe->lowerstack[i].layer));
+					 aufsng_layer_idx(oe->lowerstack[i].layer));
 	}
 
 out:

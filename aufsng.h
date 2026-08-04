@@ -34,7 +34,15 @@
 #define AUFSNG_ROOT_INO		2		/* AUFS_ROOT_INO */
 
 #define AUFSNG_MAX_STACK		500
-#define AUFSNG_MAXBRANCH_DEF	128
+/*
+ * Ceiling on the total branch count, the same one real AUFS's largest
+ * build-time setting allows (AUFS_BRANCH_MAX_32767).  It is not a
+ * preallocation size - the slot table grows on demand - only the point
+ * past which a branch slot would no longer fit the inode-number folding
+ * in aufsng_map_ino(): a slot is shifted to bit 40 and up, and must
+ * stay clear of AUFSNG_ROOT_INO_EVADE at bit 62.
+ */
+#define AUFSNG_MAXBRANCH	32767
 
 /* AUFS on-disk whiteout format (verified against aufs-standalone) */
 #define AUFSNG_WH_PFX		".wh."
@@ -77,8 +85,35 @@ enum aufsng_br_perm {
 	AUFSNG_BR_RO,	/* "ro"/"rr": read-only, never written to */
 };
 
+/*
+ * Sized to AUFS's own maximum mode-token length (AuBrPermStrSz covers
+ * "rw+coo_reg+fhsm+unpin+icexsec+icexsys+icexusr+icexoth+nolwh"):
+ * aufsng_parse_perm() accepts any '+'-suffix chain a real aufs command
+ * may carry, so the stored token - echoed back verbatim through
+ * /proc/mounts - must never be silently truncated into a malformed one.
+ */
+#define AUFSNG_PERM_LEN	64
+
+/*
+ * One branch.  Allocated individually and never moved or freed before
+ * umount, because aufsng_entry stacks reference it by pointer: the slot
+ * TABLE (aufsng_fs.layers) grows as branches are added, the branches
+ * themselves stay put.  @path and @perm live here rather than in
+ * slot-indexed side arrays so a reader that already holds a layer
+ * pointer needs no table lookup at all (aufsng_show_options()).
+ */
 struct aufsng_layer {
 	struct vfsmount *mnt;	/* private clone; NULL marks a free slot */
+	unsigned int idx;	/* stable slot number, see aufsng_layer_idx() */
+	/*
+	 * The branch path as given and the mode as it actually applies,
+	 * only consumed by show_options: the private clone mounts have no
+	 * namespace path to resolve at print time, and the mode is echoed
+	 * back exactly as given ("rr" stays "rr"), so both are kept
+	 * verbatim.  @path is NULL on a free slot.
+	 */
+	char *path;
+	char perm[AUFSNG_PERM_LEN];
 };
 
 struct aufsng_path {
@@ -107,25 +142,7 @@ struct aufsng_entry {
 	struct aufsng_path lowerstack[];
 };
 
-/*
- * Sized to AUFS's own maximum mode-token length (AuBrPermStrSz covers
- * "rw+coo_reg+fhsm+unpin+icexsec+icexsys+icexusr+icexoth+nolwh"):
- * aufsng_parse_perm() accepts any '+'-suffix chain a real aufs command
- * may carry, so the stored token - echoed back verbatim through
- * /proc/mounts - must never be silently truncated into a malformed one.
- */
-#define AUFSNG_PERM_LEN	64
-
 struct aufsng_config {
-	/*
-	 * Slot-indexed branch path strings and mode tokens, only
-	 * consumed by show_options: the private clone mounts have no
-	 * namespace path to resolve at print time, and the mode is
-	 * echoed back exactly as given ("rr" stays "rr"), so both are
-	 * kept verbatim.
-	 */
-	char **br_paths;
-	char (*br_perms)[AUFSNG_PERM_LEN];
 	char *xino_path;	/* accepted, not functionally used */
 	unsigned int udba;	/* AUFSNG_UDBA_*; see aufsng_udba_reval() */
 };
@@ -134,8 +151,22 @@ enum aufsng_udba { AUFSNG_UDBA_NONE, AUFSNG_UDBA_REVAL, AUFSNG_UDBA_NOTIFY };
 
 struct aufsng_fs {
 	unsigned int numlayer;		/* used slots incl. [0] = branch 0 */
-	unsigned int numlayer_cap;	/* fixed capacity, allocated up front */
-	struct aufsng_layer *layers;	/* [0] rw branch, [1..] ro branches */
+	unsigned int numlayer_cap;	/* slots the table can hold; grows */
+	/*
+	 * Branch slot table: [0] the rw branch, [1..] the ro branches.  A
+	 * table of POINTERS, so adding the 129th branch can grow it (real
+	 * live systems load hundreds of modules, each one a branch) without
+	 * moving any struct aufsng_layer - those are referenced by pointer
+	 * from every cached aufsng_entry and must never be relocated.
+	 *
+	 * Only ever read and written by the mount, umount and branch
+	 * add/remove paths, all of which hold sb->s_umount exclusively, so
+	 * the table itself needs no RCU: nothing on a lookup, readdir or
+	 * stat path touches it (branch 0 is reached through @upper, and a
+	 * slot number through layer->idx).
+	 */
+	struct aufsng_layer **layers;
+	struct aufsng_layer *upper;	/* == layers[0], the only rw branch */
 	const struct cred *creator_cred;
 	/*
 	 * Bumped once per runtime branch add/remove (AUFS's "sigen"):
@@ -245,19 +276,17 @@ static inline bool aufsng_reval_stamps_match(struct dentry *dentry,
 
 static inline struct vfsmount *aufsng_upper_mnt(struct aufsng_fs *pfs)
 {
-	return pfs->layers[0].mnt;
+	return pfs->upper->mnt;
 }
 
 /*
- * A layer's stable slot number: layers[] is allocated once at mount
- * with a fixed capacity and never moved or reallocated (dynlayer.c
- * relies on the addresses staying stable), so the index is derivable
- * rather than stored.
+ * A layer's stable slot number.  Stored, not derived from its address
+ * in the slot table: the table is reallocated when it grows, and a
+ * reader here may hold nothing but the layer pointer.
  */
-static inline unsigned int aufsng_layer_idx(const struct aufsng_fs *pfs,
-					    const struct aufsng_layer *layer)
+static inline unsigned int aufsng_layer_idx(const struct aufsng_layer *layer)
 {
-	return layer - pfs->layers;
+	return layer->idx;
 }
 
 /*
@@ -281,14 +310,13 @@ static inline bool aufsng_dentry_alive(const struct dentry *dentry)
  * derive the key here - hardlink-aliasing correctness depends on them
  * never disagreeing.
  */
-static inline struct inode *aufsng_hash_key(const struct aufsng_fs *pfs,
-					    const struct aufsng_entry *oe,
+static inline struct inode *aufsng_hash_key(const struct aufsng_entry *oe,
 					    struct dentry *upper,
 					    unsigned int *key_idx)
 {
 	if (oe->numlower) {
 		if (key_idx)
-			*key_idx = aufsng_layer_idx(pfs, oe->lowerstack[0].layer);
+			*key_idx = aufsng_layer_idx(oe->lowerstack[0].layer);
 		return d_inode(oe->lowerstack[0].dentry);
 	}
 	if (key_idx)
@@ -535,6 +563,8 @@ int aufsng_check_layer(struct super_block *sb, const struct path *path,
 		    const char *name);
 int aufsng_check_overlap(struct aufsng_fs *pfs, struct dentry *dentry,
 		      const char *name);
+struct aufsng_layer *aufsng_layer_reserve(struct aufsng_fs *pfs,
+					  unsigned int idx);
 int aufsng_grow_array(void **arr, size_t *cap, size_t need, size_t elemsize,
 		   gfp_t gfp);
 int aufsng_probe_namelen(const struct path *path, long *namelen);
