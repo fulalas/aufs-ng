@@ -629,7 +629,10 @@ for e in os.scandir(sys.argv[1]):
 		&& ok "a freed slot is reused by a later add" \
 		|| bad "a freed slot is reused by a later add"
 	$M aufs aufs $U "del=/mnt/many/b1" 32
-	rm -rf /mnt/many
+	# Only once nothing is attached any more: deleting the directory
+	# tree of a branch the union still holds would bury the real
+	# failure under unrelated noise in the kernel log.
+	grep -q ":/mnt/many/b" /proc/mounts || rm -rf /mnt/many
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.
