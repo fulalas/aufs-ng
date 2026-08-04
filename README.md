@@ -10,7 +10,7 @@ and speaks `aufs`'s own mount option grammar and on-disk whiteout format, so
 that any script issuing original `aufs` `mount`/`remount` commands should
 work (see [usage](#usage) below).
 
-It also carries over one of `aufs`'s defining abilities: branches can be
+It also carries over one of `aufs`'s defining abilities: layers can be
 added to or removed from the union while it's mounted, with no unmount
 or reboot required. This is what lets distros like PorteuX load and unload
 modules on an already-running system.
@@ -40,7 +40,7 @@ benchmarks.
 - **Reads and writes** — `aufs` takes a filesystem-wide lock on every
   call; `aufs-ng` hands opened files to the kernel's backing-file API
   and runs at near-native speed.
-- **Lookups and stat** — `aufs` probes each branch for the name and
+- **Lookups and stat** — `aufs` probes each layer for the name and
   its whiteout, takes several locks along the way, and writes an
   inode-table entry on a file's first lookup; `aufs-ng` does the same
   probing (that part costs the same) with lighter locking and no
@@ -58,119 +58,66 @@ benchmarks.
 
 ## Usage
 
-A union stacks one writable directory on top of any number of read-only
-ones and presents them as a single filesystem: everything you create,
-modify or delete lands in the writable branch; the read-only branches
-below provide the rest of the content. Branches are listed
-highest-priority first — when the same name exists in several branches,
-the one listed first wins. The option syntax is original `aufs`'s:
+A union shows several folders as if they were one. The first is writable
+and takes everything you create, change or delete; the rest are read-only
+and only provide content. When the same name exists in more than one, the
+first one listed wins. The mount options call such a folder a branch.
 
 ```
 mount -t aufs -o br:/memory/changes=rw,udba=reval aufs /union
-mount -no remount,add=1:/path/to/module=rr aufs /    # add a module to the live union
-mount -t aufs -o remount,del=/path/to/module aufs /  # remove the layer
+mount -o remount,add=1:/path/to/layer=ro aufs /union   # add a layer
+mount -o remount,del=/path/to/layer aufs /union        # remove it
 ```
 
-`add=1:` inserts the new branch right below the writable one, so the
-newest layer wins over older ones — the `aufs` convention. It is also
-the only insert position `aufs-ng` implements: any other index is
-rejected at mount time rather than silently merged in the wrong order.
-Branches must not overlap — a branch that is the same directory as, or
-nested inside, another branch is rejected, as original `aufs` does.
-There is no preset number of branches: room for more is made as they are
-added, so a system that loads hundreds of modules keeps going, up to the
-32767 branches original `aufs` allows at most.
+A layer can be added or removed while the union is mounted, which is what
+lets a live distro load and unload modules on a running system. A new one
+goes on top of the read-only layers, so it wins over the older ones. There
+is no preset limit on how many (up to 32767).
 
-Each branch gets a mode: `rw` (writable — only the first branch can be)
-or `ro` (read-only). For compatibility, `aufs-ng` also accepts `aufs`'s
-other read-only spelling `rr` (meant for natively read-only filesystems
-like squashfs) and mode suffixes such as `+wh` or `+nolwh` — the
-suffixes are ignored; as in `aufs`, only the base token (`rw` vs
-`ro`/`rr`) decides. A later branch declared `rw` is accepted but demoted
-to read-only, with a warning in the kernel log.
+Each layer is `rw` (writable, first layer only) or `ro`/`rr` (read-only).
+A later layer asking for `rw` is accepted but stays read-only, with a note
+in the kernel log. Layers may not overlap: one cannot be inside another.
 
-- `udba=` — `reval` (the default) shows changes made directly inside a
-  branch; `none` skips that detection (faster and safe if branches are
-  never modified directly); `notify` (and its `fsnotify` spelling) is
-  accepted but behaves as `reval`. Any other value is rejected, as
-  original `aufs` rejects it — a typo must not silently disable
-  revalidation.
-- `xino=`, `noxino` — where original `aufs` writes its inode-number table,
-  and the switch that turns it off; `aufs-ng` keeps inode numbers stable
-  without a table (see [on-disk format](#on-disk-format)), so both are
-  ignored.
-- `dirperm1` — makes original `aufs` check only the topmost branch's
-  permissions for a directory; `aufs-ng` always behaves that way, so the
-  option changes nothing.
-- `nowarn_perm` — silences original `aufs`'s warnings about branches with
-  differing owner/permissions; `aufs-ng` never prints those warnings.
+- `udba=` — whether to notice changes made directly inside a layer, behind
+  the union's back. `reval` (the default) notices them; `none` trusts the
+  cache and is a bit faster.
+- `xino=`, `noxino`, `dirperm1`, `nowarn_perm` — taken for compatibility;
+  they change nothing here.
 
-On remount, unknown options are silently ignored; at mount time,
-options outside the list above — including `aufs` options `aufs-ng`
-doesn't implement, such as `dirs=` — are rejected.
+Unknown options are rejected when mounting and ignored when remounting.
 
-`/proc/mounts` shows the mount id (`si=`) and the options, not the
-branch list — same as original `aufs`, which only prints the list when
-its `/sys/fs/aufs` tree is switched off. The line has to stay short:
-with hundreds of branches a full list runs past 4 KB, and tools that
-read `/proc/self/mountinfo` line by line into a fixed buffer then fail.
-`aufs-ng` has no `/sys/fs/aufs` tree either, so the branch list is not
-exposed to userspace.
+`/proc/mounts` shows the mount id and the options, not the list of layers —
+same as `aufs`.
 
-Unlike original `aufs`, removing a branch doesn't fail with `EBUSY`
-just because a file it provides is open (only a memory-mapped one still
-does): an open file keeps working from the removed branch until closed
-— the usual open-files rule — while fresh lookups resolve to a
-surviving branch, if any. Same for an object already deleted through the
-union while still held open — a directory (a process's cwd) as much as a
-file: it keeps the removed branch until the last user lets go.
+Removing a layer works even while a file it provides is open, unless that
+file is memory-mapped: the open file keeps working until it is closed, and
+new lookups find another layer. The same goes for something deleted through
+the union but still held open, a folder in use as a working directory
+included.
 
 ## On-disk format
 
-The format is identical to original `aufs`: a deleted name still
-provided by a lower branch is masked by a sibling regular file
-`.wh.<name>` (mode `0444`, not a character device); a directory that
-fully shadows lower content carries a `.wh..wh..opq` marker. Verified
-byte-for-byte against original `aufs`, so external tools that read or
-edit a branch directly work unchanged.
+Identical to `aufs`, byte for byte, so tools that read or write a layer
+directly keep working. A deleted name that a lower layer still provides is
+covered by a file called `.wh.<name>`; a folder that hides everything below
+it carries `.wh..wh..opq`. Files named `.wh..wh.*` can show up inside a
+layer while an operation runs; they never appear in the union, and leftovers
+after a crash are harmless.
 
-The markers themselves are the same; what can differ is the order in
-which they are written when an operation needs more than one step:
+One step order differs: a rename writes its marker after the rename instead
+of before, so a crash cannot hide the file halfway. Deletes keep `aufs`'s
+order, so a deleted file can never quietly come back.
 
-- Deleting a file that also exists in a read-only branch below behaves
-  exactly as in `aufs`: no matter what goes wrong — a crash or a full
-  disk — a deleted file can never quietly come back.
+`aufs-ng` writes one thing `aufs` does not. A file copied into the writable
+layer gets a `trusted.aufs_ng.origin` xattr naming the file it came from,
+which is what keeps its inode number the same afterwards — the job `aufs`
+uses its `xino` tables for. It is hidden from the union. Only a real copy
+gets it, so a file that merely ends up with the same name as one below is a
+different file with its own inode number, as on any normal filesystem.
 
-- Renaming such a file is where `aufs-ng` differs: it renames first and
-  writes the marker second — the reverse of `aufs` — so a crash can't
-  hide the file mid-rename. If the marker fails, the rename rolls back
-  cleanly (rare edge cases keep it instead, with a warning).
-
-- Deleting a directory renames it to a hidden temp name first and
-  cleans it up after — `aufs`'s own ordering — so no failure can bring
-  deleted names back; at worst an invisible leftover stays in the
-  writable branch.
-
-Helper files named `.wh..wh.*` may briefly appear inside a branch
-during an operation, same as in `aufs`. They are never visible in the
-union, and any leftovers after a crash are harmless and get removed
-together with their directory (a non-empty leftover directory needs
-removing by hand, as in `aufs`).
-
-`aufs-ng` writes one thing `aufs` does not. A file copied into the
-writable branch gets a `trusted.aufs_ng.origin` xattr naming the file it
-was copied from. That is what keeps its inode number the same afterwards
-— the job `aufs` uses its `xino` tables for. It is hidden from the union
-and changes nothing about the whiteout format above.
-
-Only a real copy gets it. A file that merely ends up with the same name
-as one in a lower branch — created after that name was deleted, moved
-onto it, or hard-linked to a copy — is a different file and gets its own
-inode number, as on any normal filesystem.
-
-A writable branch that cannot store xattrs still works. Files copied up
-there just get a new inode number once the kernel drops them from its
-cache, and the log says so once. (`OverlayFS` refuses to mount at all.)
+A writable layer that cannot store xattrs still works. Copied files just get
+a new inode number once the kernel drops them from its cache, and the log
+says so once. (`OverlayFS` refuses to mount at all.)
 
 ## Trade-offs
 
@@ -188,7 +135,7 @@ Also, some `aufs` features are intentionally out of scope:
 - **RDU** (readdir speed-up helper) — no userspace listing accelerator;
   only a directory with tens of thousands of entries spread across many
   layers would notice.
-- **Multiple writable branches** — only one writable location is used at
+- **Multiple writable layers** — only one writable location is used at
   a time; all your changes go there, you can't spread them across
   several disks.
 - **NFS export** — the union filesystem isn't meant to be shared out to
@@ -224,8 +171,8 @@ make -C /path/to/kernel/build M=$PWD CONFIG_AUFSNG_FS=m W=1 modules
 
 ## Status
 
-Boot, runtime branch add/remove, and copy-up have been verified
-end-to-end on a real live system (PorteuX), including branch changes
+Boot, runtime layer add/remove, and copy-up have been verified
+end-to-end on a real live system (PorteuX), including layer changes
 on an already-running union.
 
 ## License
