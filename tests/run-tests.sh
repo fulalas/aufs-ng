@@ -14,7 +14,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=107; PASS=0; FAIL=0
+	N=0; TOTAL=128; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -645,6 +645,116 @@ for e in os.scandir(sys.argv[1]):
 	# tree would bury the real failure in unrelated noise.
 	$M aufs aufs $U "del=/mnt/many/b1" 32 && [ $i -eq 0 ] && rm -rf /mnt/many
 
+	echo "=== 33. set-id files: every path that must drop the bits ==="
+	# chown, truncate, write and fallocate all drop set-id bits.  The
+	# VFS rewrites the first two into a mode change handed down with a
+	# "kill" flag - passing that pair on to the branch hits a BUG()
+	# that kills the caller with SIGSEGV and leaves the inode locked;
+	# write reaches the same kill without the lock it demands; fallocate
+	# ran it as the mounter, whose CAP_FSETID keeps the bits.  Its own
+	# union mount: a leaked lock must not wedge the other tests.
+	mkdir -p /mnt/sw /mnt/sl /mnt/su
+	$M tmpfs tmpfs /mnt/sw
+	$M tmpfs tmpfs /mnt/sl
+	echo lower-suid > /mnt/sl/lsuid                   # chown copy-up driver
+	chmod 4755 /mnt/sl/lsuid
+	echo lower-suid2 > /mnt/sl/lsuid2                 # benign copy-up driver
+	chmod 4755 /mnt/sl/lsuid2
+	$M aufs aufs /mnt/su "br:/mnt/sw=rw:/mnt/sl=ro"
+
+	# set a set-id mode and prove it stuck: without this every "drops
+	# the bit" check below could pass vacuously
+	setid() { chmod "$2" "$1" && [ "$(stat -c %a "$1")" = "$2" ] \
+		|| bad "precondition: mode $2 on $1"; }
+	# chown to 65534 must drop the set-id bit and set the new owner
+	chown_kills() { # FILE MODE-AFTER DESC
+		chown 65534:65534 "$1" \
+			&& ok "chown of $3 succeeds" \
+			|| bad "chown of $3 succeeds"
+		[ "$(stat -c %a "$1")" = "$2" ] \
+			&& ok "chown drops the set-id bit of $3" \
+			|| bad "chown drops the set-id bit of $3 (mode $(stat -c %a "$1"))"
+		[ "$(stat -c %u "$1")" = 65534 ] \
+			&& ok "chown of $3 sets the new owner" \
+			|| bad "chown of $3 sets the new owner"
+	}
+
+	# root append-open: copies up without killing anything (CAP_FSETID),
+	# isolating what copy-up itself does to the bits - otherwise
+	# "dropped across copy-up" below could mean "copy-up lost the mode"
+	exec 4>>/mnt/su/lsuid2; exec 4>&-
+	[ "$(stat -c %a /mnt/sw/lsuid2 2>/dev/null)" = 4755 ] \
+		&& ok "copy-up preserves the set-uid bit" \
+		|| bad "copy-up preserves the set-uid bit (mode $(stat -c %a /mnt/sw/lsuid2 2>/dev/null))"
+
+	echo upper-suid > /mnt/su/usuid                   # set-uid, on the upper
+	setid /mnt/su/usuid 4755
+	chown_kills /mnt/su/usuid 755 "a set-uid upper file"
+
+	[ "$(stat -c %a /mnt/su/lsuid)" = 4755 ] || bad "precondition: lsuid mode"
+	chown_kills /mnt/su/lsuid 755 "a lower-only set-uid file"
+	check "the copied-up file keeps its data" grep -q lower-suid /mnt/su/lsuid
+
+	echo upper-sgid > /mnt/su/usgid                   # set-gid, group-executable
+	setid /mnt/su/usgid 2775
+	chown_kills /mnt/su/usgid 775 "a set-gid file"
+
+	# Unprivileged on purpose from here on: the kernel only drops the
+	# set-id bits on truncate, write and fallocate for a caller without
+	# CAP_FSETID.  The chown above made 65534 the owner, so it may write.
+	setid /mnt/su/usuid 4755
+	chroot --userspec=65534:65534 / "$(command -v truncate)" \
+			-s 1 /mnt/su/usuid \
+		&& ok "truncate of a set-uid file succeeds" \
+		|| bad "truncate of a set-uid file succeeds"
+	[ "$(stat -c %s /mnt/su/usuid)" = 1 ] \
+		&& ok "truncate changed the size" \
+		|| bad "truncate changed the size (size $(stat -c %s /mnt/su/usuid))"
+	[ "$(stat -c %a /mnt/su/usuid)" = 755 ] \
+		&& ok "truncate drops the set-uid bit" \
+		|| bad "truncate drops the set-uid bit (mode $(stat -c %a /mnt/su/usuid))"
+
+	# write(2): the kill runs through the union inode's setattr and
+	# needs its lock held - unfixed, this WARNs (= panics this guest)
+	setid /mnt/su/usuid 4755
+	chroot --userspec=65534:65534 / /bin/sh -c \
+			"echo x >> /mnt/su/usuid" \
+		&& ok "append to a set-uid file succeeds" \
+		|| bad "append to a set-uid file succeeds"
+	[ "$(stat -c %a /mnt/su/usuid)" = 755 ] \
+		&& ok "write drops the set-uid bit" \
+		|| bad "write drops the set-uid bit (mode $(stat -c %a /mnt/su/usuid))"
+
+	# fallocate: the kill must run with the CALLER's creds, before the
+	# switch to the mounter's
+	setid /mnt/su/usuid 4755
+	chroot --userspec=65534:65534 / "$(command -v fallocate)" \
+			-l 8192 /mnt/su/usuid \
+		&& ok "fallocate on a set-uid file succeeds" \
+		|| bad "fallocate on a set-uid file succeeds"
+	[ "$(stat -c %a /mnt/su/usuid)" = 755 ] \
+		&& ok "fallocate drops the set-uid bit" \
+		|| bad "fallocate drops the set-uid bit (mode $(stat -c %a /mnt/su/usuid))"
+
+	# truncating a running binary: exec straight from the branch holds
+	# the write block on the UPPER inode only, and the truncate path
+	# used to check just the union's
+	cp "$(command -v sleep)" /mnt/sw/tbin && chmod 755 /mnt/sw/tbin
+	/mnt/sw/tbin 60 &
+	tpid=$!
+	sleep 1
+	check "the victim binary runs from the rw branch" test -e /proc/$tpid/exe
+	# truncate(2) by path: truncate(1) would open for write, and the
+	# OPEN path already honors the upper's write block
+	trunc2() { python3 -c "import os; os.truncate('$1', 4)"; }
+	checkfail "truncate through the union honors the running binary" \
+		trunc2 /mnt/su/tbin
+	kill $tpid 2>/dev/null; wait $tpid 2>/dev/null
+	trunc2 /mnt/su/tbin \
+		&& ok "truncate succeeds once the binary exited" \
+		|| bad "truncate succeeds once the binary exited"
+	$M -u /mnt/su
+
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.
 	if [ "$N" != "$TOTAL" ]; then
@@ -859,11 +969,11 @@ host_main() {
 	# the identity checks fail for a reason that is not aufs-ng's.
 	"$KDIR/scripts/config" --file "$KDIR/.config" \
 		--enable TMPFS_XATTR || exit
-	for t in python3 getfattr setfattr; do
+	for t in python3 getfattr setfattr truncate fallocate; do
 		command -v "$t" >/dev/null && continue
 		echo "run-tests: the guest runs on this host's root (hostfs) and" >&2
-		echo "run-tests: needs $t for the inode-identity checks." >&2
-		echo "run-tests: install python3 and the attr package." >&2
+		echo "run-tests: needs $t for some checks." >&2
+		echo "run-tests: install python3, attr and util-linux." >&2
 		exit 1
 	done
 	make -C "$KDIR" ARCH=um olddefconfig >/dev/null || exit
