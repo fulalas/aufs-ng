@@ -103,13 +103,24 @@ static ssize_t aufsng_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 static ssize_t aufsng_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
 	struct file *file = iocb->ki_filp;
+	struct inode *inode = file_inode(file);
+	ssize_t ret;
 
 	if (!iov_iter_count(iter))
 		return 0;
 
-	return backing_file_write_iter(file->private_data, iter, iocb,
-				       iocb->ki_flags,
-				       aufsng_backing_ctx(file_inode(file)->i_sb));
+	/*
+	 * Locked for the set-id kill: backing_file_write_iter drops the
+	 * bits through THIS inode's setattr, and notify_change demands
+	 * its i_rwsem (as ovl_write_iter).
+	 */
+	inode_lock(inode);
+	ret = backing_file_write_iter(file->private_data, iter, iocb,
+				      iocb->ki_flags,
+				      aufsng_backing_ctx(inode->i_sb));
+	inode_unlock(inode);
+
+	return ret;
 }
 
 static ssize_t aufsng_splice_read(struct file *in, loff_t *ppos,
@@ -132,15 +143,19 @@ static ssize_t aufsng_splice_read(struct file *in, loff_t *ppos,
 static ssize_t aufsng_splice_write(struct pipe_inode_info *pipe, struct file *out,
 				loff_t *ppos, size_t len, unsigned int flags)
 {
+	struct inode *inode = file_inode(out);
 	struct kiocb iocb;
 	ssize_t ret;
 
+	/* locked for the same set-id kill as aufsng_write_iter */
+	inode_lock(inode);
 	init_sync_kiocb(&iocb, out);
 	iocb.ki_pos = *ppos;
 	ret = backing_file_splice_write(pipe, out->private_data, &iocb, len,
 					flags,
-					aufsng_backing_ctx(file_inode(out)->i_sb));
+					aufsng_backing_ctx(inode->i_sb));
 	*ppos = iocb.ki_pos;
+	inode_unlock(inode);
 
 	return ret;
 }
@@ -217,6 +232,16 @@ static long aufsng_fallocate(struct file *file, int mode, loff_t offset,
 	 * The size may change; re-mirror.
 	 */
 	inode_lock(inode);
+	/*
+	 * The set-id kill, under the CALLER's creds - the mounter's, which
+	 * everything below runs as, have CAP_FSETID and would keep the bits
+	 * (as ovl_fallocate).
+	 */
+	ret = file_remove_privs(file);
+	if (ret) {
+		inode_unlock(inode);
+		return ret;
+	}
 	old_cred = override_creds(pfs->creator_cred);
 	ret = vfs_fallocate(file->private_data, mode, offset, len);
 	revert_creds(old_cred);

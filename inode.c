@@ -62,6 +62,7 @@ static int aufsng_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	struct inode *inode = d_inode(dentry);
 	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
 	const struct cred *old_cred;
+	struct inode *winode = NULL;
 	struct dentry *upper;
 	int err;
 
@@ -75,11 +76,39 @@ static int aufsng_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	if (IS_ERR(upper))
 		return PTR_ERR(upper);
 
+	/*
+	 * Truncate must respect the write block a direct exec from the
+	 * branch holds on the UPPER inode; the caller's VFS only checked
+	 * the union's (as ovl_setattr).
+	 */
+	if (attr->ia_valid & ATTR_SIZE) {
+		winode = d_inode(upper);
+		err = get_write_access(winode);
+		if (err) {
+			dput(upper);
+			return err;
+		}
+	}
+
 	err = mnt_want_write(aufsng_upper_mnt(pfs));
 	if (err) {
+		if (winode)
+			put_write_access(winode);
 		dput(upper);
 		return err;
 	}
+
+	/*
+	 * notify_change() already turned ATTR_KILL_S*ID into an ATTR_MODE
+	 * for the union inode and handed both down, but it BUG()s on that
+	 * pair.  Drop the mode and let the upper's own notify_change derive
+	 * it from the upper mode, which is the one being changed.  One
+	 * corner diverges, and overlayfs shares it: the re-derivation runs
+	 * as the mounter, so a chgrp into a group the CALLER left never
+	 * clears S_ISGID on a non-group-executable file.
+	 */
+	if (attr->ia_valid & (ATTR_KILL_SUID | ATTR_KILL_SGID))
+		attr->ia_valid &= ~ATTR_MODE;
 
 	attr->ia_valid &= ~(ATTR_FILE | ATTR_OPEN);
 
@@ -93,6 +122,8 @@ static int aufsng_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		aufsng_copyattr_from(inode, d_inode(upper));
 
 	mnt_drop_write(aufsng_upper_mnt(pfs));
+	if (winode)
+		put_write_access(winode);
 	dput(upper);
 	return err;
 }
