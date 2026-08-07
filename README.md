@@ -148,10 +148,9 @@ Also, some `aufs` features are intentionally out of scope:
 Needs a **64-bit** kernel: inode numbers carry the layer a file came
 from in their high bits, which a 32-bit inode number cannot hold.
 
-Best built **into the kernel** (`CONFIG_AUFSNG_FS=y`) — a live-boot
+Best built **into the kernel** (`CONFIG_AUFSNG_FS=y`) as a live-boot
 sequence typically needs this filesystem type mounted before any
-loadable module can be reached at all. Building it as a module
-(`CONFIG_AUFSNG_FS=m`) works too, and is the easier way to test.
+loadable module can be reached at all.
 
 To integrate into a kernel source tree (any anchor line in `fs/Kconfig`/
 `fs/Makefile` works; the `OverlayFS` entry is just a convenient, stable one):
