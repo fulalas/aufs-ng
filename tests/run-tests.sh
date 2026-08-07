@@ -45,7 +45,9 @@ guest_main() {
 	check "merge: l1 wins dir/file"      grep -q l1-file $U/dir/file
 	check "merge: only1 visible"         test -f $U/only1
 	check "merge: only2 visible"         test -f $U/only2
-	ls $U | grep -q '^\.wh\.' && bad "no .wh. in readdir" || ok "no .wh. in readdir"
+	# -a on purpose: plain ls hides every dotted name, so without it
+	# this check cannot fail whatever readdir returns
+	ls -a $U | grep -q '^\.wh\.' && bad "no .wh. in readdir" || ok "no .wh. in readdir"
 
 	echo "=== 2. write / whiteout / resurrect ==="
 	echo upper > $U/newfile
@@ -508,7 +510,13 @@ guest_main() {
 	# earn it.  Guessing it from the name gave a re-created file the
 	# identity of the one it replaced - and with it the write block
 	# exec holds on a running binary.
-	drop_caches() { sync; echo 2 > /proc/sys/vm/drop_caches 2>/dev/null; }
+	# Loud on failure: silently skipping the drop would make every
+	# "survives a cache drop" check below pass without testing anything
+	drop_caches() {
+		sync
+		echo 2 > /proc/sys/vm/drop_caches 2>/dev/null ||
+			bad "precondition: cannot drop caches"
+	}
 	# d_ino as getdents reports it, WITHOUT stat'ing the name - the two
 	# must agree, and only a readdir-level read can tell whether they do
 	dino() { python3 -c 'import os,sys
@@ -876,7 +884,7 @@ aufsng_fetch_kernel() {
 }
 
 host_main() {
-	local self here repo JOBS TIMEOUT KDIR work log fails warnpat status d f lock
+	local self here repo JOBS TIMEOUT KDIR work log fails warnpat status base d f lock
 
 	self=$(readlink -f "$0")
 	here=$(dirname "$self")
@@ -886,12 +894,16 @@ host_main() {
 
 	KDIR=${KERNEL_SRC:-}
 	if [ -z "$KDIR" ]; then
-		# look in tests/ first, then the aufs-ng folder above it
-		for d in "$here"/linux-*/ "$repo"/linux-*/; do
-			if [ -f "${d}Makefile" ] && [ -d "${d}fs" ]; then
+		# look in tests/ first, then the aufs-ng folder above it;
+		# within each, newest by VERSION - a plain glob is lexical,
+		# so linux-7.9 would otherwise outrank linux-7.10
+		for base in "$here" "$repo"; do
+			while IFS= read -r d; do
+				[ -f "${d}Makefile" ] && [ -d "${d}fs" ] || continue
 				KDIR=${d%/}
 				break
-			fi
+			done < <(printf '%s\n' "$base"/linux-*/ | sort -Vr)
+			[ -n "$KDIR" ] && break
 		done
 	fi
 	if [ -z "$KDIR" ]; then
@@ -913,7 +925,9 @@ host_main() {
 		echo "run-tests: another instance is using $KDIR (if stale: rmdir '$lock')" >&2
 		exit 2
 	fi
-	work=$(mktemp -d)
+	# Checked: with an empty $work every path below resolves against /,
+	# and the script would write /mnt.c, /mnt and /run-tests.sh
+	work=$(mktemp -d) || { rmdir "$lock" 2>/dev/null; exit 2; }
 	trap 'rm -rf "$work"; rmdir "$lock" 2>/dev/null' EXIT
 
 	# 1. Wire aufs-ng into the tree (idempotent; the README's documented

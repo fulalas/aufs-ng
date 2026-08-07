@@ -156,9 +156,9 @@ static int aufsng_parse_br(struct fs_context *fc, char *value)
 	while ((tok = strsep(&value, ":")) != NULL) {
 		if (!*tok)
 			continue;
-		if (ctx->nr >= AUFSNG_MAX_STACK)
+		if (ctx->nr >= AUFSNG_MAXBRANCH)
 			return invalfc(fc, "too many branches, limit is %d",
-				       AUFSNG_MAX_STACK);
+				       AUFSNG_MAXBRANCH);
 		err = aufsng_grow_array((void **)&ctx->br, &ctx->cap,
 				     ctx->nr + 1, sizeof(*ctx->br),
 				     GFP_KERNEL_ACCOUNT);

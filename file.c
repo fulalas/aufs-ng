@@ -16,9 +16,11 @@
 static void aufsng_file_accessed(struct file *file)
 {
 	struct inode *inode = file_inode(file);
+	struct inode *real = aufsng_inode_real(inode);
 
-	inode_set_atime_to_ts(inode,
-			      inode_get_atime(aufsng_inode_real(inode)));
+	/* no real object left to read the time off (see aufsng_path_real) */
+	if (real)
+		inode_set_atime_to_ts(inode, inode_get_atime(real));
 }
 
 static void aufsng_file_end_write(struct kiocb *iocb, ssize_t ret)

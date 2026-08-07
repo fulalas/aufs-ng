@@ -340,11 +340,6 @@ int aufsng_check_overlap(struct aufsng_fs *pfs, struct dentry *dentry,
 }
 
 /*
- * A whiteout adds ".wh." to the name, so the advertised limit must
- * leave room for the prefix - and must be the SMALLEST across
- * branches, or a name no shallow branch can store gets accepted.
- */
-/*
  * Room for @need elements of @elemsize in *@arr, doubling from a floor
  * of 16.  One growth policy for every caller; they differ only in
  * allocation context, which @gfp carries.
@@ -368,6 +363,11 @@ int aufsng_grow_array(void **arr, size_t *cap, size_t need, size_t elemsize,
 	return 0;
 }
 
+/*
+ * A whiteout adds ".wh." to the name, so the advertised limit must
+ * leave room for the prefix - and must be the SMALLEST across
+ * branches, or a name no shallow branch can store gets accepted.
+ */
 int aufsng_probe_namelen(const struct path *path, long *namelen)
 {
 	struct kstatfs statfs;

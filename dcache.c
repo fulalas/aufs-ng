@@ -32,8 +32,10 @@ static unsigned long aufsng_dir_stamp(struct inode *dir)
 {
 	struct timespec64 mtime = inode_get_mtime(dir);
 
+	/* tv_nsec needs 30 bits; a smaller shift overlaps the two fields
+	 * and makes distinct (sec, nsec) pairs collide into one stamp */
 	return (unsigned long)(inode_query_iversion(dir) ^
-			       ((u64)mtime.tv_sec << 20) ^ mtime.tv_nsec);
+			       ((u64)mtime.tv_sec << 30) ^ mtime.tv_nsec);
 }
 
 /*

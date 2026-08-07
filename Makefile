@@ -9,9 +9,12 @@ aufs-ng-y := super.o params.o namei.o dcache.o file.o readdir.o inode.o copy_up.
 
 else
 
-# Out-of-tree convenience build: only produces a .ko if the target
-# kernel's own .config has CONFIG_AUFSNG_FS=m; produces nothing (by
-# design) if it's =y there, since it's already part of that vmlinux.
+# Out-of-tree convenience build.  The 'default' target below passes no
+# CONFIG_ value, so it follows the target kernel's own .config: a .ko
+# when CONFIG_AUFSNG_FS=m there, nothing when it's =y, since it's
+# already part of that vmlinux.  Setting CONFIG_AUFSNG_FS=m on the make
+# command line overrides the .config either way - that is what the
+# README's one-liner does, and it works against a =y tree too.
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 default:
