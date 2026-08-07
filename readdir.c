@@ -79,11 +79,10 @@ struct aufsng_dir_file {
 
 /*
  * Common head for aufsng_dir_drain() actors: the loop needs the
- * per-call count and the sticky error.  Must be the first member.
+ * sticky error.  Must be the first member.
  */
 struct aufsng_dir_drain {
 	struct dir_context ctx;
-	int count;
 	int err;
 };
 
@@ -297,15 +296,14 @@ static bool aufsng_fill_merge(struct dir_context *ctx, const char *name,
 		rdd->dd.err = err;
 		return false;
 	}
-	rdd->dd.count++;
 	return true;
 }
 
 /*
  * Open @realpath with creator credentials and feed every entry through
  * @dd's actor.  One iterate_dir() need not reach the end, so it runs
- * until a call adds nothing; the actor's sticky error counts only when
- * the call itself succeeded.
+ * until a call stops advancing ctx.pos; the actor's sticky error counts
+ * only when the call itself succeeded.
  */
 static int aufsng_dir_drain(struct aufsng_fs *pfs, const struct path *realpath,
 			 struct aufsng_dir_drain *dd)
@@ -318,13 +316,24 @@ static int aufsng_dir_drain(struct aufsng_fs *pfs, const struct path *realpath,
 	if (IS_ERR(realfile))
 		return PTR_ERR(realfile);
 
-	do {
-		dd->count = 0;
+	for (;;) {
+		loff_t pos = dd->ctx.pos;
+
 		dd->err = 0;
 		err = iterate_dir(realfile, &dd->ctx);
 		if (!err)
 			err = dd->err;
-	} while (!err && dd->count);
+		/*
+		 * Progress is ctx.pos moving, NOT entries the actor kept:
+		 * both actors drop whole classes of names ("."/".." and
+		 * ".wh..wh.*" for the merge, everything but ".wh." for the
+		 * sweep), so a batch they filter entirely is still progress.
+		 * Counting kept entries ended the drain there, leaving a
+		 * truncated listing or unswept markers reported as success.
+		 */
+		if (err || dd->ctx.pos == pos)
+			break;
+	}
 
 	fput(realfile);
 	return err;
@@ -743,7 +752,6 @@ static bool aufsng_wh_sweep_actor(struct dir_context *ctx, const char *name,
 	p->name[namelen] = '\0';
 	p->len = namelen;
 	list_add_tail(&p->node, &sw->names);
-	sw->dd.count++;
 	return true;
 }
 

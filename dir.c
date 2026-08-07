@@ -305,7 +305,14 @@ static int aufsng_create_object(struct dentry *dentry,
 	err = aufsng_copy_up(parent);
 	if (err)
 		return err;
+	/*
+	 * Nothing pins the parent's upper between the copy-up and this
+	 * sample: under udba=reval a lookup can shed it.  -ESTALE, as
+	 * aufsng_copy_up_one() does; the caller retries.
+	 */
 	pupper = aufsng_upperdentry(dir);
+	if (!pupper)
+		return -ESTALE;
 
 	err = mnt_want_write(aufsng_upper_mnt(pfs));
 	if (err)
@@ -588,6 +595,12 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	pupper = aufsng_upperdentry(dir);
 	upper = oi->upperdentry;
 
+	/* shed between the copy-up and here: retry against the new state */
+	if (!pupper) {
+		err = -ESTALE;
+		goto out;
+	}
+
 	/*
 	 * Whiteout FIRST, removal second - AUFS's ordering.  If the
 	 * whiteout fails the object is untouched and the delete fails
@@ -731,19 +744,17 @@ int aufsng_rmdir(struct inode *dir, struct dentry *dentry)
  * fully undone; otherwise the rename stands and is reported as
  * success with a warning.
  */
-static int aufsng_rename_undo(struct aufsng_fs *pfs, struct inode *olddir,
+static int aufsng_rename_undo(struct aufsng_fs *pfs, struct dentry *oldupperdir,
 			   struct dentry *old, struct dentry *newupperdir,
 			   struct dentry *new, bool drop_whiteout)
 {
 	int err = 0;
 
 	if (drop_whiteout)
-		err = aufsng_remove_whiteout(pfs, aufsng_upperdentry(olddir),
-					  &old->d_name);
+		err = aufsng_remove_whiteout(pfs, oldupperdir, &old->d_name);
 	if (!err)
 		err = aufsng_branch_rename(pfs, newupperdir, &new->d_name,
-					aufsng_upperdentry(olddir),
-					&old->d_name);
+					oldupperdir, &old->d_name);
 	return err;
 }
 
@@ -756,7 +767,7 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	const struct cred *old_cred;
 	struct renamedata rd = {};
 	struct aufsng_entry *oe = AUFSNG_I_E(d_inode(old));
-	struct dentry *newupperdir;
+	struct dentry *newupperdir, *oldupperdir, *oldupper;
 	/*
 	 * Rollback safety hinges on whether the upper rename destroyed
 	 * something, not on union visibility: a lower-only victim has no
@@ -843,7 +854,18 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	}
 	err = 0;
 
+	/*
+	 * Sampled once, and checked: the copy-ups above do not pin these,
+	 * so a shed-upper in the window would hand a NULL parent to
+	 * start_renaming() and to every marker step below.
+	 */
 	newupperdir = aufsng_upperdentry(newdir);
+	oldupperdir = aufsng_upperdentry(olddir);
+	oldupper = aufsng_upperdentry(d_inode(old));
+	if (!newupperdir || !oldupperdir || !oldupper) {
+		err = -ESTALE;
+		goto out;
+	}
 
 	/*
 	 * A stale ".wh.<newname>" would keep hiding the name after this
@@ -870,7 +892,7 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	}
 
 	rd.mnt_idmap = upper_idmap;
-	rd.old_parent = aufsng_upperdentry(olddir);
+	rd.old_parent = oldupperdir;
 	rd.new_parent = newupperdir;
 	rd.flags = flags;
 	{
@@ -890,7 +912,7 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 		goto out_unpark;
 
 	if (covered) {
-		int wherr = aufsng_create_whiteout(pfs, aufsng_upperdentry(olddir),
+		int wherr = aufsng_create_whiteout(pfs, oldupperdir,
 						&old->d_name);
 		/*
 		 * Without the whiteout, what the old name shadowed
@@ -900,7 +922,7 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 		 * stands, is reported as success, and is warned about.
 		 */
 		if (wherr && !had_victim &&
-		    !aufsng_rename_undo(pfs, olddir, old, newupperdir, new,
+		    !aufsng_rename_undo(pfs, oldupperdir, old, newupperdir, new,
 				     false)) {
 			err = wherr;
 			goto out_unpark;
@@ -919,11 +941,10 @@ int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
 	 * rename stands, reported as success with a warning.
 	 */
 	if (covered_new) {
-		int opqerr = aufsng_mark_diropq(pfs,
-					aufsng_upperdentry(d_inode(old)));
+		int opqerr = aufsng_mark_diropq(pfs, oldupper);
 
 		if (opqerr && !had_victim &&
-		    !aufsng_rename_undo(pfs, olddir, old, newupperdir, new,
+		    !aufsng_rename_undo(pfs, oldupperdir, old, newupperdir, new,
 				     covered)) {
 			err = opqerr;
 			goto out_unpark;

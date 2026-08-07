@@ -28,11 +28,11 @@
 #define AUFSNG_SUPER_MAGIC	0x61756673	/* "aufs" */
 #define AUFSNG_ROOT_INO		2		/* AUFS_ROOT_INO */
 
-#define AUFSNG_MAX_STACK		500
 /*
  * Branch ceiling: AUFS's own maximum, and the widest slot number
- * aufsng_map_ino() can still fold into i_ino.  Not a preallocation
- * size - the slot table grows on demand.
+ * aufsng_map_ino() can still fold into i_ino.  The one limit for both
+ * "br:" at mount and "add=" at remount.  Not a preallocation size -
+ * the slot table grows on demand.
  */
 #define AUFSNG_MAXBRANCH	32767
 
@@ -142,7 +142,8 @@ struct aufsng_fs {
 	struct percpu_rw_semaphore dyn_lock;
 	struct backing_file_ctx backing_ctx;
 	struct aufsng_config config;
-	int namelen;
+	/* long, as statfs's f_namelen and aufsng_probe_namelen() both are */
+	long namelen;
 };
 
 struct aufsng_dir_cache;
@@ -333,7 +334,15 @@ static inline void aufsng_copyattr_from(struct inode *inode,
 
 static inline void aufsng_copyattr(struct inode *inode)
 {
-	aufsng_copyattr_from(inode, aufsng_inode_real(inode));
+	struct inode *real = aufsng_inode_real(inode);
+
+	/*
+	 * No real object at all: the upper is gone and the stack is
+	 * empty.  Nothing to mirror, and the union inode's attributes
+	 * are as current as they can be - keep them.
+	 */
+	if (real)
+		aufsng_copyattr_from(inode, real);
 }
 
 /*
@@ -378,6 +387,10 @@ static inline int aufsng_wh_name(char *buf, const struct qstr *name,
  * detection in cp -a/tar and find's loop check.  Fold the branch's
  * slot into the high bits, as overlayfs's xino does.  Branch 0, and
  * any fs already using those bits, are left alone.
+ *
+ * The result lands in i_ino, an unsigned long, so both this shift and
+ * the root evasion below need 64 bits - hence Kconfig's "depends on
+ * 64BIT", as overlayfs gates its own xino.
  */
 #define AUFSNG_XINO_SHIFT	40
 

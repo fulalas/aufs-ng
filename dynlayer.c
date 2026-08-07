@@ -271,7 +271,7 @@ static unsigned int aufsng_find_free_slot(struct aufsng_fs *pfs)
 /* defined later; used by the surgical-add path below */
 static bool aufsng_entry_has_layer(struct aufsng_entry *oe,
 				const struct aufsng_layer *layer);
-static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode,
+static void aufsng_dyn_commit_rebuild(struct inode *inode,
 				   struct aufsng_entry *new_oe,
 				   struct aufsng_dyn_parked *parked);
 
@@ -671,7 +671,7 @@ static void aufsng_dyn_splice_cached(struct aufsng_fs *pfs, struct super_block *
 			aufsng_free_entry(neu);
 			continue;
 		}
-		aufsng_dyn_commit_rebuild(pfs, dirs[i], neu, pk);
+		aufsng_dyn_commit_rebuild(dirs[i], neu, pk);
 		aufsng_dyn_drop_neg_children(dirs[i]);
 	}
 
@@ -1178,7 +1178,7 @@ out:
 	return new_oe;
 }
 
-static void aufsng_dyn_commit_rebuild(struct aufsng_fs *pfs, struct inode *inode,
+static void aufsng_dyn_commit_rebuild(struct inode *inode,
 				  struct aufsng_entry *new_oe,
 				  struct aufsng_dyn_parked *parked)
 {
@@ -1472,7 +1472,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 	 */
 	for (i = 0; i < scan.nr; i++) {
 		if (new_oes[i]) {
-			aufsng_dyn_commit_rebuild(pfs, scan.pinned[i], new_oes[i],
+			aufsng_dyn_commit_rebuild(scan.pinned[i], new_oes[i],
 					      parked[i]);
 			/*
 			 * A removed branch's whiteout stops hiding the name

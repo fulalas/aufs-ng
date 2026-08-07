@@ -575,7 +575,10 @@ out:
 const char *aufsng_get_link(struct dentry *dentry, struct inode *inode,
 			 struct delayed_call *done)
 {
+	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
+	const struct cred *old_cred;
 	struct path realpath;
+	const char *link;
 
 	if (!dentry)
 		return ERR_PTR(-ECHILD);
@@ -585,5 +588,15 @@ const char *aufsng_get_link(struct dentry *dentry, struct inode *inode,
 	if (!realpath.dentry)
 		return ERR_PTR(-ESTALE);
 
-	return vfs_get_link(realpath.dentry, done);
+	/*
+	 * As every other path that touches a real object: vfs_get_link()
+	 * runs the branch's own checks (security_inode_readlink() among
+	 * them), and those must see the mounter, not the caller - the
+	 * union already vetted the caller against its own inode.
+	 */
+	old_cred = override_creds(pfs->creator_cred);
+	link = vfs_get_link(realpath.dentry, done);
+	revert_creds(old_cred);
+
+	return link;
 }

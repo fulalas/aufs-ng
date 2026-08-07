@@ -237,22 +237,34 @@ static struct dentry *aufsng_copy_up_prep_regular(struct aufsng_fs *pfs,
 {
 	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	struct dentry *work;
+	int tries;
 	int err;
-
-	snprintf(tmpbuf, 32, ".wh..wh.pxu%u",
-		 atomic_inc_return(&aufsng_tmpfile_seq));
-	*tmp = QSTR(tmpbuf);
 
 	err = mnt_want_write(aufsng_upper_mnt(pfs));
 	if (err)
 		return ERR_PTR(err);
-	work = start_creating_noperm(pupper, tmp);
-	if (IS_ERR(work))
-		goto out_drop;
-	if (d_is_positive(work)) {
+
+	/*
+	 * The sequence restarts at 0 on every load, so a crash leftover
+	 * can sit on the first name minted here - and nothing sweeps it
+	 * until the directory is removed.  Take the next name instead of
+	 * failing this file's copy-up for good.
+	 */
+	for (tries = 0; ; tries++) {
+		snprintf(tmpbuf, 32, ".wh..wh.pxu%u",
+			 atomic_inc_return(&aufsng_tmpfile_seq));
+		*tmp = QSTR(tmpbuf);
+
+		work = start_creating_noperm(pupper, tmp);
+		if (IS_ERR(work))
+			goto out_drop;
+		if (!d_is_positive(work))
+			break;
 		end_dirop(work);
-		work = ERR_PTR(-EEXIST);
-		goto out_drop;
+		if (tries >= 16) {
+			work = ERR_PTR(-EEXIST);
+			goto out_drop;
+		}
 	}
 	err = vfs_create(idmap, work, S_IFREG | 0600, NULL);
 	if (err) {
@@ -603,10 +615,24 @@ int aufsng_copy_up(struct dentry *dentry)
 		err = aufsng_copy_up_one(next);
 		/*
 		 * -ESTALE: a removal re-pointed the source stack mid-copy.
-		 * The retry copies the survivor; the cap guards a livelock.
+		 * The retry copies the survivor.
 		 */
-		if (err == -ESTALE && ++retries <= 3)
+		if (err == -ESTALE)
 			err = 0;
+		/*
+		 * Success that left no upper means the round made no
+		 * progress: either the -ESTALE above, or a concurrent
+		 * shed-upper undoing the copy-up.  Cap those rounds - a
+		 * repeating shed would otherwise spin here forever.  A
+		 * round that DID publish an upper resets the count, so a
+		 * deep ancestor chain is not capped.
+		 */
+		if (!err && !aufsng_upperdentry(d_inode(next))) {
+			if (++retries > 3)
+				err = -ESTALE;
+		} else {
+			retries = 0;
+		}
 		dput(next);
 	}
 
