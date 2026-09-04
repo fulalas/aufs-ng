@@ -14,7 +14,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=128; PASS=0; FAIL=0
+	N=0; TOTAL=134; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -762,6 +762,58 @@ for e in os.scandir(sys.argv[1]):
 		&& ok "truncate succeeds once the binary exited" \
 		|| bad "truncate succeeds once the binary exited"
 	$M -u /mnt/su
+
+	echo "=== 34. inotify-pinned directory generations survive branch removal ==="
+	# inotify holds only the union inode, not its dentry.  Drop the
+	# dentry before an add so the old generation cannot be spliced to
+	# the new branch; a fresh lookup after the add then creates a second
+	# generation.  Removal makes both converge on L1/watchdir.
+	mkdir -p $L1/watchdir $L3/watchdir
+	echo base > $L1/watchdir/base
+	echo added > $L3/watchdir/added
+	watch1=/tmp/aufsng-watch1.$$; watch2=/tmp/aufsng-watch2.$$
+	ready1=/tmp/aufsng-ready1.$$; ready2=/tmp/aufsng-ready2.$$
+	python3 -c 'import ctypes,os,sys,time
+libc=ctypes.CDLL(None, use_errno=True)
+fd=libc.inotify_init1(os.O_CLOEXEC)
+if fd < 0: raise OSError(ctypes.get_errno(), "inotify_init1")
+wd=libc.inotify_add_watch(fd, os.fsencode(sys.argv[1]), 0xfff)
+if wd < 0: raise OSError(ctypes.get_errno(), "inotify_add_watch")
+open(sys.argv[2], "w").close()
+time.sleep(60)' "$U/watchdir" "$ready1" & watch1=$!
+	for _ in $(seq 1 50); do [ -e "$ready1" ] && break; sleep .02; done
+	[ -e "$ready1" ] || bad "precondition: first inotify watch did not start"
+	ino_before=$(stat -c %i $U/watchdir)
+	drop_caches
+	$M aufs aufs $U "add=1:$L3=rr" 32 || bad "remount add (inotify dir generations)"
+	ino_added=$(stat -c %i $U/watchdir)
+	[ "$ino_before" != "$ino_added" ] \
+		&& ok "cache drop plus add creates the pinned directory generation split" \
+		|| bad "cache drop plus add creates the pinned directory generation split"
+	python3 -c 'import ctypes,os,sys,time
+libc=ctypes.CDLL(None, use_errno=True)
+fd=libc.inotify_init1(os.O_CLOEXEC)
+if fd < 0: raise OSError(ctypes.get_errno(), "inotify_init1")
+wd=libc.inotify_add_watch(fd, os.fsencode(sys.argv[1]), 0xfff)
+if wd < 0: raise OSError(ctypes.get_errno(), "inotify_add_watch")
+open(sys.argv[2], "w").close()
+time.sleep(60)' "$U/watchdir" "$ready2" & watch2=$!
+	for _ in $(seq 1 50); do [ -e "$ready2" ] && break; sleep .02; done
+	[ -e "$ready2" ] || bad "precondition: second inotify watch did not start"
+	$M aufs aufs $U "del=$L3" 32 \
+		&& ok "removal succeeds with two inotify-pinned directory generations" \
+		|| bad "removal succeeds with two inotify-pinned directory generations"
+	check "surviving lower directory remains visible after removal" grep -q base $U/watchdir/base
+	checkfail "removed branch content disappears from the merged directory" test -e $U/watchdir/added
+	[ "$(stat -c %i $U/watchdir)" = "$ino_before" ] \
+		&& ok "directory identity returns to the surviving lower generation" \
+		|| bad "directory identity returns to the surviving lower generation"
+	kill -0 "$watch1" 2>/dev/null && kill -0 "$watch2" 2>/dev/null \
+		&& ok "both inotify users remain alive across branch removal" \
+		|| bad "both inotify users remain alive across branch removal"
+	kill "$watch1" "$watch2" 2>/dev/null; wait "$watch1" "$watch2" 2>/dev/null
+	rm -f "$ready1" "$ready2"
+	rm -rf $L1/watchdir $L3/watchdir
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.
