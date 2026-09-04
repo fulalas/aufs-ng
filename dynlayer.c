@@ -228,18 +228,42 @@ out:
 static void aufsng_dyn_rekey_inode(struct inode *inode, struct aufsng_entry *oe)
 {
 	unsigned int key_idx;
+	struct inode *dup = NULL;
 	struct inode *key = aufsng_hash_key(oe, aufsng_upperdentry(inode),
 					    &key_idx);
 
-	if (inode->i_private == key)
+	if (inode->i_private == key && !inode_unhashed(inode))
 		return;
 	if (!inode_unhashed(inode))
 		remove_inode_hash(inode);
 	inode->i_private = key;
-	if (key) {
-		inode->i_ino = aufsng_map_ino(key->i_ino, key_idx);
-		__insert_inode_hash(inode, (unsigned long)key);
+	if (!key)
+		return;
+
+	inode->i_ino = aufsng_map_ino(key->i_ino, key_idx);
+	/*
+	 * inotify pins an inode but not its dentry.  If the dentry was
+	 * reclaimed before a dynamic add, the add cannot splice that old
+	 * directory generation in place; a later lookup may therefore
+	 * instantiate a second generation for the same merged directory.
+	 * When a subsequent branch change makes both generations converge
+	 * on one real directory, they must not both enter the inode hash.
+	 *
+	 * Directories cannot have hardlink siblings, so keeping the extra
+	 * pinned generation unhashed is safe: its existing users keep the
+	 * rebuilt survivor stack, while fresh lookups find the canonical
+	 * hashed inode.  A later rebuild retries insertion after the
+	 * canonical generation is evicted.
+	 */
+	if (S_ISDIR(inode->i_mode)) {
+		dup = ilookup5(inode->i_sb, (unsigned long)key,
+				aufsng_inode_test, key);
+		if (dup) {
+			iput(dup);
+			return;
+		}
 	}
+	__insert_inode_hash(inode, (unsigned long)key);
 }
 
 /* find an active branch whose root is @dentry, or NULL */
@@ -1246,12 +1270,14 @@ void aufsng_dyn_free_parked(struct aufsng_inode *oi)
 
 /*
  * A rekey re-hashes @inode under its rebuilt stack's key, and
- * __insert_inode_hash() checks no duplicates - a second inode under
- * one key shadows the first for every lookup, splitting one hardlink
- * family into two identities.  Reachable through hardlinks: two pinned
- * inodes for sibling names, one re-pointing onto the key the other
- * already holds.  Refuse the removal instead.  @new_oes[0..@i] are
- * this batch's stacks: two of them may also target the SAME new key,
+ * __insert_inode_hash() checks no duplicates - a second non-directory
+ * inode under one key shadows the first for every lookup, splitting one
+ * hardlink family into two identities.  Reachable through hardlinks: two
+ * pinned file inodes for sibling names, one re-pointing onto the key the
+ * other already holds.  Refuse that removal instead.  Directories cannot
+ * be hardlinked, so duplicate directory generations are handled by the
+ * commit path leaving the extra pinned generation unhashed.  @new_oes[0..@i]
+ * are this batch's stacks: two of them may also target the SAME new key,
  * which the hash cannot show while neither is rekeyed.
  */
 static int aufsng_dyn_check_rekey(struct super_block *sb,
@@ -1265,6 +1291,14 @@ static int aufsng_dyn_check_rekey(struct super_block *sb,
 
 	key = aufsng_hash_key(new_oes[i], aufsng_upperdentry(inode), NULL);
 	if (!key || key == inode->i_private)
+		return 0;
+	/*
+	 * A directory collision can only be another generation of the same
+	 * real directory (directories cannot be hardlinked).  The commit
+	 * path deliberately leaves the extra pinned generation unhashed;
+	 * only non-directories need the hardlink-identity fail-closed gate.
+	 */
+	if (S_ISDIR(inode->i_mode))
 		return 0;
 
 	dup = ilookup5(sb, (unsigned long)key, aufsng_inode_test, key);
