@@ -93,7 +93,9 @@ Removing a layer works even while a file it provides is open, unless that
 file is memory-mapped: the open file keeps working until it is closed, and
 new lookups find another layer. The same goes for something deleted through
 the union but still held open, a folder in use as a working directory
-included.
+included. Pinned directory inode generations do not block layer removal when
+another branch still provides the directory; fresh lookups keep using the
+canonical cached generation.
 
 ## On-disk format
 
