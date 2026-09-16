@@ -14,7 +14,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=134; PASS=0; FAIL=0
+	N=0; TOTAL=138; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -22,6 +22,12 @@ guest_main() {
 		echo "TEST-FAIL: $1"; }
 	check() { local desc="$1"; shift
 		if "$@" >/dev/null 2>&1; then ok "$desc"; else bad "$desc"; fi; }
+	wait_file() { local i
+		for i in $(seq 1 250); do
+			[ -e "$1" ] && return 0
+			kill -0 "$2" 2>/dev/null || return 1
+			sleep .02
+		done; return 1; }
 	checkfail() { local desc="$1"; shift
 		if "$@" >/dev/null 2>&1; then bad "$desc"; else ok "$desc"; fi; }
 
@@ -771,7 +777,6 @@ for e in os.scandir(sys.argv[1]):
 	mkdir -p $L1/watchdir $L3/watchdir
 	echo base > $L1/watchdir/base
 	echo added > $L3/watchdir/added
-	watch1=/tmp/aufsng-watch1.$$; watch2=/tmp/aufsng-watch2.$$
 	ready1=/tmp/aufsng-ready1.$$; ready2=/tmp/aufsng-ready2.$$
 	python3 -c 'import ctypes,os,sys,time
 libc=ctypes.CDLL(None, use_errno=True)
@@ -781,8 +786,7 @@ wd=libc.inotify_add_watch(fd, os.fsencode(sys.argv[1]), 0xfff)
 if wd < 0: raise OSError(ctypes.get_errno(), "inotify_add_watch")
 open(sys.argv[2], "w").close()
 time.sleep(60)' "$U/watchdir" "$ready1" & watch1=$!
-	for _ in $(seq 1 50); do [ -e "$ready1" ] && break; sleep .02; done
-	[ -e "$ready1" ] || bad "precondition: first inotify watch did not start"
+	wait_file "$ready1" "$watch1" || bad "precondition: first inotify watch did not start"
 	ino_before=$(stat -c %i $U/watchdir)
 	drop_caches
 	$M aufs aufs $U "add=1:$L3=rr" 32 || bad "remount add (inotify dir generations)"
@@ -798,22 +802,40 @@ wd=libc.inotify_add_watch(fd, os.fsencode(sys.argv[1]), 0xfff)
 if wd < 0: raise OSError(ctypes.get_errno(), "inotify_add_watch")
 open(sys.argv[2], "w").close()
 time.sleep(60)' "$U/watchdir" "$ready2" & watch2=$!
-	for _ in $(seq 1 50); do [ -e "$ready2" ] && break; sleep .02; done
-	[ -e "$ready2" ] || bad "precondition: second inotify watch did not start"
+	wait_file "$ready2" "$watch2" || bad "precondition: second inotify watch did not start"
 	$M aufs aufs $U "del=$L3" 32 \
 		&& ok "removal succeeds with two inotify-pinned directory generations" \
 		|| bad "removal succeeds with two inotify-pinned directory generations"
 	check "surviving lower directory remains visible after removal" grep -q base $U/watchdir/base
 	checkfail "removed branch content disappears from the merged directory" test -e $U/watchdir/added
 	[ "$(stat -c %i $U/watchdir)" = "$ino_before" ] \
-		&& ok "directory identity returns to the surviving lower generation" \
-		|| bad "directory identity returns to the surviving lower generation"
+		&& ok "inode number returns to the surviving lower's" \
+		|| bad "inode number returns to the surviving lower's"
 	kill -0 "$watch1" 2>/dev/null && kill -0 "$watch2" 2>/dev/null \
 		&& ok "both inotify users remain alive across branch removal" \
 		|| bad "both inotify users remain alive across branch removal"
 	kill "$watch1" "$watch2" 2>/dev/null; wait "$watch1" "$watch2" 2>/dev/null
 	rm -f "$ready1" "$ready2"
 	rm -rf $L1/watchdir $L3/watchdir
+
+	echo "=== 35. a deleted-but-pinned directory stays deleted across branch removal ==="
+	mkdir -p $L1/gonedir $L3/gonedir
+	$M aufs aufs $U "add=1:$L3=rr" 32 || bad "remount add (deleted pinned dir)"
+	exec 8<$U/gonedir
+	rmdir $U/gonedir || bad "precondition: rmdir of the pinned merged directory"
+	$M aufs aufs $U "del=$L3" 32 \
+		&& ok "removal succeeds with a deleted-but-pinned directory" \
+		|| bad "removal succeeds with a deleted-but-pinned directory"
+	checkfail "the deleted name stays gone from the union" test -e $U/gonedir
+	$M aufs aufs $U "del=$L1" 32 \
+		&& ok "the last provider of a deleted pinned directory can go too" \
+		|| bad "the last provider of a deleted pinned directory can go too"
+	checkfail "the deleted directory was not copied up to the rw branch" \
+		test -e $W/gonedir
+	exec 8<&-
+	$M aufs aufs $U "add=1:$L1=ro" 32 || bad "remount add (restore L1)"
+	rm -f $W/.wh.gonedir
+	rm -rf $L1/gonedir $L3/gonedir
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.

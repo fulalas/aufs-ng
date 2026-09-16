@@ -228,7 +228,7 @@ out:
 static void aufsng_dyn_rekey_inode(struct inode *inode, struct aufsng_entry *oe)
 {
 	unsigned int key_idx;
-	struct inode *dup = NULL;
+	struct inode *dup;
 	struct inode *key = aufsng_hash_key(oe, aufsng_upperdentry(inode),
 					    &key_idx);
 
@@ -242,18 +242,14 @@ static void aufsng_dyn_rekey_inode(struct inode *inode, struct aufsng_entry *oe)
 
 	inode->i_ino = aufsng_map_ino(key->i_ino, key_idx);
 	/*
-	 * inotify pins an inode but not its dentry.  If the dentry was
-	 * reclaimed before a dynamic add, the add cannot splice that old
-	 * directory generation in place; a later lookup may therefore
-	 * instantiate a second generation for the same merged directory.
-	 * When a subsequent branch change makes both generations converge
-	 * on one real directory, they must not both enter the inode hash.
-	 *
-	 * Directories cannot have hardlink siblings, so keeping the extra
-	 * pinned generation unhashed is safe: its existing users keep the
-	 * rebuilt survivor stack, while fresh lookups find the canonical
-	 * hashed inode.  A later rebuild retries insertion after the
-	 * canonical generation is evicted.
+	 * inotify pins an inode but not its dentry, and the add-side
+	 * splice needs a dentry: an old directory generation can survive
+	 * an add unspliced while a fresh lookup mints a second one.  When
+	 * a later removal makes both converge on one real directory, only
+	 * one may be hashed.  Directories have no hardlink siblings, so
+	 * the extra generation stays unhashed: its users keep the rebuilt
+	 * stack, fresh lookups find the hashed one, and a later rebuild
+	 * retries once that one is evicted.
 	 */
 	if (S_ISDIR(inode->i_mode)) {
 		dup = ilookup5(inode->i_sb, (unsigned long)key,
@@ -635,7 +631,7 @@ static void aufsng_dyn_splice_cached(struct aufsng_fs *pfs, struct super_block *
 		spin_lock(&inode->i_lock);
 		if ((inode_state_read(inode) &
 		     (I_FREEING | I_WILL_FREE | I_NEW)) ||
-		    !S_ISDIR(inode->i_mode)) {
+		    !S_ISDIR(inode->i_mode) || IS_DEADDIR(inode)) {
 			spin_unlock(&inode->i_lock);
 			continue;
 		}
@@ -854,14 +850,14 @@ static bool aufsng_entry_has_layer(struct aufsng_entry *oe,
 
 /*
  * A directory removed through the union but still pinned by a cwd or
- * fd: rmdir cleared its link count, so no lookup can reach it again.
+ * fd: the VFS marked it S_DEAD, so no lookup can reach it again.
  * Like a deleted-but-open file it must not block a branch removal -
  * there is nothing to re-point to - so it takes the same pin-only
  * path: the stack stays, mounts pinned, until the last user lets go.
  */
 static bool aufsng_dyn_dir_gone(struct inode *inode)
 {
-	return S_ISDIR(inode->i_mode) && !inode->i_nlink;
+	return S_ISDIR(inode->i_mode) && IS_DEADDIR(inode);
 }
 
 /*
@@ -1436,12 +1432,11 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 
 		if (S_ISDIR(scan.pinned[i]->i_mode)) {
 			/*
-			 * A deleted-but-open directory with no survivor has
-			 * nothing to rebuild onto: keep the stack and pin
-			 * the mounts, as the non-directory path does.
+			 * A deleted-but-open directory has nothing to rebuild
+			 * onto, survivor or not: keep the stack and pin the
+			 * mounts, as the non-directory path does.
 			 */
-			if (aufsng_dyn_dir_gone(scan.pinned[i]) &&
-			    !aufsng_dyn_has_survivor(scan.pinned[i], layer))
+			if (aufsng_dyn_dir_gone(scan.pinned[i]))
 				pin_only = true;
 			else
 				new_oes[i] = aufsng_dyn_prep_rebuild(pfs,
