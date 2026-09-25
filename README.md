@@ -58,11 +58,6 @@ benchmarks.
 
 ## Usage
 
-A union shows several folders as if they were one. The first is writable
-and takes everything you create, change or delete; the rest are read-only
-and only provide content. When the same name exists in more than one, the
-first one listed wins. The mount options call such a folder a branch.
-
 ```
 mount -t aufs -o br:/memory/changes=rw,udba=reval aufs /union
 mount -o remount,add=1:/path/to/layer=ro aufs /union   # add a layer
@@ -145,14 +140,7 @@ Also, some `aufs` features are intentionally out of scope:
 - **FHSM** (automatic storage tiering) — not needed: `aufs-ng` only ever
   has one writable location, so there's nothing to move files between.
 
-## Building
-
-Needs a **64-bit** kernel: inode numbers carry the layer a file came
-from in their high bits, which a 32-bit inode number cannot hold.
-
-Best built **into the kernel** (`CONFIG_AUFSNG_FS=y`) as a live-boot
-sequence typically needs this filesystem type mounted before any
-loadable module can be reached at all.
+## Building (64-bit only)
 
 To integrate into a kernel source tree (any anchor line in `fs/Kconfig`/
 `fs/Makefile` works; the `OverlayFS` entry is just a convenient, stable one):
@@ -164,7 +152,11 @@ sed -i '/obj-\$(CONFIG_OVERLAY_FS)\s*+= overlayfs\//a obj-$(CONFIG_AUFSNG_FS)\t+
 echo "CONFIG_AUFSNG_FS=y" >> .config
 ```
 
-Then build the kernel as usual.
+Then build the kernel as usual. 
+
+For a live-boot system it's recommend to use `CONFIG_AUFSNG_FS=y` (instead
+of `CONFIG_AUFSNG_FS=m`) because the filesystem is mounted before any
+loadable module can be reached.
 
 For a quick out-of-tree test build against an already-built kernel tree
 (producing a loadable `.ko` instead, no `fs/Kconfig`/`fs/Makefile` edits
