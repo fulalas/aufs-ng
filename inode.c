@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * aufs-ng inode operations: attribute and xattr passthrough to the
  * real object, with copy-up on the first modification.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Dentry revalidation.  Branch add/remove updates the stack surgically
  * (dynlayer.c), so what can go stale is the relation to a branch edited

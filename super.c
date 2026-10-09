@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Superblock and module setup.  Registers filesystem type "aufs", so
  * real AUFS mount commands and "mount -t aufs" auto-loading both find

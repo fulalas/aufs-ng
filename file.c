@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Regular file I/O: passthrough to the real file via the kernel's
  * backing-file API, so reads, writes, splice and mmap run at native

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Kernel-version shims.  Every LINUX_VERSION_CODE guard lives here so
  * version churn stays out of the filesystem code.

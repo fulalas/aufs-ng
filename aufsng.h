@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * aufs-ng - standalone union filesystem, semantically compatible with
  * AUFS: registers as filesystem type "aufs", takes AUFS's mount option

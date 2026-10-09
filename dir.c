@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Directory mutations.  All of them happen in branch 0 with the
  * mounter's capabilities but the caller's fsuid/fsgid, after copying

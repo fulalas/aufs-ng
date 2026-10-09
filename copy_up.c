@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Copy-up: give a lower-backed object an upper copy before the first
  * modification.  File data goes into a uniquely named temp and is

@@ -175,6 +175,5 @@ on an already-running union.
 ## License
 
 `aufs-ng` is free software, released under the **GNU General Public
-License, version 2** (`GPL-2.0-only`) — the same license as the Linux
-kernel it builds against, so the project is fully GPL-friendly and can
-be distributed as part of a GPL kernel tree.
+License, version 2 or later** (`GPL-2.0-or-later`). See
+[COPYING](COPYING) (GPL 2) and [LICENSE](LICENSE) (GPL 3).

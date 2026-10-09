@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Layered lookup with AUFS whiteout semantics.  AUFS marks a name
  * deleted with a SEPARATE sibling ".wh.<name>" (a 0444 regular file),

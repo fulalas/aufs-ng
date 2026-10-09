@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Runtime branch add/remove ("add=N:PATH=MODE" / "del=PATH" on
  * remount), matching AUFS semantics.
