@@ -431,7 +431,7 @@ out_write:
 }
 
 int aufsng_create(struct mnt_idmap *idmap, struct inode *dir,
-	       struct dentry *dentry, umode_t mode, bool excl)
+	       struct dentry *dentry, umode_t mode AUFSNG_CREATE_EXCL)
 {
 	struct aufsng_create_args a = { .mode = (mode & 07777) | S_IFREG };
 

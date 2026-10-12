@@ -552,7 +552,7 @@ bool aufsng_has_origin(struct aufsng_fs *pfs, struct dentry *upper,
 
 /* dir.c */
 int aufsng_create(struct mnt_idmap *idmap, struct inode *dir,
-	       struct dentry *dentry, umode_t mode, bool excl);
+	       struct dentry *dentry, umode_t mode AUFSNG_CREATE_EXCL);
 struct dentry *aufsng_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode);
 int aufsng_mknod(struct mnt_idmap *idmap, struct inode *dir,
