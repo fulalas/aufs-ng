@@ -18,4 +18,10 @@
 #define AUFSNG_CREATE_EXCL , bool excl
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 4, 0)
+#define AUFSNG_IDMAP const struct mnt_idmap
+#else
+#define AUFSNG_IDMAP struct mnt_idmap
+#endif
+
 #endif /* AUFSNG_COMPAT_H */

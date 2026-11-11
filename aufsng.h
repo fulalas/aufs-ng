@@ -551,18 +551,18 @@ bool aufsng_has_origin(struct aufsng_fs *pfs, struct dentry *upper,
 		    const struct qstr *name);
 
 /* dir.c */
-int aufsng_create(struct mnt_idmap *idmap, struct inode *dir,
+int aufsng_create(AUFSNG_IDMAP *idmap, struct inode *dir,
 	       struct dentry *dentry, umode_t mode AUFSNG_CREATE_EXCL);
-struct dentry *aufsng_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+struct dentry *aufsng_mkdir(AUFSNG_IDMAP *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode);
-int aufsng_mknod(struct mnt_idmap *idmap, struct inode *dir,
+int aufsng_mknod(AUFSNG_IDMAP *idmap, struct inode *dir,
 	      struct dentry *dentry, umode_t mode, dev_t rdev);
-int aufsng_symlink(struct mnt_idmap *idmap, struct inode *dir,
+int aufsng_symlink(AUFSNG_IDMAP *idmap, struct inode *dir,
 		struct dentry *dentry, const char *link);
 int aufsng_link(struct dentry *old, struct inode *dir, struct dentry *new);
 int aufsng_unlink(struct inode *dir, struct dentry *dentry);
 int aufsng_rmdir(struct inode *dir, struct dentry *dentry);
-int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
+int aufsng_rename(AUFSNG_IDMAP *idmap, struct inode *olddir,
 	       struct dentry *old, struct inode *newdir,
 	       struct dentry *new, unsigned int flags);
 int aufsng_remove_object(struct aufsng_fs *pfs, struct dentry *upperdir,

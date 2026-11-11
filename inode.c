@@ -13,7 +13,7 @@
 #include <linux/rcupdate.h>
 #include "aufsng.h"
 
-static int aufsng_getattr(struct mnt_idmap *idmap, const struct path *path,
+static int aufsng_getattr(AUFSNG_IDMAP *idmap, const struct path *path,
 		       struct kstat *stat, u32 request_mask,
 		       unsigned int flags)
 {
@@ -56,7 +56,7 @@ static int aufsng_getattr(struct mnt_idmap *idmap, const struct path *path,
 	return 0;
 }
 
-static int aufsng_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int aufsng_setattr(AUFSNG_IDMAP *idmap, struct dentry *dentry,
 		       struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
@@ -184,12 +184,12 @@ static int aufsng_xattr_get(const struct xattr_handler *handler,
 }
 
 static int aufsng_xattr_set(const struct xattr_handler *handler,
-			 struct mnt_idmap *idmap, struct dentry *dentry,
+			 AUFSNG_IDMAP *idmap, struct dentry *dentry,
 			 struct inode *inode, const char *name,
 			 const void *value, size_t size, int flags)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
-	struct mnt_idmap *upper_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *upper_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	const struct cred *old_cred;
 	struct dentry *upper;
 	int err;

@@ -765,7 +765,7 @@ static bool aufsng_wh_sweep_actor(struct dir_context *ctx, const char *name,
  */
 int aufsng_clear_whiteouts(struct aufsng_fs *pfs, struct dentry *upperdir)
 {
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	struct aufsng_wh_sweep sw = {
 		.dd.ctx.actor = aufsng_wh_sweep_actor,
 		.dd.ctx.count = INT_MAX,

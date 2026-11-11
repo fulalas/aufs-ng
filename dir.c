@@ -49,7 +49,7 @@ static const struct cred *aufsng_override_create_creds(struct aufsng_fs *pfs,
 static int aufsng_create_marker(struct aufsng_fs *pfs, struct dentry *upperdir,
 			     struct qstr *wh)
 {
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	struct dentry *slot;
 	int err;
 
@@ -93,7 +93,7 @@ static int aufsng_remove_whiteout(struct aufsng_fs *pfs,
 			       struct dentry *upperdir,
 			       const struct qstr *name)
 {
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	char buf[NAME_MAX + 1];
 	struct qstr wh;
 	struct dentry *slot;
@@ -142,7 +142,7 @@ static int aufsng_do_remove_object(struct aufsng_fs *pfs,
 				struct dentry *upperdir,
 				const struct qstr *name, bool is_dir)
 {
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	struct qstr q = QSTR_LEN(name->name, name->len);
 	struct dentry *slot;
 	int err;
@@ -289,7 +289,7 @@ static int aufsng_create_object(struct dentry *dentry,
 	struct dentry *parent = dentry->d_parent;
 	struct inode *dir = d_inode(parent);
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	const struct cred *old_cred;
 	struct cred *create_cred = NULL;
 	struct dentry *pupper, *slot, *upper, *made;
@@ -430,7 +430,7 @@ out_write:
 	return err;
 }
 
-int aufsng_create(struct mnt_idmap *idmap, struct inode *dir,
+int aufsng_create(AUFSNG_IDMAP *idmap, struct inode *dir,
 	       struct dentry *dentry, umode_t mode AUFSNG_CREATE_EXCL)
 {
 	struct aufsng_create_args a = { .mode = (mode & 07777) | S_IFREG };
@@ -438,7 +438,7 @@ int aufsng_create(struct mnt_idmap *idmap, struct inode *dir,
 	return aufsng_create_object(dentry, &a);
 }
 
-struct dentry *aufsng_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+struct dentry *aufsng_mkdir(AUFSNG_IDMAP *idmap, struct inode *dir,
 			 struct dentry *dentry, umode_t mode)
 {
 	struct aufsng_create_args a = { .mode = (mode & 07777) | S_IFDIR };
@@ -448,7 +448,7 @@ struct dentry *aufsng_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	return err ? ERR_PTR(err) : NULL;
 }
 
-int aufsng_mknod(struct mnt_idmap *idmap, struct inode *dir,
+int aufsng_mknod(AUFSNG_IDMAP *idmap, struct inode *dir,
 	      struct dentry *dentry, umode_t mode, dev_t rdev)
 {
 	struct aufsng_create_args a = { .mode = mode, .rdev = rdev };
@@ -456,7 +456,7 @@ int aufsng_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	return aufsng_create_object(dentry, &a);
 }
 
-int aufsng_symlink(struct mnt_idmap *idmap, struct inode *dir,
+int aufsng_symlink(AUFSNG_IDMAP *idmap, struct inode *dir,
 		struct dentry *dentry, const char *link)
 {
 	struct aufsng_create_args a = { .mode = S_IFLNK | 0777, .link = link };
@@ -473,7 +473,7 @@ int aufsng_link(struct dentry *old, struct inode *dir, struct dentry *new)
 {
 	struct dentry *parent = new->d_parent;
 	struct aufsng_fs *pfs = AUFSNG_FS(old->d_sb);
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	const struct cred *old_cred;
 	struct cred *create_cred = NULL;
 	struct dentry *pupper, *oldupper, *slot;
@@ -758,12 +758,12 @@ static int aufsng_rename_undo(struct aufsng_fs *pfs, struct dentry *oldupperdir,
 	return err;
 }
 
-int aufsng_rename(struct mnt_idmap *idmap, struct inode *olddir,
+int aufsng_rename(AUFSNG_IDMAP *idmap, struct inode *olddir,
 	       struct dentry *old, struct inode *newdir,
 	       struct dentry *new, unsigned int flags)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(old->d_sb);
-	struct mnt_idmap *upper_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *upper_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	const struct cred *old_cred;
 	struct renamedata rd = {};
 	struct aufsng_entry *oe = AUFSNG_I_E(d_inode(old));

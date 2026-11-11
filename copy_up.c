@@ -40,8 +40,8 @@ static void aufsng_discard_tmp(struct aufsng_fs *pfs, struct dentry *pupper,
 static int aufsng_copy_xattr(struct aufsng_fs *pfs, const struct path *oldpath,
 			  struct dentry *new)
 {
-	struct mnt_idmap *old_idmap = mnt_idmap(oldpath->mnt);
-	struct mnt_idmap *new_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *old_idmap = mnt_idmap(oldpath->mnt);
+	AUFSNG_IDMAP *new_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	ssize_t list_size, size, value_size = 0;
 	char *buf, *name, *value = NULL;
 	int err = 0;
@@ -114,7 +114,7 @@ out:
 static void aufsng_mark_origin(struct aufsng_fs *pfs, struct dentry *upper,
 			    const struct qstr *name)
 {
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	int err = vfs_setxattr(idmap, upper, AUFSNG_XATTR_ORIGIN,
 			       name->name, name->len, 0);
 
@@ -131,7 +131,7 @@ static void aufsng_mark_origin(struct aufsng_fs *pfs, struct dentry *upper,
 bool aufsng_has_origin(struct aufsng_fs *pfs, struct dentry *upper,
 		    const struct qstr *name)
 {
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	char buf[NAME_MAX];
 	ssize_t len;
 
@@ -142,7 +142,7 @@ bool aufsng_has_origin(struct aufsng_fs *pfs, struct dentry *upper,
 static int aufsng_set_attr_from(struct aufsng_fs *pfs, struct dentry *upper,
 			     const struct kstat *stat)
 {
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	struct iattr attr = {
 		.ia_valid = ATTR_UID | ATTR_GID |
 			    ATTR_ATIME | ATTR_MTIME | ATTR_ATIME_SET |
@@ -235,7 +235,7 @@ static struct dentry *aufsng_copy_up_prep_regular(struct aufsng_fs *pfs,
 					       loff_t size,
 					       struct qstr *tmp, char *tmpbuf)
 {
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	struct dentry *work;
 	int tries;
 	int err;
@@ -363,7 +363,7 @@ static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 					  struct dentry *pupper,
 					  const struct kstat *stat)
 {
-	struct mnt_idmap *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	struct dentry *slot, *upper = NULL;
 	DEFINE_DELAYED_CALL(done);
 	const char *link = NULL;
