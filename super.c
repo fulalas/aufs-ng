@@ -298,13 +298,24 @@ const struct super_operations aufsng_super_operations = {
 int aufsng_check_layer(struct super_block *sb, const struct path *path,
 		    const char *name)
 {
+	struct dentry *dentry = path->dentry;
+	unsigned int flags = dentry->d_flags;
+
+	/*
+	 * As in AUFS 6.12, FS_REQUIRES_DEV distinguishes local block-backed
+	 * filesystems from remote filesystems.  Local filesystems may install
+	 * revalidation callbacks too; dcache.c delegates to those callbacks.
+	 */
 	if (!d_is_dir(path->dentry)) {
 		pr_err("aufs: %s is not a directory\n", name);
 		return -ENOTDIR;
 	}
-	/* Branches needing dentry revalidation (remote fs) are unsupported */
-	if (path->dentry->d_flags & (DCACHE_OP_REVALIDATE |
-				     DCACHE_OP_WEAK_REVALIDATE)) {
+	if (flags & (DCACHE_NOKEY_NAME | DCACHE_OP_HASH | DCACHE_OP_COMPARE)) {
+		pr_err("aufs: %s uses unsupported custom name operations\n", name);
+		return -EINVAL;
+	}
+	if ((flags & (DCACHE_OP_REVALIDATE | DCACHE_OP_WEAK_REVALIDATE)) &&
+	    !(dentry->d_sb->s_type->fs_flags & FS_REQUIRES_DEV)) {
 		pr_err("aufs: %s is on a remote filesystem, not supported\n",
 		       name);
 		return -EINVAL;

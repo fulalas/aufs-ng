@@ -59,3 +59,11 @@ description unique — a failure's `TEST-FAIL:` marker is grepped
 verbatim by the host judge. Then bump **`TOTAL`** in `guest_main()`;
 the suite asserts `TOTAL` matches the number of checks actually run,
 so a stale count fails the run loudly rather than silently.
+
+## Local filesystem roots on a distribution kernel
+
+`local-fs-root-vm.sh` checks ext4, ext2 and optional Btrfs roots as union
+branches, including copy-up, whiteouts, bind mounts, dynamic branch changes
+and rejection of unsupported casefold or nested AUFS roots. Run it as root
+**only in a disposable VM** booted with `aufsng_test=1`; the script refuses
+to run elsewhere and creates its own temporary loop devices and mounts.

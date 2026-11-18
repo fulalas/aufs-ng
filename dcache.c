@@ -66,6 +66,33 @@ static int aufsng_attrs_valid(struct inode *inode, struct inode *real,
 	return 1;
 }
 
+static int aufsng_real_valid(struct dentry *dentry, unsigned int flags)
+{
+	if (!(dentry->d_flags & DCACHE_OP_REVALIDATE))
+		return 1;
+	return dentry->d_op->d_revalidate(d_inode(dentry->d_parent),
+					   &dentry->d_name, dentry, flags);
+}
+
+static int aufsng_real_stack_valid(struct inode *inode, struct dentry *upper,
+				   struct aufsng_entry *oe, unsigned int flags)
+{
+	unsigned int i, numlower = oe ? oe->numlower : 0;
+	int valid;
+
+	if (upper) {
+		valid = aufsng_real_valid(upper, flags);
+		if (valid <= 0 || !d_is_dir(upper))
+			return valid;
+	}
+	for (i = 0; i < numlower; i++) {
+		valid = aufsng_real_valid(oe->lowerstack[i].dentry, flags);
+		if (valid <= 0 || !S_ISDIR(inode->i_mode))
+			return valid;
+	}
+	return 1;
+}
+
 /*
  * Does @upper carry @name in @dir's upper directory?  "The inode has an
  * upper" is per-INODE (hardlink siblings share it); revalidation needs
@@ -109,6 +136,10 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 	int ret = 1;
 	int found;
 	int wh = 0;
+
+	ret = aufsng_real_stack_valid(inode, upper, oe, flags);
+	if (ret <= 0)
+		return ret;
 
 	/*
 	 * An out-of-band unlink/rename unhashes the pinned real dentry -
@@ -256,12 +287,13 @@ static int aufsng_d_revalidate(struct inode *dir, const struct qstr *name,
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
 
 	/*
-	 * The root is never stale: its entry is swapped in place on a
-	 * branch change.  udba=none trusts the cache out of band, as
-	 * AUFS; the union's own branch changes are still honored.
+	 * The union root is swapped in place on a branch change, but a local
+	 * backing filesystem may still require its own root revalidation.
 	 */
 	if (unlikely(IS_ROOT(dentry)))
-		return 1;
+		return aufsng_real_stack_valid(d_inode(dentry),
+					       aufsng_upperdentry(d_inode(dentry)),
+					       AUFSNG_I_E(d_inode(dentry)), flags);
 
 	if (d_is_negative(dentry)) {
 		unsigned long stamp;
