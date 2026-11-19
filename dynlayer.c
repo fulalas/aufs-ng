@@ -460,6 +460,8 @@ static struct dentry *aufsng_dyn_resolve_step(struct aufsng_fs *pfs,
 	 * so with no upper the object is gone from the union.  A probe
 	 * error skips instead, keeping the pre-add view.
 	 */
+	if (aufsng_check_key(pbase))
+		goto out;
 	wh = aufsng_check_whiteout(mnt, pbase, &ns.name);
 	if (wh) {
 		if (wh == 1)

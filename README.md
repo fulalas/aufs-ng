@@ -73,6 +73,11 @@ Each layer is `rw` (writable, first layer only) or `ro`/`rr` (read-only).
 A later layer asking for `rw` is accepted but stays read-only, with a note
 in the kernel log. Layers may not overlap: one cannot be inside another.
 
+Layers must be on a local filesystem. NFS, CIFS and other network or
+FUSE filesystems are refused, except `fuseblk` (e.g. `ntfs-3g`).
+Case-insensitive (casefold) filesystems are not supported. An encrypted
+folder (fscrypt) inside a layer gives `ENOKEY` until its key is loaded.
+
 - `udba=` — whether to notice changes made directly inside a layer, behind
   the union's back. `reval` (the default) notices them; `none` trusts the
   cache and is a bit faster.

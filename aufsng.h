@@ -512,6 +512,7 @@ const char *aufsng_get_link(struct dentry *dentry, struct inode *inode,
 int aufsng_check_whiteout(struct vfsmount *mnt, struct dentry *parent,
 		       const struct qstr *name);
 int aufsng_check_diropq(struct vfsmount *mnt, struct dentry *dir);
+int aufsng_check_key(struct dentry *dir);
 int aufsng_find_origin_ex(struct aufsng_entry *poe, const struct qstr *name,
 		       const struct aufsng_layer *skip_layer, umode_t mode,
 		       struct aufsng_path *out);

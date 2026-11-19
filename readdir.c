@@ -311,6 +311,9 @@ static int aufsng_dir_drain(struct aufsng_fs *pfs, const struct path *realpath,
 	struct file *realfile;
 	int err;
 
+	err = aufsng_check_key(realpath->dentry);
+	if (err)
+		return err;
 	realfile = dentry_open(realpath, O_RDONLY | O_DIRECTORY | O_LARGEFILE,
 			       pfs->creator_cred);
 	if (IS_ERR(realfile))

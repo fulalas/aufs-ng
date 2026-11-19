@@ -13,6 +13,7 @@
 #include <linux/mount.h>
 #include <linux/cred.h>
 #include <linux/slab.h>
+#include <linux/fscrypt.h>
 #include "aufsng.h"
 
 /*
@@ -67,6 +68,16 @@ int aufsng_check_diropq(struct vfsmount *mnt, struct dentry *dir)
 	return aufsng_probe_marker(mnt, dir, &opq, false);
 }
 
+int aufsng_check_key(struct dentry *dir)
+{
+	struct inode *inode = d_inode(dir);
+	int err = fscrypt_prepare_readdir(inode);
+
+	if (!err && IS_ENCRYPTED(inode) && !fscrypt_has_encryption_key(inode))
+		err = -ENOKEY;
+	return err;
+}
+
 /*
  * Look up @name in one branch dir: NULL if negative, a referenced
  * dentry if positive, or *whiteout = 1 (and NULL) if this branch
@@ -81,6 +92,9 @@ struct dentry *aufsng_lookup_once(struct vfsmount *mnt,
 	struct dentry *this;
 	int wh;
 
+	wh = aufsng_check_key(base);
+	if (wh)
+		return ERR_PTR(wh);
 	wh = aufsng_check_whiteout(mnt, base, name);
 	if (wh < 0)
 		return ERR_PTR(wh);
