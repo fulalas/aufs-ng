@@ -301,13 +301,16 @@ static const char *aufsng_reval_reason(struct dentry *dentry)
 
 	if (flags & DCACHE_OP_WEAK_REVALIDATE)
 		return "is on a remote filesystem";
+	/* fscrypt can clear REVALIDATE on a plaintext child without
+	 * clearing the filesystem's hash/compare operations.
+	 */
+	if (flags & (DCACHE_OP_HASH | DCACHE_OP_COMPARE))
+		return "uses unsupported name operations";
 	if (!(flags & DCACHE_OP_REVALIDATE) ||
 	    !strcmp(dentry->d_sb->s_type->name, "fuseblk"))
 		return NULL;
 	if (dentry->d_op->d_revalidate != fscrypt_d_revalidate)
 		return "is on a remote filesystem";
-	if (flags & (DCACHE_OP_HASH | DCACHE_OP_COMPARE))
-		return "uses case-insensitive names";
 	return NULL;
 }
 
