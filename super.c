@@ -295,6 +295,13 @@ const struct super_operations aufsng_super_operations = {
 	.show_options	= aufsng_show_options,
 };
 
+static bool aufsng_is_nocase(struct dentry *dentry)
+{
+	return IS_CASEFOLDED(d_inode(dentry)) ||
+	       (!sb_has_encoding(dentry->d_sb) &&
+		(READ_ONCE(dentry->d_flags) & DCACHE_OP_COMPARE));
+}
+
 static bool aufsng_is_remote(struct dentry *dentry)
 {
 	unsigned int flags = READ_ONCE(dentry->d_flags);
@@ -317,11 +324,6 @@ int aufsng_check_layer(struct super_block *sb, const struct path *path,
 		pr_err("aufs: %s is not a directory\n", name);
 		return -ENOTDIR;
 	}
-	if (IS_CASEFOLDED(d_inode(path->dentry))) {
-		pr_err("aufs: %s uses case-insensitive names, not supported\n",
-		       name);
-		return -EINVAL;
-	}
 	err = aufsng_check_key(path->dentry);
 	if (!err && (path->dentry->d_flags & DCACHE_NOKEY_NAME))
 		err = -ENOKEY;
@@ -332,6 +334,11 @@ int aufsng_check_layer(struct super_block *sb, const struct path *path,
 	}
 	if (aufsng_is_remote(path->dentry)) {
 		pr_err("aufs: %s is on a remote filesystem, not supported\n",
+		       name);
+		return -EINVAL;
+	}
+	if (aufsng_is_nocase(path->dentry)) {
+		pr_err("aufs: %s uses case-insensitive names, not supported\n",
 		       name);
 		return -EINVAL;
 	}

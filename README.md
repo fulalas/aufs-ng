@@ -75,6 +75,10 @@ in the kernel log. Layers may not overlap: one cannot be inside another.
 
 Layers must be on a local filesystem. NFS, CIFS and other network or
 FUSE filesystems are refused, except `fuseblk` (e.g. `ntfs-3g`).
+Case-insensitive filesystems are refused too: FAT, exFAT, HFS/HFS+, HPFS,
+AFFS, ADFS, Joliet-only ISOs, ISOs mounted with `check=relaxed`, and ntfs3
+or JFS in case-insensitive mode. XFS with `ascii-ci` and the `ntfs` driver
+with `nocase` are not detected, so don't use them as layers.
 A case-insensitive folder (casefold, `chattr +F`) cannot be a layer; other
 folders of a filesystem with casefold enabled can. Such a folder inside a
 layer is not refused, but it is not supported either. An encrypted folder
