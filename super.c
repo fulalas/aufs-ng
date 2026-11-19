@@ -295,32 +295,32 @@ const struct super_operations aufsng_super_operations = {
 	.show_options	= aufsng_show_options,
 };
 
-static const char *aufsng_reval_reason(struct dentry *dentry)
+static bool aufsng_is_remote(struct dentry *dentry)
 {
 	unsigned int flags = READ_ONCE(dentry->d_flags);
 
 	if (flags & DCACHE_OP_WEAK_REVALIDATE)
-		return "is on a remote filesystem";
+		return true;
 	if (!(flags & DCACHE_OP_REVALIDATE) ||
 	    !strcmp(dentry->d_sb->s_type->name, "fuseblk"))
-		return NULL;
-	if (dentry->d_op->d_revalidate != fscrypt_d_revalidate)
-		return "is on a remote filesystem";
-	if (flags & (DCACHE_OP_HASH | DCACHE_OP_COMPARE))
-		return "uses case-insensitive names";
-	return NULL;
+		return false;
+	return dentry->d_op->d_revalidate != fscrypt_d_revalidate;
 }
 
 /* branch validation, shared with dynlayer.c (no fs_context there) */
 int aufsng_check_layer(struct super_block *sb, const struct path *path,
 		    const char *name)
 {
-	const char *reason;
 	int err;
 
 	if (!d_is_dir(path->dentry)) {
 		pr_err("aufs: %s is not a directory\n", name);
 		return -ENOTDIR;
+	}
+	if (IS_CASEFOLDED(d_inode(path->dentry))) {
+		pr_err("aufs: %s uses case-insensitive names, not supported\n",
+		       name);
+		return -EINVAL;
 	}
 	err = aufsng_check_key(path->dentry);
 	if (!err && (path->dentry->d_flags & DCACHE_NOKEY_NAME))
@@ -330,9 +330,9 @@ int aufsng_check_layer(struct super_block *sb, const struct path *path,
 		       name);
 		return err;
 	}
-	reason = aufsng_reval_reason(path->dentry);
-	if (reason) {
-		pr_err("aufs: %s %s, not supported\n", name, reason);
+	if (aufsng_is_remote(path->dentry)) {
+		pr_err("aufs: %s is on a remote filesystem, not supported\n",
+		       name);
 		return -EINVAL;
 	}
 	if (path->mnt->mnt_sb->s_stack_depth >= sb->s_stack_depth) {

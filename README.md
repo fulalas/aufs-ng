@@ -75,8 +75,10 @@ in the kernel log. Layers may not overlap: one cannot be inside another.
 
 Layers must be on a local filesystem. NFS, CIFS and other network or
 FUSE filesystems are refused, except `fuseblk` (e.g. `ntfs-3g`).
-Case-insensitive (casefold) filesystems are not supported. An encrypted
-folder (fscrypt) inside a layer gives `ENOKEY` until its key is loaded.
+A case-insensitive folder (casefold, `chattr +F`) cannot be a layer; other
+folders of a filesystem with casefold enabled can. Such a folder inside a
+layer is not refused, but it is not supported either. An encrypted folder
+(fscrypt) inside a layer gives `ENOKEY` until its key is loaded.
 
 - `udba=` — whether to notice changes made directly inside a layer, behind
   the union's back. `reval` (the default) notices them; `none` trusts the

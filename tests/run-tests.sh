@@ -14,7 +14,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=138; PASS=0; FAIL=0
+	N=0; TOTAL=140; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -305,6 +305,18 @@ guest_main() {
 		$M aufs aufs $U2 "br:$W=rw:$L1=ro:$L1/dir=ro"
 	checkfail "duplicate branch rejected at mount" \
 		$M aufs aufs $U2 "br:$W=rw:$L1=ro:$L1=ro"
+	CI=/mnt/ci; mkdir -p $CI
+	$M tmpfs tmpfs $CI casefold
+	mkdir $CI/fold $CI/plain
+	chattr +F $CI/fold 2>/dev/null
+	echo folded > $CI/fold/Mixed
+	grep -qs folded $CI/fold/mixed || bad "precondition: casefold folder"
+	checkfail "case-insensitive folder rejected as a branch" \
+		$M aufs aufs $U2 "br:$CI/fold=rw"
+	check "plain folder of a casefold filesystem accepted as a branch" \
+		$M aufs aufs $U2 "br:$CI/plain=rw"
+	while $M -u $U2 2>/dev/null; do :; done
+	$M -u $CI
 	checkfail "add=2: rejected on remount" \
 		$M aufs aufs $U "add=2:$L3=rr" 32
 	check "union unharmed by rejected options" grep -q l1-file $U/dir/file
@@ -1056,12 +1068,13 @@ host_main() {
 	# without it the tmpfs branches cannot hold the copy-up marker and
 	# the identity checks fail for a reason that is not aufs-ng's.
 	"$KDIR/scripts/config" --file "$KDIR/.config" \
-		--enable TMPFS_XATTR || exit
-	for t in python3 getfattr setfattr truncate fallocate; do
+		--enable TMPFS_XATTR \
+		--enable UNICODE || exit
+	for t in python3 getfattr setfattr truncate fallocate chattr; do
 		command -v "$t" >/dev/null && continue
 		echo "run-tests: the guest runs on this host's root (hostfs) and" >&2
 		echo "run-tests: needs $t for some checks." >&2
-		echo "run-tests: install python3, attr and util-linux." >&2
+		echo "run-tests: install python3, attr, util-linux and e2fsprogs." >&2
 		exit 1
 	done
 	make -C "$KDIR" ARCH=um olddefconfig >/dev/null || exit
