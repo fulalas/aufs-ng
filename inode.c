@@ -23,10 +23,11 @@ static int aufsng_getattr(AUFSNG_IDMAP *idmap, const struct path *path,
 	struct path realpath;
 	int err;
 
-	aufsng_path_real(inode, &realpath);
+	aufsng_path_real_get(inode, &realpath);
 	old_cred = override_creds(pfs->creator_cred);
 	err = vfs_getattr(&realpath, stat, request_mask, flags);
 	revert_creds(old_cred);
+	aufsng_path_real_put(inode, &realpath);
 	if (err)
 		return err;
 
@@ -40,7 +41,7 @@ static int aufsng_getattr(AUFSNG_IDMAP *idmap, const struct path *path,
 		struct aufsng_entry *oe;
 		unsigned int i;
 
-		/* RCU: the root's superseded entry is freed after a grace period */
+		/* RCU: a directory's superseded entry is freed after a grace period */
 		rcu_read_lock();
 		oe = AUFSNG_I_E(inode);
 		i = aufsng_upperdentry(inode) ? 0 : 1;
@@ -142,10 +143,11 @@ static ssize_t aufsng_listxattr(struct dentry *dentry, char *list, size_t size)
 	char *from, *to, *end;
 	ssize_t res;
 
-	aufsng_path_real(inode, &realpath);
+	aufsng_path_real_get(inode, &realpath);
 	old_cred = override_creds(pfs->creator_cred);
 	res = vfs_listxattr(realpath.dentry, list, size);
 	revert_creds(old_cred);
+	aufsng_path_real_put(inode, &realpath);
 	/* A size probe may over-report; the VFS expects an upper bound */
 	if (res <= 0 || !list)
 		return res;
@@ -175,11 +177,12 @@ static int aufsng_xattr_get(const struct xattr_handler *handler,
 	if (aufsng_is_private_xattr(name))
 		return -ENODATA;
 
-	aufsng_path_real(inode, &realpath);
+	aufsng_path_real_get(inode, &realpath);
 	old_cred = override_creds(pfs->creator_cred);
 	res = vfs_getxattr(mnt_idmap(realpath.mnt), realpath.dentry, name,
 			   buffer, size);
 	revert_creds(old_cred);
+	aufsng_path_real_put(inode, &realpath);
 	return res;
 }
 

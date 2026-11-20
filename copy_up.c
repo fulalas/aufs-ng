@@ -477,29 +477,36 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 		return -ENOENT;
 
 	/*
-	 * The lower source is sampled without oi->lock: safe to READ (a
-	 * superseded stack stays parked until eviction) but not
-	 * guaranteed current, since a removal re-points the stack.  The
-	 * commit re-reads it under oi->lock and aborts with -ESTALE, so a
-	 * copy-up can never publish content from a removed branch.
+	 * The lower source is sampled without oi->lock: safe to READ (it
+	 * is referenced under RCU) but not guaranteed current, since a
+	 * removal re-points the stack.  The commit re-reads it under
+	 * oi->lock and aborts with -ESTALE, so a copy-up can never
+	 * publish content from a removed branch.
 	 */
+	rcu_read_lock();
 	oe = AUFSNG_I_E(inode);
-	if (!oe || !oe->numlower)
+	if (!oe || !oe->numlower) {
+		rcu_read_unlock();
 		return -ENOENT;
+	}
 	lowerpath.mnt = oe->lowerstack[0].mnt;
 	lowerpath.dentry = oe->lowerstack[0].dentry;
+	path_get(&lowerpath);
+	rcu_read_unlock();
 
 	err = vfs_getattr(&lowerpath, &stat,
 			  STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT);
 	if (err)
-		return err;
+		goto out_path;
 
 	/* the data-filled temp is built before any lock (see prep_regular) */
 	if (S_ISREG(stat.mode)) {
 		work = aufsng_copy_up_prep_regular(pfs, &lowerpath, pupper,
 						stat.size, &tmpq, tmpbuf);
-		if (IS_ERR(work))
-			return PTR_ERR(work);
+		if (IS_ERR(work)) {
+			err = PTR_ERR(work);
+			goto out_path;
+		}
 	}
 
 	/*
@@ -527,7 +534,10 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 	 * the data would come from the REMOVED branch.  Abort; the caller
 	 * retries against the new stack.
 	 */
-	if (AUFSNG_I_E(inode) != oe) {
+	oe = AUFSNG_I_E(inode);
+	if (!oe || !oe->numlower ||
+	    oe->lowerstack[0].dentry != lowerpath.dentry ||
+	    oe->lowerstack[0].mnt != lowerpath.mnt) {
 		err = -ESTALE;
 		goto out;
 	}
@@ -580,6 +590,8 @@ out_tmp:
 		dput(work);
 	}
 	release_dentry_name_snapshot(&ns);
+out_path:
+	path_put(&lowerpath);
 	return err;
 }
 

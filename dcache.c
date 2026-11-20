@@ -91,13 +91,32 @@ static bool aufsng_upper_carries_name(struct inode *dir, struct dentry *upper,
 	return same;
 }
 
+static int aufsng_lower_valid(struct inode *inode, unsigned int flags)
+{
+	struct aufsng_entry *oe;
+	struct dentry *lower;
+	int ret = 1;
+
+	rcu_read_lock();
+	oe = AUFSNG_I_E(inode);
+	if (oe && oe->numlower) {
+		lower = oe->lowerstack[0].dentry;
+		if (!aufsng_dentry_alive(lower))
+			ret = 0;
+		else if (aufsng_attrs_valid(inode, d_inode(lower), flags) < 0)
+			ret = -ECHILD;
+	}
+	rcu_read_unlock();
+	return ret;
+}
+
 static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
-			      struct dentry *dentry, unsigned int flags)
+			      struct dentry *dentry, struct inode *inode,
+			      unsigned int flags)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
-	struct inode *inode = d_inode(dentry);
 	struct dentry *upper = aufsng_upperdentry(inode);
-	struct aufsng_entry *oe = AUFSNG_I_E(inode);
+	struct aufsng_entry *oe;
 	struct aufsng_path origin = { NULL, NULL };
 	const struct cred *old_cred;
 	bool reval = aufsng_udba_reval(pfs);
@@ -129,13 +148,10 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 		if (!dir || aufsng_upper_carries_name(dir, upper, name))
 			return aufsng_attrs_valid(inode, d_inode(upper), flags);
 	}
-	if (reval && !upper && oe && oe->numlower) {
-		struct dentry *lower = oe->lowerstack[0].dentry;
-
-		if (!aufsng_dentry_alive(lower))
-			return 0;
-		if (aufsng_attrs_valid(inode, d_inode(lower), flags) < 0)
-			return -ECHILD;
+	if (reval && !upper) {
+		ret = aufsng_lower_valid(inode, flags);
+		if (ret <= 0)
+			return ret;
 	}
 
 	/*
@@ -164,6 +180,7 @@ static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
 
 	old_cred = override_creds(pfs->creator_cred);
 	percpu_down_read(&pfs->dyn_lock);
+	oe = AUFSNG_I_E(inode);
 
 	if (!stamp_hit && reval && pupper) {
 		this = aufsng_lookup_once(aufsng_upper_mnt(pfs), pupper, name,
@@ -254,6 +271,7 @@ static int aufsng_d_revalidate(struct inode *dir, const struct qstr *name,
 			    struct dentry *dentry, unsigned int flags)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
+	struct inode *inode;
 
 	/*
 	 * The root is never stale: its entry is swapped in place on a
@@ -286,7 +304,10 @@ static int aufsng_d_revalidate(struct inode *dir, const struct qstr *name,
 		return 1;
 	}
 
-	return aufsng_positive_valid(dir, name, dentry, flags);
+	inode = d_inode_rcu(dentry);
+	if (!inode)
+		return flags & LOOKUP_RCU ? -ECHILD : 0;
+	return aufsng_positive_valid(dir, name, dentry, inode, flags);
 }
 
 const struct dentry_operations aufsng_dentry_operations = {

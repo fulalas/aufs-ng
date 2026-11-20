@@ -86,8 +86,7 @@ struct aufsng_path {
 	 * The branch mount as captured when the entry was built.
 	 * Lockless readers must use this copy, never layer->mnt: a
 	 * removal blanks that (and a later add may reuse the slot) while
-	 * a parked stack is still being dereferenced.  The park pins the
-	 * vfsmount, so this stays valid until the inode is evicted.
+	 * a superseded stack is still being dereferenced.
 	 */
 	struct vfsmount *mnt;
 };
@@ -290,6 +289,26 @@ static inline void aufsng_path_real(struct inode *inode, struct path *path)
 	path->dentry = upper;
 }
 
+static inline void aufsng_path_real_get(struct inode *inode,
+					struct path *path)
+{
+	if (!S_ISDIR(inode->i_mode)) {
+		aufsng_path_real(inode, path);
+		return;
+	}
+	rcu_read_lock();
+	aufsng_path_real(inode, path);
+	path_get(path);
+	rcu_read_unlock();
+}
+
+static inline void aufsng_path_real_put(struct inode *inode,
+					struct path *path)
+{
+	if (S_ISDIR(inode->i_mode))
+		path_put(path);
+}
+
 /* aufsng_path_real() owns the lockless upper/stack read protocol */
 static inline struct inode *aufsng_inode_real(struct inode *inode)
 {
@@ -334,8 +353,10 @@ static inline void aufsng_copyattr_from(struct inode *inode,
 
 static inline void aufsng_copyattr(struct inode *inode)
 {
-	struct inode *real = aufsng_inode_real(inode);
+	struct inode *real;
 
+	rcu_read_lock();
+	real = aufsng_inode_real(inode);
 	/*
 	 * No real object at all: the upper is gone and the stack is
 	 * empty.  Nothing to mirror, and the union inode's attributes
@@ -343,6 +364,7 @@ static inline void aufsng_copyattr(struct inode *inode)
 	 */
 	if (real)
 		aufsng_copyattr_from(inode, real);
+	rcu_read_unlock();
 }
 
 /*

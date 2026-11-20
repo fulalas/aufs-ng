@@ -758,6 +758,18 @@ static int aufsng_rename_undo(struct aufsng_fs *pfs, struct dentry *oldupperdir,
 	return err;
 }
 
+static bool aufsng_has_lowers(struct inode *inode)
+{
+	struct aufsng_entry *oe;
+	bool ret;
+
+	rcu_read_lock();
+	oe = AUFSNG_I_E(inode);
+	ret = oe && oe->numlower;
+	rcu_read_unlock();
+	return ret;
+}
+
 int aufsng_rename(AUFSNG_IDMAP *idmap, struct inode *olddir,
 	       struct dentry *old, struct inode *newdir,
 	       struct dentry *new, unsigned int flags)
@@ -766,7 +778,6 @@ int aufsng_rename(AUFSNG_IDMAP *idmap, struct inode *olddir,
 	AUFSNG_IDMAP *upper_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	const struct cred *old_cred;
 	struct renamedata rd = {};
-	struct aufsng_entry *oe = AUFSNG_I_E(d_inode(old));
 	struct dentry *newupperdir, *oldupperdir, *oldupper;
 	/*
 	 * Rollback safety hinges on whether the upper rename destroyed
@@ -791,14 +802,13 @@ int aufsng_rename(AUFSNG_IDMAP *idmap, struct inode *olddir,
 	 * Renaming a still-merged directory would detach it from its
 	 * lower content; AUFS has no redirect either, so mv falls back.
 	 */
-	if (d_is_dir(old) && oe && oe->numlower)
+	if (d_is_dir(old) && aufsng_has_lowers(d_inode(old)))
 		return -EXDEV;
 	if (replace_dir) {
 		err = aufsng_check_empty_dir(new);
 		if (err)
 			return err;
-		oe = AUFSNG_I_E(d_inode(new));
-		if (oe && oe->numlower)
+		if (aufsng_has_lowers(d_inode(new)))
 			return -EXDEV;
 	}
 
@@ -830,16 +840,10 @@ int aufsng_rename(AUFSNG_IDMAP *idmap, struct inode *olddir,
 	 * branch's subtree for good.
 	 */
 	err = -EXDEV;
-	if (d_is_dir(old)) {
-		oe = AUFSNG_I_E(d_inode(old));
-		if (oe && oe->numlower)
-			goto out;
-	}
-	if (replace_dir) {
-		oe = AUFSNG_I_E(d_inode(new));
-		if (oe && oe->numlower)
-			goto out;
-	}
+	if (d_is_dir(old) && aufsng_has_lowers(d_inode(old)))
+		goto out;
+	if (replace_dir && aufsng_has_lowers(d_inode(new)))
+		goto out;
 
 	covered = aufsng_lower_covers(olddir, &old->d_name);
 	if (covered < 0) {
