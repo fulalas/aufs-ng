@@ -92,10 +92,10 @@ static bool aufsng_upper_carries_name(struct inode *dir, struct dentry *upper,
 }
 
 static int aufsng_positive_valid(struct inode *dir, const struct qstr *name,
-			      struct dentry *dentry, unsigned int flags)
+			      struct dentry *dentry, struct inode *inode,
+			      unsigned int flags)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
-	struct inode *inode = d_inode(dentry);
 	struct dentry *upper = aufsng_upperdentry(inode);
 	struct aufsng_entry *oe = AUFSNG_I_E(inode);
 	struct aufsng_path origin = { NULL, NULL };
@@ -254,6 +254,8 @@ static int aufsng_d_revalidate(struct inode *dir, const struct qstr *name,
 			    struct dentry *dentry, unsigned int flags)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
+	struct inode *inode;
+	int idx, ret;
 
 	/*
 	 * The root is never stale: its entry is swapped in place on a
@@ -286,7 +288,18 @@ static int aufsng_d_revalidate(struct inode *dir, const struct qstr *name,
 		return 1;
 	}
 
-	return aufsng_positive_valid(dir, name, dentry, flags);
+	/*
+	 * Read the inode once: an RCU walk can see the dentry turn
+	 * negative under it, so a second d_inode() may return NULL.  The
+	 * positive check reads the stack before dyn_lock: hold stack_srcu.
+	 */
+	inode = d_inode_rcu(dentry);
+	if (!inode)
+		return flags & LOOKUP_RCU ? -ECHILD : 0;
+	idx = aufsng_stack_lock(inode);
+	ret = aufsng_positive_valid(dir, name, dentry, inode, flags);
+	aufsng_stack_unlock(inode, idx);
+	return ret;
 }
 
 const struct dentry_operations aufsng_dentry_operations = {

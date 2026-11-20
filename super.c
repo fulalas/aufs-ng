@@ -272,6 +272,8 @@ static void aufsng_free_fs(struct aufsng_fs *pfs)
 	kvfree(pfs->layers);
 	/* safe on a never-initialized (kzalloc'd) lock, by design */
 	percpu_free_rwsem(&pfs->dyn_lock);
+	if (pfs->stack_srcu_ready)
+		cleanup_srcu_struct(&pfs->stack_srcu);
 	if (pfs->creator_cred)
 		put_cred(pfs->creator_cred);
 	kfree(pfs->config.xino_path);
@@ -461,6 +463,10 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 	err = percpu_init_rwsem(&pfs->dyn_lock);
 	if (err)
 		goto out_free;
+	err = init_srcu_struct(&pfs->stack_srcu);
+	if (err)
+		goto out_free;
+	pfs->stack_srcu_ready = true;
 	err = -ENOMEM;
 	atomic_long_set(&pfs->branch_gen, 0);
 	pfs->si_id = atomic_long_inc_return(&aufsng_si_last);

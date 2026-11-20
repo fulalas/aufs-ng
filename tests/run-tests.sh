@@ -14,7 +14,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=140; PASS=0; FAIL=0
+	N=0; TOTAL=142; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -848,6 +848,41 @@ time.sleep(60)' "$U/watchdir" "$ready2" & watch2=$!
 	$M aufs aufs $U "add=1:$L1=ro" 32 || bad "remount add (restore L1)"
 	rm -f $W/.wh.gonedir
 	rm -rf $L1/gonedir $L3/gonedir
+
+	echo "=== 36. a removed branch is released while a merged directory stays in use ==="
+	# A cwd keeps $U/dir in use across the add and the removal.  Its
+	# superseded stack must not keep the removed branch's mount: once
+	# the branch's own mount goes too, the filesystem must shut down
+	# (inotify reports IN_UNMOUNT on it), not linger until the
+	# directory is evicted - which on a root union is never.
+	L4=/mnt/l4; mkdir -p $L4; $M tmpfs tmpfs $L4
+	mkdir -p $L4/dir; echo l4 > $L4/dir/l4file; : > $L4/marker
+	ready=/tmp/aufsng-ready4.$$; gone=/tmp/aufsng-gone4.$$
+	python3 -c 'import ctypes,os,struct,sys
+libc=ctypes.CDLL(None, use_errno=True)
+fd=libc.inotify_init1(os.O_CLOEXEC)
+if fd < 0: raise OSError(ctypes.get_errno(), "inotify_init1")
+if libc.inotify_add_watch(fd, os.fsencode(sys.argv[1]), 0xfff) < 0:
+    raise OSError(ctypes.get_errno(), "inotify_add_watch")
+open(sys.argv[2], "w").close()
+while True:
+    b=os.read(fd, 4096); o=0
+    while o < len(b):
+        wd,mask,ck,ln=struct.unpack_from("iIII", b, o); o+=16+ln
+        if mask & 0x2000:
+            open(sys.argv[3], "w").close(); sys.exit(0)' "$L4/marker" "$ready" "$gone" & watch4=$!
+	wait_file "$ready" "$watch4" || bad "precondition: branch unmount watch did not start"
+	( cd $U/dir && exec sleep 60 ) & pin4=$!
+	$M aufs aufs $U "add=1:$L4=rr" 32 || bad "remount add (in-use directory)"
+	grep -q l4 $U/dir/l4file || bad "precondition: added branch visible in the in-use directory"
+	$M aufs aufs $U "del=$L4" 32 || bad "remount del (in-use directory)"
+	$M -u $L4
+	wait_file "$gone" "$watch4" \
+		&& ok "the removed branch shuts down while its merged directory stays in use" \
+		|| bad "the removed branch shuts down while its merged directory stays in use"
+	check "the in-use directory keeps its surviving content" grep -q l1-file $U/dir/file
+	kill "$pin4" "$watch4" 2>/dev/null; wait "$pin4" "$watch4" 2>/dev/null
+	rm -f "$ready" "$gone"
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.

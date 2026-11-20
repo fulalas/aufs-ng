@@ -293,7 +293,10 @@ static bool aufsng_entry_has_layer(struct aufsng_entry *oe,
 				const struct aufsng_layer *layer);
 static void aufsng_dyn_commit_rebuild(struct inode *inode,
 				   struct aufsng_entry *new_oe,
-				   struct aufsng_dyn_parked *parked);
+				   struct aufsng_dyn_parked *parked,
+				   struct aufsng_dyn_parked **retire);
+static void aufsng_dyn_retire_free(struct aufsng_fs *pfs,
+				struct aufsng_dyn_parked *retire);
 
 #define AUFSNG_RESOLVE_MAXDEPTH 64
 #define AUFSNG_MEMO_BITS 9
@@ -614,12 +617,13 @@ static void aufsng_dyn_drop_neg_children(struct inode *inode)
 /*
  * Splice @layer into every cached union directory in place, so pinned
  * directories show the new content at once - without an invalidation
- * that would detach nested mounts.  Under the root inode lock and
- * dyn_lock(write).
+ * that would detach nested mounts.  Superseded stacks go on @retire.
+ * Under the root inode lock and dyn_lock(write).
  */
 static void aufsng_dyn_splice_cached(struct aufsng_fs *pfs, struct super_block *sb,
 				  struct aufsng_layer *layer,
-				  struct inode *root_inode)
+				  struct inode *root_inode,
+				  struct aufsng_dyn_parked **retire)
 {
 	struct inode **dirs = NULL;
 	unsigned int ndirs = 0, i;
@@ -693,7 +697,7 @@ static void aufsng_dyn_splice_cached(struct aufsng_fs *pfs, struct super_block *
 			aufsng_free_entry(neu);
 			continue;
 		}
-		aufsng_dyn_commit_rebuild(dirs[i], neu, pk);
+		aufsng_dyn_commit_rebuild(dirs[i], neu, pk, retire);
 		aufsng_dyn_drop_neg_children(dirs[i]);
 	}
 
@@ -711,6 +715,7 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	struct aufsng_fs *pfs = AUFSNG_FS(sb);
 	struct inode *root_inode = aufsng_root_inode(sb);
 	struct aufsng_entry *old_oe, *new_oe, *cur_oe;
+	struct aufsng_dyn_parked *retire = NULL;
 	struct aufsng_layer *layer;
 	struct vfsmount *mnt;
 	char *dup_name;
@@ -794,7 +799,7 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	 */
 	old_oe = aufsng_dyn_swap_root(sb, new_oe);
 	aufsng_dyn_drop_neg_children(root_inode);
-	aufsng_dyn_splice_cached(pfs, sb, layer, root_inode);
+	aufsng_dyn_splice_cached(pfs, sb, layer, root_inode, &retire);
 	/* one re-check of every cached lower-only dentry (dcache.c) */
 	atomic_long_inc(&pfs->branch_gen);
 
@@ -812,6 +817,7 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	 */
 	synchronize_rcu_expedited();
 	aufsng_free_entry(old_oe);
+	aufsng_dyn_retire_free(pfs, retire);
 
 	pr_info("aufs (aufs-ng): branch '%s' added\n", name);
 	return 0;
@@ -1202,7 +1208,8 @@ out:
 
 static void aufsng_dyn_commit_rebuild(struct inode *inode,
 				  struct aufsng_entry *new_oe,
-				  struct aufsng_dyn_parked *parked)
+				  struct aufsng_dyn_parked *parked,
+				  struct aufsng_dyn_parked **retire)
 {
 	struct aufsng_inode *oi = AUFSNG_I(inode);
 	struct aufsng_entry *old_oe;
@@ -1233,8 +1240,44 @@ static void aufsng_dyn_commit_rebuild(struct inode *inode,
 	 */
 	aufsng_copyattr(inode);
 
-	aufsng_dyn_park_fill(oi, parked, old_oe, NULL, old_oe);
+	if (S_ISDIR(inode->i_mode)) {
+		/*
+		 * Retired, not parked: an in-use directory may never be
+		 * evicted, and a park would pin every branch in @old_oe -
+		 * a removed one included - until it is.  Freed once
+		 * stack_srcu shows no lockless reader can still hold it,
+		 * before the caller releases any branch.
+		 */
+		parked->oe = old_oe;
+		parked->upper = NULL;
+		parked->nr_mnts = 0;
+		parked->next = *retire;
+		*retire = parked;
+	} else {
+		aufsng_dyn_park_fill(oi, parked, old_oe, NULL, old_oe);
+	}
 	mutex_unlock(&oi->lock);
+}
+
+/*
+ * Free the directory stacks a branch change retired.  Only s_umount is
+ * held: synchronize_srcu() waits for readers that may themselves wait on
+ * dyn_lock, oi->lock or a directory's i_rwsem.  A removal calls this
+ * BEFORE releasing the branch - the stacks still hold its dentries.
+ */
+static void aufsng_dyn_retire_free(struct aufsng_fs *pfs,
+				struct aufsng_dyn_parked *retire)
+{
+	struct aufsng_dyn_parked *next;
+
+	if (!retire)
+		return;
+	synchronize_srcu(&pfs->stack_srcu);
+	for (; retire; retire = next) {
+		next = retire->next;
+		aufsng_free_entry(retire->oe);
+		kfree(retire);
+	}
 }
 
 void aufsng_dyn_put_parked(struct aufsng_inode *oi)
@@ -1343,6 +1386,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 	struct aufsng_entry *new_oe = NULL, *old_root_oe;
 	struct aufsng_entry **new_oes = NULL;
 	struct aufsng_dyn_parked **parked = NULL;
+	struct aufsng_dyn_parked *retire = NULL;
 	struct aufsng_layer *layer;
 	struct aufsng_dyn_scan scan = {};
 	u64 blocker_ino;
@@ -1504,7 +1548,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 	for (i = 0; i < scan.nr; i++) {
 		if (new_oes[i]) {
 			aufsng_dyn_commit_rebuild(scan.pinned[i], new_oes[i],
-					      parked[i]);
+					      parked[i], &retire);
 			/*
 			 * A removed branch's whiteout stops hiding the name
 			 * below it, so drop cached negatives whose "absent"
@@ -1542,9 +1586,10 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 	/* expedited for the same reason as on the add path (see there) */
 	synchronize_rcu_expedited();
 	aufsng_free_entry(old_root_oe);
+	aufsng_dyn_retire_free(pfs, retire);
 	/*
-	 * Only after the grace period: an RCU reader of the superseded
-	 * root stack may still be dereferencing this branch's dentries
+	 * Only after the grace periods: a reader of a superseded
+	 * stack may still be dereferencing this branch's dentries
 	 * and mount.  Slot reuse by a later add is safe for the same
 	 * reason - it cannot begin before this removal completes.
 	 */

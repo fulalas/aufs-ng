@@ -21,14 +21,16 @@ static int aufsng_getattr(AUFSNG_IDMAP *idmap, const struct path *path,
 	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
 	const struct cred *old_cred;
 	struct path realpath;
+	int idx;
 	int err;
 
+	idx = aufsng_stack_lock(inode);
 	aufsng_path_real(inode, &realpath);
 	old_cred = override_creds(pfs->creator_cred);
 	err = vfs_getattr(&realpath, stat, request_mask, flags);
 	revert_creds(old_cred);
 	if (err)
-		return err;
+		goto out;
 
 	stat->dev = inode->i_sb->s_dev;
 	stat->ino = inode->i_ino;
@@ -52,8 +54,9 @@ static int aufsng_getattr(AUFSNG_IDMAP *idmap, const struct path *path,
 		}
 		rcu_read_unlock();
 	}
-
-	return 0;
+out:
+	aufsng_stack_unlock(inode, idx);
+	return err;
 }
 
 static int aufsng_setattr(AUFSNG_IDMAP *idmap, struct dentry *dentry,
@@ -141,11 +144,14 @@ static ssize_t aufsng_listxattr(struct dentry *dentry, char *list, size_t size)
 	struct path realpath;
 	char *from, *to, *end;
 	ssize_t res;
+	int idx;
 
+	idx = aufsng_stack_lock(inode);
 	aufsng_path_real(inode, &realpath);
 	old_cred = override_creds(pfs->creator_cred);
 	res = vfs_listxattr(realpath.dentry, list, size);
 	revert_creds(old_cred);
+	aufsng_stack_unlock(inode, idx);
 	/* A size probe may over-report; the VFS expects an upper bound */
 	if (res <= 0 || !list)
 		return res;
@@ -170,16 +176,18 @@ static int aufsng_xattr_get(const struct xattr_handler *handler,
 	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
 	const struct cred *old_cred;
 	struct path realpath;
-	int res;
+	int res, idx;
 
 	if (aufsng_is_private_xattr(name))
 		return -ENODATA;
 
+	idx = aufsng_stack_lock(inode);
 	aufsng_path_real(inode, &realpath);
 	old_cred = override_creds(pfs->creator_cred);
 	res = vfs_getxattr(mnt_idmap(realpath.mnt), realpath.dentry, name,
 			   buffer, size);
 	revert_creds(old_cred);
+	aufsng_stack_unlock(inode, idx);
 	return res;
 }
 

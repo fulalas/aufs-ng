@@ -766,7 +766,7 @@ int aufsng_rename(AUFSNG_IDMAP *idmap, struct inode *olddir,
 	AUFSNG_IDMAP *upper_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	const struct cred *old_cred;
 	struct renamedata rd = {};
-	struct aufsng_entry *oe = AUFSNG_I_E(d_inode(old));
+	struct aufsng_entry *oe;
 	struct dentry *newupperdir, *oldupperdir, *oldupper;
 	/*
 	 * Rollback safety hinges on whether the upper rename destroyed
@@ -791,14 +791,13 @@ int aufsng_rename(AUFSNG_IDMAP *idmap, struct inode *olddir,
 	 * Renaming a still-merged directory would detach it from its
 	 * lower content; AUFS has no redirect either, so mv falls back.
 	 */
-	if (d_is_dir(old) && oe && oe->numlower)
+	if (d_is_dir(old) && aufsng_has_lowers(d_inode(old)))
 		return -EXDEV;
 	if (replace_dir) {
 		err = aufsng_check_empty_dir(new);
 		if (err)
 			return err;
-		oe = AUFSNG_I_E(d_inode(new));
-		if (oe && oe->numlower)
+		if (aufsng_has_lowers(d_inode(new)))
 			return -EXDEV;
 	}
 

@@ -477,8 +477,9 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 		return -ENOENT;
 
 	/*
-	 * The lower source is sampled without oi->lock: safe to READ (a
-	 * superseded stack stays parked until eviction) but not
+	 * The lower source is sampled without oi->lock: safe to READ (the
+	 * caller holds stack_srcu, and a non-directory's superseded stack
+	 * stays parked until eviction) but not
 	 * guaranteed current, since a removal re-points the stack.  The
 	 * commit re-reads it under oi->lock and aborts with -ESTALE, so a
 	 * copy-up can never publish content from a removed branch.
@@ -596,7 +597,7 @@ int aufsng_copy_up(struct dentry *dentry)
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
 	const struct cred *old_cred;
 	int retries = 0;
-	int err = 0;
+	int err = 0, idx;
 
 	old_cred = override_creds(pfs->creator_cred);
 
@@ -612,7 +613,9 @@ int aufsng_copy_up(struct dentry *dentry)
 			next = parent;
 		}
 
+		idx = aufsng_stack_lock(d_inode(next));
 		err = aufsng_copy_up_one(next);
+		aufsng_stack_unlock(d_inode(next), idx);
 		/*
 		 * -ESTALE: a removal re-pointed the source stack mid-copy.
 		 * The retry copies the survivor.

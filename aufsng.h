@@ -18,6 +18,7 @@
 #include <linux/dcache.h>
 #include <linux/cred.h>
 #include <linux/percpu-rwsem.h>
+#include <linux/srcu.h>
 #include <linux/atomic.h>
 #include <linux/mutex.h>
 #include <linux/limits.h>
@@ -86,16 +87,20 @@ struct aufsng_path {
 	 * The branch mount as captured when the entry was built.
 	 * Lockless readers must use this copy, never layer->mnt: a
 	 * removal blanks that (and a later add may reuse the slot) while
-	 * a parked stack is still being dereferenced.  The park pins the
-	 * vfsmount, so this stays valid until the inode is evicted.
+	 * a superseded stack is still being dereferenced.  The branch is
+	 * released only after every superseded stack that references it
+	 * is gone (see stack_srcu), so this stays valid as long as the
+	 * stack does.
 	 */
 	struct vfsmount *mnt;
 };
 
 /*
  * Lower branch stack of a dentry/inode, top priority first.  Swapped
- * under RCU by branch changes; readers hold rcu_read_lock() or
- * dyn_lock.
+ * by branch changes; readers hold dyn_lock or the inode's oi->lock.  A
+ * lockless reader that may sleep holds stack_srcu, which covers the
+ * superseded stacks of directories; a non-directory's stays parked
+ * until eviction, and the root's is freed after an RCU grace period.
  */
 struct aufsng_entry {
 	unsigned int numlower;
@@ -140,6 +145,15 @@ struct aufsng_fs {
 	 * period.
 	 */
 	struct percpu_rw_semaphore dyn_lock;
+	/*
+	 * A branch change frees the superseded stack of every in-use
+	 * directory after a grace period of this SRCU.  Parking it until
+	 * eviction instead kept the removed branch mounted for as long as
+	 * the directory stayed in use - for /usr on a root union, until
+	 * reboot, with the branch's loop device and backing file held.
+	 */
+	struct srcu_struct stack_srcu;
+	bool stack_srcu_ready;
 	struct backing_file_ctx backing_ctx;
 	struct aufsng_config config;
 	/* long, as statfs's f_namelen and aufsng_probe_namelen() both are */
@@ -164,6 +178,17 @@ struct aufsng_inode {
 static inline struct aufsng_fs *AUFSNG_FS(struct super_block *sb)
 {
 	return sb->s_fs_info;
+}
+
+/* Hold across a lockless use of a directory's stack (see stack_srcu) */
+static inline int aufsng_stack_lock(struct inode *inode)
+{
+	return srcu_read_lock(&AUFSNG_FS(inode->i_sb)->stack_srcu);
+}
+
+static inline void aufsng_stack_unlock(struct inode *inode, int idx)
+{
+	srcu_read_unlock(&AUFSNG_FS(inode->i_sb)->stack_srcu, idx);
 }
 
 /*
@@ -334,6 +359,7 @@ static inline void aufsng_copyattr_from(struct inode *inode,
 
 static inline void aufsng_copyattr(struct inode *inode)
 {
+	int idx = aufsng_stack_lock(inode);
 	struct inode *real = aufsng_inode_real(inode);
 
 	/*
@@ -343,6 +369,18 @@ static inline void aufsng_copyattr(struct inode *inode)
 	 */
 	if (real)
 		aufsng_copyattr_from(inode, real);
+	aufsng_stack_unlock(inode, idx);
+}
+
+/* Does @inode merge any lower branch?  A one-shot unlocked check. */
+static inline bool aufsng_has_lowers(struct inode *inode)
+{
+	int idx = aufsng_stack_lock(inode);
+	struct aufsng_entry *oe = AUFSNG_I_E(inode);
+	bool ret = oe && oe->numlower;
+
+	aufsng_stack_unlock(inode, idx);
+	return ret;
 }
 
 /*
@@ -416,7 +454,9 @@ static inline u64 aufsng_map_ino(u64 ino, unsigned int idx)
 /*
  * A stack superseded by a branch change or a replaced upper, kept
  * until the inode is evicted: an operation that resolved a path
- * before the change may still hold pointers into it.
+ * before the change may still hold pointers into it.  A directory's
+ * superseded stack uses the same node to wait out stack_srcu instead,
+ * on a branch change's retire list (see aufsng_dyn_retire_free()).
  */
 struct aufsng_dyn_parked {
 	struct aufsng_dyn_parked *next;
