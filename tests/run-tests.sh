@@ -14,7 +14,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=142; PASS=0; FAIL=0
+	N=0; TOTAL=157; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -883,6 +883,70 @@ while True:
 	kill "$pin4" "$watch4" 2>/dev/null; wait "$pin4" "$watch4" 2>/dev/null
 	rm -f "$ready" "$gone" "$pinned"
 
+	echo "=== 37. POSIX ACLs of a branch are enforced and kept ==="
+	AW=/mnt/aw; AL=/mnt/al; AU=/mnt/au
+	mkdir -p $AW $AL $AU
+	$M tmpfs tmpfs $AW; $M tmpfs tmpfs $AL
+	chmod 755 $AW $AL
+	as_u() { setpriv --reuid=12345 --regid=23456 --clear-groups "$@"; }
+	nacl() { getfacl -cn "$1" 2>/dev/null | grep -c "^$2"; }
+	echo secret > $AL/deny; chown 0:23456 $AL/deny; chmod 600 $AL/deny
+	setfacl -m g::---,u:54321:r-- $AL/deny || bad "precondition: ACL on a branch file"
+	echo shared > $AL/grant; chmod 600 $AL/grant
+	setfacl -m u:12345:r-- $AL/grant
+	mkdir $AL/inherit; setfacl -d -m u:12345:rwx $AL/inherit
+	mkdir $AL/dflt $AW/dflt; echo plain > $AL/dflt/f
+	setfacl -d -m u:54321:rwx $AW/dflt
+	$M aufs aufs $AU "br:$AW=rw:$AL=ro" || bad "precondition: ACL union mount"
+	checkfail "a group denied by a branch ACL cannot read through the union" \
+		as_u cat $AU/deny
+	check "a user granted by a branch ACL can read through the union" \
+		as_u cat $AU/grant
+	[ "$(nacl $AU/grant user:12345:)" = 1 ] \
+		&& ok "getfacl through the union shows the branch ACL" \
+		|| bad "getfacl through the union shows the branch ACL"
+	check "a listed ACL xattr can be read through the union" \
+		getfattr -n system.posix_acl_access $AU/grant
+	check "setfacl through the union succeeds" setfacl -m u:12345:rw- $AU/grant
+	[ "$(nacl $AW/grant user:12345:rw-)" = 1 ] \
+		&& ok "setfacl through the union lands in the rw branch" \
+		|| bad "setfacl through the union lands in the rw branch"
+	setfacl -b $AU/grant
+	[ "$(nacl $AW/grant "user:[0-9]")" = 0 ] \
+		&& ok "setfacl -b through the union removes the ACL" \
+		|| bad "setfacl -b through the union removes the ACL"
+	touch $AU/deny
+	[ "$(nacl $AW/deny user:54321:)" = 1 ] \
+		&& ok "copy-up keeps the ACL" || bad "copy-up keeps the ACL"
+	checkfail "a group denied by an ACL still cannot read after copy-up" \
+		as_u cat $AU/deny
+	touch $AU/inherit/new
+	[ "$(nacl $AW/inherit/new user:12345:)" = 1 ] \
+		&& ok "a new file inherits a default ACL copied up from a branch" \
+		|| bad "a new file inherits a default ACL copied up from a branch"
+	touch $AU/dflt/f
+	test -f $AW/dflt/f || bad "precondition: copy-up into a folder with a default ACL"
+	[ "$(nacl $AW/dflt/f user:54321:)" = 0 ] \
+		&& ok "copy-up does not take the rw folder's default ACL" \
+		|| bad "copy-up does not take the rw folder's default ACL"
+	( umask 027; : > $AU/umfile; mkdir $AU/umdir )
+	[ "$(stat -c %a $AU/umfile 2>/dev/null)" = 640 ] \
+		&& ok "umask applies to a new file" \
+		|| bad "umask applies to a new file (mode $(stat -c %a $AU/umfile 2>/dev/null))"
+	[ "$(stat -c %a $AU/umdir 2>/dev/null)" = 750 ] \
+		&& ok "umask applies to a new folder" \
+		|| bad "umask applies to a new folder (mode $(stat -c %a $AU/umdir 2>/dev/null))"
+	$M -u $AU; $M -u $AW
+	$M ramfs ramfs $AW; chmod 755 $AW
+	$M aufs aufs $AU "br:$AW=rw:$AL=ro" || bad "precondition: union on a rw branch without ACLs"
+	touch $AU/deny
+	[ "$(stat -c %a $AW/deny 2>/dev/null)" = 600 ] \
+		&& ok "copy-up to a branch without ACLs cuts the group bits" \
+		|| bad "copy-up to a branch without ACLs cuts the group bits (mode $(stat -c %a $AW/deny 2>/dev/null))"
+	checkfail "a group denied by an ACL still cannot read after a copy-up that drops it" \
+		as_u cat $AU/deny
+	$M -u $AU; $M -u $AW; $M -u $AL
+
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.
 	if [ "$N" != "$TOTAL" ]; then
@@ -1103,12 +1167,13 @@ host_main() {
 	# the identity checks fail for a reason that is not aufs-ng's.
 	"$KDIR/scripts/config" --file "$KDIR/.config" \
 		--enable TMPFS_XATTR \
+		--enable TMPFS_POSIX_ACL \
 		--enable UNICODE || exit
-	for t in python3 getfattr setfattr truncate fallocate chattr; do
+	for t in python3 getfattr setfattr setfacl getfacl truncate fallocate setpriv chattr; do
 		command -v "$t" >/dev/null && continue
 		echo "run-tests: the guest runs on this host's root (hostfs) and" >&2
 		echo "run-tests: needs $t for some checks." >&2
-		echo "run-tests: install python3, attr, util-linux and e2fsprogs." >&2
+		echo "run-tests: install python3, attr, acl, util-linux and e2fsprogs." >&2
 		exit 1
 	done
 	make -C "$KDIR" ARCH=um olddefconfig >/dev/null || exit

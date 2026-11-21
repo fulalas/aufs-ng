@@ -14,6 +14,8 @@
 #include <linux/cred.h>
 #include <linux/slab.h>
 #include <linux/xattr.h>
+#include <linux/posix_acl.h>
+#include <linux/posix_acl_xattr.h>
 #include <linux/uio.h>
 #include <linux/atomic.h>
 #include "aufsng.h"
@@ -37,14 +39,76 @@ static void aufsng_discard_tmp(struct aufsng_fs *pfs, struct dentry *pupper,
 	}
 }
 
+static umode_t aufsng_acl_group_mask(const struct posix_acl *acl)
+{
+	unsigned int i;
+
+	for (i = 0; i < acl->a_count; i++)
+		if (acl->a_entries[i].e_tag == ACL_GROUP_OBJ)
+			return ~S_IRWXG | (acl->a_entries[i].e_perm << 3);
+	return ~S_IRWXG;
+}
+
+static int aufsng_copy_acl(struct aufsng_fs *pfs, const struct path *oldpath,
+			   struct dentry *new, int type, umode_t *mode)
+{
+	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	const char *name = posix_acl_xattr_name(type);
+	struct posix_acl *acl, *clone;
+	int err;
+
+	acl = aufsng_get_acl_path(oldpath, type, false);
+	if (IS_ERR(acl))
+		return PTR_ERR(acl);
+	if (!acl) {
+		acl = get_inode_acl(d_inode(new->d_parent), ACL_TYPE_DEFAULT);
+		if (!acl)
+			return 0;
+		if (!IS_ERR(acl))
+			posix_acl_release(acl);
+		err = vfs_remove_acl(idmap, new, name);
+		return err == -ENODATA || err == -EOPNOTSUPP ? 0 : err;
+	}
+
+	clone = posix_acl_clone(acl, GFP_KERNEL);
+	posix_acl_release(acl);
+	if (!clone)
+		return -ENOMEM;
+	err = vfs_set_acl(idmap, new, name, clone);
+	if (err == -EOPNOTSUPP || err == -EPERM) {
+		if (type == ACL_TYPE_ACCESS)
+			*mode &= aufsng_acl_group_mask(clone);
+		err = 0;
+	}
+	posix_acl_release(clone);
+	return err;
+}
+
+static int aufsng_copy_acls(struct aufsng_fs *pfs, const struct path *oldpath,
+			    struct dentry *new, umode_t *mode)
+{
+	int err;
+
+	if (!IS_ENABLED(CONFIG_FS_POSIX_ACL))
+		return 0;
+	err = aufsng_copy_acl(pfs, oldpath, new, ACL_TYPE_ACCESS, mode);
+	if (!err && d_is_dir(new))
+		err = aufsng_copy_acl(pfs, oldpath, new, ACL_TYPE_DEFAULT, mode);
+	return err;
+}
+
 static int aufsng_copy_xattr(struct aufsng_fs *pfs, const struct path *oldpath,
-			  struct dentry *new)
+			  struct dentry *new, umode_t *mode)
 {
 	AUFSNG_IDMAP *old_idmap = mnt_idmap(oldpath->mnt);
 	AUFSNG_IDMAP *new_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	ssize_t list_size, size, value_size = 0;
 	char *buf, *name, *value = NULL;
-	int err = 0;
+	int err;
+
+	err = aufsng_copy_acls(pfs, oldpath, new, mode);
+	if (err)
+		return err;
 
 	list_size = vfs_listxattr(oldpath->dentry, NULL, 0);
 	if (list_size <= 0)
@@ -63,7 +127,7 @@ static int aufsng_copy_xattr(struct aufsng_fs *pfs, const struct path *oldpath,
 	for (name = buf; list_size;
 	     list_size -= strlen(name) + 1, name += strlen(name) + 1) {
 		/* our own bookkeeping is never inherited; the commit sets it */
-		if (aufsng_is_private_xattr(name))
+		if (aufsng_is_private_xattr(name) || is_posix_acl_xattr(name))
 			continue;
 retry:
 		size = vfs_getxattr(old_idmap, oldpath->dentry, name, value,
@@ -313,7 +377,7 @@ static int aufsng_copy_up_commit_regular(struct aufsng_fs *pfs,
 	err = vfs_getattr(lowerpath, &stat,
 			  STATX_BASIC_STATS, AT_STATX_SYNC_AS_STAT);
 	if (!err)
-		err = aufsng_copy_xattr(pfs, lowerpath, work);
+		err = aufsng_copy_xattr(pfs, lowerpath, work, &stat.mode);
 	if (!err)
 		err = aufsng_set_attr_from(pfs, work, &stat);
 	if (err)
@@ -361,7 +425,7 @@ static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 					  const struct qstr *name,
 					  const struct path *lowerpath,
 					  struct dentry *pupper,
-					  const struct kstat *stat)
+					  struct kstat *stat)
 {
 	AUFSNG_IDMAP *idmap = mnt_idmap(aufsng_upper_mnt(pfs));
 	struct dentry *slot, *upper = NULL;
@@ -409,7 +473,7 @@ static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 	end_dirop(slot);
 	do_delayed_call(&done);
 
-	err = aufsng_copy_xattr(pfs, lowerpath, upper);
+	err = aufsng_copy_xattr(pfs, lowerpath, upper, &stat->mode);
 	if (!err)
 		err = aufsng_set_attr_from(pfs, upper, stat);
 	/* Directories are keyed by their merged stack; a marker is never read */

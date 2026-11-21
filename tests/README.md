@@ -13,8 +13,9 @@ tests/run-tests.sh
 
 No root is required. The guest runs on your own root (via hostfs), so
 it needs `python3`, the `attr` package (`getfattr`/`setfattr`) for the
-inode-identity checks, `util-linux` (`truncate`/`fallocate`) for the
-set-id checks, and `e2fsprogs` (`chattr`) for the casefold checks; the
+inode-identity checks, `acl` (`setfacl`/`getfacl`) for the ACL checks,
+`util-linux` (`truncate`/`fallocate`/`setpriv`) for the set-id and ACL
+checks, and `e2fsprogs` (`chattr`) for the casefold checks; the
 script says so and stops if any is missing.
 
 The kernel source tree is looked for as `linux-*/` first in `tests/`,

@@ -9,6 +9,8 @@
 #include <linux/mount.h>
 #include <linux/cred.h>
 #include <linux/xattr.h>
+#include <linux/posix_acl.h>
+#include <linux/posix_acl_xattr.h>
 #include <linux/stat.h>
 #include <linux/rcupdate.h>
 #include "aufsng.h"
@@ -239,6 +241,157 @@ const struct xattr_handler * const aufsng_xattr_handlers[] = {
 	NULL,
 };
 
+#ifdef CONFIG_FS_POSIX_ACL
+static void aufsng_idmap_acl(struct inode *realinode, AUFSNG_IDMAP *idmap,
+			     struct posix_acl *acl)
+{
+	struct user_namespace *fs_userns = i_user_ns(realinode);
+	unsigned int i;
+
+	for (i = 0; i < acl->a_count; i++) {
+		struct posix_acl_entry *e = &acl->a_entries[i];
+
+		if (e->e_tag == ACL_USER)
+			e->e_uid = vfsuid_into_kuid(make_vfsuid(idmap, fs_userns,
+								e->e_uid));
+		else if (e->e_tag == ACL_GROUP)
+			e->e_gid = vfsgid_into_kgid(make_vfsgid(idmap, fs_userns,
+								e->e_gid));
+	}
+}
+
+struct posix_acl *aufsng_get_acl_path(const struct path *path, int type,
+				      bool noperm)
+{
+	struct inode *realinode = d_inode(path->dentry);
+	struct posix_acl *acl, *clone;
+
+	if (noperm)
+		acl = get_inode_acl(realinode, type);
+	else
+		acl = vfs_get_acl(mnt_idmap(path->mnt), path->dentry,
+				  posix_acl_xattr_name(type));
+	if (acl == ERR_PTR(-ENODATA) || acl == ERR_PTR(-EOPNOTSUPP))
+		return NULL;
+	if (IS_ERR_OR_NULL(acl) || !is_idmapped_mnt(path->mnt))
+		return acl;
+
+	clone = posix_acl_clone(acl, GFP_KERNEL);
+	posix_acl_release(acl);
+	if (!clone)
+		return ERR_PTR(-ENOMEM);
+	aufsng_idmap_acl(realinode, mnt_idmap(path->mnt), clone);
+	return clone;
+}
+
+static struct posix_acl *aufsng_do_get_acl(struct inode *inode, int type,
+					   bool noperm)
+{
+	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
+	const struct cred *old_cred;
+	struct posix_acl *acl = NULL;
+	struct path realpath;
+
+	aufsng_path_real_get(inode, &realpath);
+	if (realpath.dentry) {
+		old_cred = override_creds(pfs->creator_cred);
+		acl = aufsng_get_acl_path(&realpath, type, noperm);
+		revert_creds(old_cred);
+	}
+	aufsng_path_real_put(inode, &realpath);
+	return acl;
+}
+
+static struct posix_acl *aufsng_get_inode_acl(struct inode *inode, int type,
+					      bool rcu)
+{
+	struct inode *realinode;
+	struct path realpath;
+
+	if (!rcu)
+		return aufsng_do_get_acl(inode, type, true);
+
+	aufsng_path_real(inode, &realpath);
+	realinode = realpath.dentry ? d_inode_rcu(realpath.dentry) : NULL;
+	if (!realinode)
+		return ERR_PTR(-ECHILD);
+	if (!IS_POSIXACL(realinode))
+		return NULL;
+	if (is_idmapped_mnt(realpath.mnt))
+		return ERR_PTR(-ECHILD);
+	return get_cached_acl_rcu(realinode, type);
+}
+
+static struct posix_acl *aufsng_get_acl(AUFSNG_IDMAP *idmap,
+					struct dentry *dentry, int type)
+{
+	return aufsng_do_get_acl(d_inode(dentry), type, false);
+}
+
+static int aufsng_set_acl(AUFSNG_IDMAP *idmap, struct dentry *dentry,
+			  struct posix_acl *acl, int type)
+{
+	struct inode *inode = d_inode(dentry);
+	struct aufsng_fs *pfs = AUFSNG_FS(inode->i_sb);
+	AUFSNG_IDMAP *upper_idmap = mnt_idmap(aufsng_upper_mnt(pfs));
+	const char *name = posix_acl_xattr_name(type);
+	const struct cred *old_cred;
+	struct dentry *upper;
+	bool kill_sgid;
+	int err;
+
+	if (!IS_POSIXACL(d_inode(aufsng_upper_mnt(pfs)->mnt_root)))
+		return -EOPNOTSUPP;
+
+	if (!acl && !aufsng_upperdentry(inode)) {
+		struct posix_acl *real = aufsng_do_get_acl(inode, type, false);
+
+		if (IS_ERR(real))
+			return PTR_ERR(real);
+		if (!real)
+			return -ENODATA;
+		posix_acl_release(real);
+	}
+
+	kill_sgid = type == ACL_TYPE_ACCESS && (inode->i_mode & S_ISGID) &&
+		    !in_group_or_capable(idmap, inode,
+					 i_gid_into_vfsgid(idmap, inode));
+
+	upper = aufsng_copy_up_upper(dentry);
+	if (IS_ERR(upper))
+		return PTR_ERR(upper);
+
+	err = mnt_want_write(aufsng_upper_mnt(pfs));
+	if (err) {
+		dput(upper);
+		return err;
+	}
+
+	old_cred = override_creds(pfs->creator_cred);
+	if (acl)
+		err = vfs_set_acl(upper_idmap, upper, name, acl);
+	else
+		err = vfs_remove_acl(upper_idmap, upper, name);
+	revert_creds(old_cred);
+
+	if (!err)
+		aufsng_copyattr_from(inode, d_inode(upper));
+
+	mnt_drop_write(aufsng_upper_mnt(pfs));
+	dput(upper);
+	if (!err && kill_sgid) {
+		struct iattr attr = { .ia_valid = ATTR_KILL_SGID };
+
+		err = aufsng_setattr(&nop_mnt_idmap, dentry, &attr);
+	}
+	return err;
+}
+#else
+#define aufsng_get_inode_acl	NULL
+#define aufsng_get_acl		NULL
+#define aufsng_set_acl		NULL
+#endif
+
 const struct inode_operations aufsng_dir_inode_operations = {
 	.lookup		= aufsng_lookup,
 	.create		= aufsng_create,
@@ -252,12 +405,18 @@ const struct inode_operations aufsng_dir_inode_operations = {
 	.getattr	= aufsng_getattr,
 	.setattr	= aufsng_setattr,
 	.listxattr	= aufsng_listxattr,
+	.get_inode_acl	= aufsng_get_inode_acl,
+	.get_acl	= aufsng_get_acl,
+	.set_acl	= aufsng_set_acl,
 };
 
 const struct inode_operations aufsng_file_inode_operations = {
 	.getattr	= aufsng_getattr,
 	.setattr	= aufsng_setattr,
 	.listxattr	= aufsng_listxattr,
+	.get_inode_acl	= aufsng_get_inode_acl,
+	.get_acl	= aufsng_get_acl,
+	.set_acl	= aufsng_set_acl,
 };
 
 const struct inode_operations aufsng_symlink_inode_operations = {
@@ -271,4 +430,7 @@ const struct inode_operations aufsng_special_inode_operations = {
 	.getattr	= aufsng_getattr,
 	.setattr	= aufsng_setattr,
 	.listxattr	= aufsng_listxattr,
+	.get_inode_acl	= aufsng_get_inode_acl,
+	.get_acl	= aufsng_get_acl,
+	.set_acl	= aufsng_set_acl,
 };

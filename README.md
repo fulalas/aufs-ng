@@ -127,6 +127,12 @@ A writable layer that cannot store xattrs still works. Copied files just get
 a new inode number once the kernel drops them from its cache, and the log
 says so once. (`OverlayFS` refuses to mount at all.)
 
+POSIX ACLs on a layer are enforced through the union, kept when a file is
+copied, and can be changed with `setfacl` when the writable layer supports
+them. When the writable layer cannot store ACLs, a copied file loses its
+ACL, and its group permission is cut to what the ACL gave the owning group,
+so the copy never grants more than the original.
+
 ## Trade-offs
 
 This is new code, not a driver hardened by two decades of real-world use.

@@ -348,6 +348,16 @@ static inline void aufsng_copyattr_from(struct inode *inode,
 	inode_set_ctime_to_ts(inode, inode_get_ctime(realinode));
 	i_size_write(inode, i_size_read(realinode));
 	set_nlink(inode, realinode->i_nlink);
+#ifdef CONFIG_FS_POSIX_ACL
+	{
+		struct posix_acl *acl = NULL;
+
+		if (IS_POSIXACL(realinode) && !S_ISLNK(realinode->i_mode))
+			acl = ACL_DONT_CACHE;
+		WRITE_ONCE(inode->i_acl, acl);
+		WRITE_ONCE(inode->i_default_acl, acl);
+	}
+#endif
 	spin_unlock(&inode->i_lock);
 }
 
@@ -566,6 +576,8 @@ extern const struct inode_operations aufsng_file_inode_operations;
 extern const struct inode_operations aufsng_symlink_inode_operations;
 extern const struct inode_operations aufsng_special_inode_operations;
 extern const struct xattr_handler * const aufsng_xattr_handlers[];
+struct posix_acl *aufsng_get_acl_path(const struct path *path, int type,
+				      bool noperm);
 
 /* copy_up.c */
 int aufsng_copy_up(struct dentry *dentry);

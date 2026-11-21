@@ -534,6 +534,8 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_op = &aufsng_super_operations;
 	set_default_d_op(sb, &aufsng_dentry_operations);
 	sb->s_xattr = aufsng_xattr_handlers;
+	if (IS_ENABLED(CONFIG_FS_POSIX_ACL))
+		sb->s_flags |= SB_POSIXACL;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_time_gran = ctx->br[0].path.dentry->d_sb->s_time_gran;
 
