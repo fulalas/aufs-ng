@@ -47,7 +47,9 @@ benchmarks.
   table to write.
 - **Copy-up** — `aufs` copies file data through a page-at-a-time
   buffer; `aufs-ng` moves it with in-kernel splice, faster for large
-  files.
+  files. Holes in sparse files stay holes when the lower filesystem
+  reports them, and when both layers sit on the same btrfs or XFS
+  filesystem the copy shares the data blocks.
 
 **RAM**
 

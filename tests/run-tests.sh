@@ -14,7 +14,7 @@ guest_main() {
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
 
-	N=0; TOTAL=157; PASS=0; FAIL=0
+	N=0; TOTAL=162; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -946,6 +946,33 @@ while True:
 	checkfail "a group denied by an ACL still cannot read after a copy-up that drops it" \
 		as_u cat $AU/deny
 	$M -u $AU; $M -u $AW; $M -u $AL
+
+	echo "=== 38. copy-up of a sparse file keeps its holes ==="
+	SL=/mnt/spl; SW=/mnt/spw; SU=/mnt/spu
+	mkdir -p $SL $SW $SU
+	$M tmpfs tmpfs $SL; $M tmpfs tmpfs $SW "size=1m"
+	truncate -s 64M $SL/sparse $SL/empty $SL/tail
+	printf data | dd of=$SL/sparse bs=4k seek=8192 conv=notrunc status=none
+	printf data | dd of=$SL/tail bs=4k seek=16383 conv=notrunc status=none
+	$M aufs aufs $SU "br:$SW=rw:$SL=ro" || bad "precondition: sparse union mount"
+	check "copy-up of a sparse file larger than the rw branch succeeds" \
+		touch $SU/sparse
+	b=$(stat -c %b $SW/sparse 2>/dev/null)
+	[ "$b" -le 64 ] 2>/dev/null \
+		&& ok "sparse copy-up writes only the data" \
+		|| bad "sparse copy-up writes only the data ($b blocks)"
+	check "sparse copy-up keeps size and data" cmp -s $SW/sparse $SL/sparse
+	touch $SU/empty
+	b=$(stat -c %s:%b $SW/empty 2>/dev/null)
+	[ "$b" = 67108864:0 ] \
+		&& ok "copy-up of a file that is all hole keeps its size" \
+		|| bad "copy-up of a file that is all hole keeps its size ($b)"
+	touch $SU/tail
+	b=$(stat -c %b $SW/tail 2>/dev/null)
+	cmp -s $SW/tail $SL/tail && [ "$b" -le 64 ] 2>/dev/null \
+		&& ok "copy-up of a file with data after a hole up to its end" \
+		|| bad "copy-up of a file with data after a hole up to its end ($b blocks)"
+	$M -u $SU; $M -u $SW; $M -u $SL
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.

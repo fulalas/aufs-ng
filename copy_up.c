@@ -321,6 +321,27 @@ static void aufsng_copy_fileattr(struct aufsng_fs *pfs,
 			     err);
 }
 
+static int aufsng_set_size(struct aufsng_fs *pfs, struct dentry *upper,
+			   loff_t size)
+{
+	struct vfsmount *mnt = aufsng_upper_mnt(pfs);
+	struct iattr attr = {
+		.ia_valid = ATTR_SIZE,
+		.ia_size = size,
+	};
+	int err;
+
+	err = mnt_want_write(mnt);
+	if (err)
+		return err;
+	inode_lock(d_inode(upper));
+	err = notify_change(mnt_idmap(mnt), upper, &attr, NULL);
+	inode_unlock(d_inode(upper));
+	mnt_drop_write(mnt);
+
+	return err;
+}
+
 static int aufsng_copy_data(struct aufsng_fs *pfs, const struct path *lowerpath,
 			 struct dentry *work, loff_t len)
 {
@@ -329,8 +350,11 @@ static int aufsng_copy_data(struct aufsng_fs *pfs, const struct path *lowerpath,
 		.dentry = work,
 	};
 	struct file *in, *out;
-	loff_t pos_in = 0, pos_out = 0;
+	loff_t pos = 0, end = 0;
 	int err = 0;
+
+	if (!len)
+		return 0;
 
 	in = kernel_file_open(lowerpath, O_RDONLY | O_LARGEFILE,
 			      pfs->creator_cred);
@@ -343,6 +367,9 @@ static int aufsng_copy_data(struct aufsng_fs *pfs, const struct path *lowerpath,
 		return PTR_ERR(out);
 	}
 
+	if (vfs_clone_file_range(in, 0, out, 0, len, 0) == len)
+		goto out;
+
 	/*
 	 * COPY_FILE_SPLICE lets the VFS handle the cross-sb case, falling
 	 * back to an in-kernel splice - no bounce buffer, and the policy
@@ -350,18 +377,37 @@ static int aufsng_copy_data(struct aufsng_fs *pfs, const struct path *lowerpath,
 	 * the copy-up + rename pair has no crash consistency anyway, and
 	 * flushing would serialize every copy-up on the device.
 	 */
-	while (pos_in < len) {
-		ssize_t bytes = vfs_copy_file_range(in, pos_in, out, pos_out,
-						    len - pos_in,
-						    COPY_FILE_SPLICE);
+	while (pos < len) {
+		ssize_t bytes;
+
+		if (pos >= end) {
+			loff_t data = vfs_llseek(in, pos, SEEK_DATA);
+
+			end = len;
+			if (data == -ENXIO || data >= len)
+				break;
+			if (data >= 0) {
+				loff_t hole = vfs_llseek(in, data, SEEK_HOLE);
+
+				pos = data;
+				if (hole > data && hole < len)
+					end = hole;
+			}
+		}
+
+		bytes = vfs_copy_file_range(in, pos, out, pos, end - pos,
+					    COPY_FILE_SPLICE);
 		if (bytes <= 0) {
 			err = bytes < 0 ? bytes : -EIO;
 			break;
 		}
-		pos_in += bytes;
-		pos_out += bytes;
+		pos += bytes;
 	}
+	if (!err && pos < len)
+		err = i_size_read(file_inode(in)) < len ? -EIO :
+		      aufsng_set_size(pfs, work, len);
 
+out:
 	fput(out);
 	fput(in);
 	return err;
