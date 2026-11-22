@@ -13,6 +13,7 @@
 #include <linux/posix_acl_xattr.h>
 #include <linux/stat.h>
 #include <linux/rcupdate.h>
+#include <linux/capability.h>
 #include "aufsng.h"
 
 static int aufsng_getattr(AUFSNG_IDMAP *idmap, const struct path *path,
@@ -136,6 +137,15 @@ static int aufsng_setattr(AUFSNG_IDMAP *idmap, struct dentry *dentry,
  * hide aufs-ng's own namespace (AUFSNG_XATTR_PFX) - from listings,
  * reads, writes and cp -a alike.
  */
+static bool aufsng_can_list(const char *name)
+{
+	if (aufsng_is_private_xattr(name))
+		return false;
+	if (strncmp(name, XATTR_TRUSTED_PREFIX, XATTR_TRUSTED_PREFIX_LEN))
+		return true;
+	return ns_capable_noaudit(&init_user_ns, CAP_SYS_ADMIN);
+}
+
 static ssize_t aufsng_listxattr(struct dentry *dentry, char *list, size_t size)
 {
 	struct inode *inode = d_inode(dentry);
@@ -157,7 +167,7 @@ static ssize_t aufsng_listxattr(struct dentry *dentry, char *list, size_t size)
 	for (from = list, to = list, end = list + res; from < end;) {
 		size_t len = strlen(from) + 1;
 
-		if (!aufsng_is_private_xattr(from)) {
+		if (aufsng_can_list(from)) {
 			if (to != from)
 				memmove(to, from, len);
 			to += len;

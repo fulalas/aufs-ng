@@ -299,6 +299,7 @@ static int aufsng_create_object(struct dentry *dentry,
 	char whtmpbuf[NAME_MAX + 1];
 	struct qstr whtmp;
 	int parked = 0;
+	const struct aufsng_layer *stop = NULL;
 	int hides_lower = 0;
 	int err;
 
@@ -334,11 +335,19 @@ static int aufsng_create_object(struct dentry *dentry,
 	 */
 	percpu_down_read(&pfs->dyn_lock);
 	if (is_dir) {
-		hides_lower = aufsng_lower_covers(dir, &dentry->d_name);
-		if (hides_lower < 0) {
-			err = hides_lower;
-			goto out_creds;
+		struct aufsng_merge m = { .allow_top_nondir = true };
+
+		err = aufsng_merge_dirs(&m, AUFSNG_I_E(dir), 0,
+					&dentry->d_name, NULL);
+		if (m.oe) {
+			m.oe->numlower = m.n;
+			aufsng_free_entry(m.oe);
 		}
+		if (err)
+			goto out_creds;
+		hides_lower = m.n > 0;
+		if (!hides_lower)
+			stop = m.stop;
 	}
 
 	parked = aufsng_park_whiteout(pfs, pupper, &dentry->d_name,
@@ -400,6 +409,7 @@ static int aufsng_create_object(struct dentry *dentry,
 		err = -ENOMEM;
 		goto out_remove;
 	}
+	oe->stop = stop;
 	inode = aufsng_get_inode(dentry->d_sb, upper, oe);
 	if (IS_ERR(inode)) {
 		err = PTR_ERR(inode);
@@ -501,8 +511,8 @@ int aufsng_link(struct dentry *old, struct inode *dir, struct dentry *new)
 
 	pupper = aufsng_upperdentry(dir);
 	oldupper = aufsng_upperdentry(d_inode(old));
-	if (WARN_ON(!pupper || !oldupper)) {
-		err = -ENOENT;
+	if (!pupper || !oldupper) {
+		err = -ESTALE;
 		goto out_creds;
 	}
 
@@ -544,6 +554,73 @@ out_write:
 	return err;
 }
 
+static bool aufsng_name_gone(struct inode *inode, bool is_dir,
+			     bool real_removed, struct dentry *upper)
+{
+	struct aufsng_entry *oe = AUFSNG_I_E(inode);
+	unsigned int lower_nlink = 0;
+	bool last = false, shed = false, dead;
+
+	/*
+	 * The link count only moves when a real link went away.  A
+	 * whiteout-only removal changed no real inode: dropping anyway
+	 * would take a shared union inode to nlink 0 while another name
+	 * is still linked, then wrap to UINT_MAX when that one goes.
+	 */
+	if (!is_dir && !real_removed && !upper) {
+		/*
+		 * A lower-only name: no real link went away, but if the
+		 * lower had only this one, the only way to reach this union
+		 * inode just did, so it is as dead as a real removal.
+		 *
+		 * Ask the lower, not the union inode's mirror: the mirror
+		 * only refreshes when drift is noticed, so a link made
+		 * directly in the branch would leave it reading 1 while a
+		 * sibling name still resolves to it.
+		 */
+		struct inode *real = aufsng_inode_real(inode);
+
+		last = real && real->i_nlink <= 1;
+	}
+	if (!is_dir && real_removed && upper && oe && oe->numlower)
+		lower_nlink = d_inode(oe->lowerstack[0].dentry)->i_nlink;
+
+	spin_lock(&inode->i_lock);
+	if (is_dir) {
+		if (real_removed || !upper)
+			clear_nlink(inode);
+	} else if (real_removed) {
+		if (upper && !d_inode(upper)->i_nlink && lower_nlink > 1) {
+			set_nlink(inode, lower_nlink);
+			shed = true;
+		} else if (upper) {
+			set_nlink(inode, d_inode(upper)->i_nlink);
+		} else if (inode->i_nlink)
+			drop_nlink(inode);
+	} else if (last) {
+		clear_nlink(inode);
+	}
+	dead = !inode->i_nlink;
+	spin_unlock(&inode->i_lock);
+
+	/*
+	 * The last name is gone: take the inode out of the hash.
+	 *
+	 * The key is the copy-up origin, re-derived by name on create, so
+	 * without this a re-create of the same name gets the dead inode -
+	 * and everything the VFS still holds against it.  Most visibly a
+	 * running executable: deny_write_access() makes the first write
+	 * to the replacement fail with ETXTBSY.  A real filesystem gives
+	 * a re-created name a new inode.
+	 *
+	 * Eviction alone is not enough: it unhashes only on the last
+	 * reference, and a deleted-but-open object is exactly the case.
+	 */
+	if (dead)
+		remove_inode_hash(inode);
+	return shed;
+}
+
 static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 {
 	struct dentry *parent = dentry->d_parent;
@@ -554,6 +631,8 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	const struct cred *old_cred;
 	struct dentry *pupper, *upper;
 	bool real_removed = false;
+	bool shed = false;
+	unsigned long gen;
 	int covered;
 	int err;
 
@@ -561,6 +640,8 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	if (err)
 		return err;
 
+again:
+	gen = atomic_long_read(&pfs->branch_gen);
 	if (is_dir) {
 		err = aufsng_check_empty_dir(dentry);
 		if (err)
@@ -579,6 +660,12 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 	 * skipped whiteout would resurrect it.
 	 */
 	percpu_down_read(&pfs->dyn_lock);
+	if (is_dir && atomic_long_read(&pfs->branch_gen) != gen) {
+		percpu_up_read(&pfs->dyn_lock);
+		revert_creds(old_cred);
+		mnt_drop_write(aufsng_upper_mnt(pfs));
+		goto again;
+	}
 	covered = aufsng_lower_covers(dir, &dentry->d_name);
 	if (covered < 0) {
 		err = covered;
@@ -671,55 +758,15 @@ static int aufsng_do_remove(struct dentry *dentry, bool is_dir)
 		goto out;
 	}
 
-	/*
-	 * The link count only moves when a real link went away.  A
-	 * whiteout-only removal changed no real inode: dropping anyway
-	 * would take a shared union inode to nlink 0 while another name
-	 * is still linked, then wrap to UINT_MAX when that one goes.
-	 */
-	if (is_dir) {
-		if (real_removed || !upper)
-			clear_nlink(inode);
-	} else if (real_removed) {
-		drop_nlink(inode);
-	} else if (!upper) {
-		/*
-		 * A lower-only name: no real link went away, but if the
-		 * lower had only this one, the only way to reach this union
-		 * inode just did, so it is as dead as a real removal.
-		 *
-		 * Ask the lower, not the union inode's mirror: the mirror
-		 * only refreshes when drift is noticed, so a link made
-		 * directly in the branch would leave it reading 1 while a
-		 * sibling name still resolves to it.
-		 */
-		struct inode *real = aufsng_inode_real(inode);
-
-		if (real && real->i_nlink <= 1)
-			clear_nlink(inode);
-	}
-
-	/*
-	 * The last name is gone: take the inode out of the hash.
-	 *
-	 * The key is the copy-up origin, re-derived by name on create, so
-	 * without this a re-create of the same name gets the dead inode -
-	 * and everything the VFS still holds against it.  Most visibly a
-	 * running executable: deny_write_access() makes the first write
-	 * to the replacement fail with ETXTBSY.  A real filesystem gives
-	 * a re-created name a new inode.
-	 *
-	 * Eviction alone is not enough: it unhashes only on the last
-	 * reference, and a deleted-but-open object is exactly the case.
-	 */
-	if (!inode->i_nlink)
-		remove_inode_hash(inode);
+	shed = aufsng_name_gone(inode, is_dir, real_removed, upper);
 
 	atomic64_inc(&AUFSNG_I(dir)->version);
 	aufsng_copyattr(dir);
 
 out:
 	mutex_unlock(&oi->lock);
+	if (shed)
+		aufsng_dyn_shed_upper(inode);
 out_dyn:
 	percpu_up_read(&pfs->dyn_lock);
 	revert_creds(old_cred);
@@ -758,6 +805,20 @@ static int aufsng_rename_undo(struct aufsng_fs *pfs, struct dentry *oldupperdir,
 	return err;
 }
 
+static int aufsng_link_name(struct aufsng_fs *pfs, struct dentry *upper,
+			    struct dentry *upperdir, const struct qstr *name)
+{
+	struct dentry *slot = aufsng_create_slot(upperdir, name);
+	int err;
+
+	if (IS_ERR(slot))
+		return PTR_ERR(slot);
+	err = vfs_link(upper, mnt_idmap(aufsng_upper_mnt(pfs)),
+		       d_inode(upperdir), slot, NULL);
+	end_dirop(slot);
+	return err;
+}
+
 static bool aufsng_has_lowers(struct inode *inode)
 {
 	struct aufsng_entry *oe;
@@ -779,6 +840,7 @@ int aufsng_rename(AUFSNG_IDMAP *idmap, struct inode *olddir,
 	const struct cred *old_cred;
 	struct renamedata rd = {};
 	struct dentry *newupperdir, *oldupperdir, *oldupper;
+	struct inode *victim = d_inode(new);
 	/*
 	 * Rollback safety hinges on whether the upper rename destroyed
 	 * something, not on union visibility: a lower-only victim has no
@@ -906,6 +968,12 @@ int aufsng_rename(AUFSNG_IDMAP *idmap, struct inode *olddir,
 					    new->d_name.len);
 
 		err = start_renaming(&rd, 0, &oldq, &newq);
+		if (err == -ENOENT && !d_is_dir(old)) {
+			err = aufsng_link_name(pfs, oldupper, oldupperdir,
+					       &old->d_name);
+			if (!err)
+				err = start_renaming(&rd, 0, &oldq, &newq);
+		}
 	}
 	if (!err) {
 		had_victim = d_is_positive(rd.new_dentry);
@@ -956,6 +1024,18 @@ int aufsng_rename(AUFSNG_IDMAP *idmap, struct inode *olddir,
 		if (opqerr)
 			pr_err("aufs (aufs-ng): failed to mark renamed dir '%.*s' opaque (%d), deleted lower content may show through\n",
 			       new->d_name.len, new->d_name.name, opqerr);
+	}
+
+	if (victim) {
+		struct aufsng_inode *voi = AUFSNG_I(victim);
+		bool shed;
+
+		mutex_lock(&voi->lock);
+		shed = aufsng_name_gone(victim, replace_dir, had_victim,
+					voi->upperdentry);
+		mutex_unlock(&voi->lock);
+		if (shed)
+			aufsng_dyn_shed_upper(victim);
 	}
 
 	/* the copy-up marker is per-name: a rename stops matching it */

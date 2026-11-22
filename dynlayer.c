@@ -18,9 +18,10 @@
  *  - A cached directory inode is re-keyed whenever its top lower
  *    changes, so a fresh lookup finds it instead of an alias.
  *
- *  - Superseded non-directory stacks are parked on the inode until
- *    eviction, not freed after one synchronize_rcu(): an in-flight
- *    getattr may still be dereferencing them.
+ *  - Superseded symlink stacks are parked on the inode until eviction,
+ *    not freed after one synchronize_rcu(): get_link may still be
+ *    using the old lower.  Every other reader takes its own reference,
+ *    so other stacks are freed after the grace period.
  *
  *  - The removal scan uses one sb-wide evict_inodes() pass, not a
  *    per-inode evict-and-restart loop quadratic in cached inodes.
@@ -34,6 +35,7 @@
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <linux/hashtable.h>
+#include <linux/sort.h>
 #include "aufsng.h"
 
 static inline struct inode *aufsng_root_inode(struct super_block *sb)
@@ -107,6 +109,8 @@ static bool aufsng_dyn_park_upper(struct aufsng_inode *oi, struct inode *inode,
 	if (!pk)
 		return false;
 	aufsng_dyn_park_fill(oi, pk, NULL, oi->upperdentry, NULL);
+	WRITE_ONCE(oi->protflags, aufsng_read_protattr(AUFSNG_FS(inode->i_sb),
+						       new_upper));
 	WRITE_ONCE(oi->upperdentry, new_upper ? dget(new_upper) : NULL);
 	aufsng_copyattr(inode);
 	atomic64_inc(&oi->version);
@@ -155,6 +159,9 @@ bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 		goto out;
 
 	if (!oi->upperdentry) {
+		WRITE_ONCE(oi->protflags,
+			   aufsng_read_protattr(AUFSNG_FS(inode->i_sb),
+						upperdentry));
 		WRITE_ONCE(oi->upperdentry, dget(upperdentry));
 		/* the upper is the authoritative real object now */
 		aufsng_copyattr(inode);
@@ -587,7 +594,10 @@ static struct aufsng_entry *aufsng_dyn_prep_splice(struct aufsng_fs *pfs,
 	/* an opaque new dir hides the existing lowers underneath it */
 	base_n = (opq || !cur) ? 0 : cur->numlower;
 	neu = aufsng_entry_prepend(cur, base_n, layer, nd, layer->mnt);
-	return neu ? neu : ERR_PTR(-ENOMEM);
+	if (!neu)
+		return ERR_PTR(-ENOMEM);
+	neu->stop = opq ? layer : (cur ? cur->stop : NULL);
+	return neu;
 }
 
 /*
@@ -853,6 +863,14 @@ static bool aufsng_entry_has_layer(struct aufsng_entry *oe,
 	return false;
 }
 
+static bool aufsng_dyn_cut_by(struct inode *inode,
+			      const struct aufsng_layer *layer)
+{
+	struct aufsng_entry *oe = AUFSNG_I_E(inode);
+
+	return S_ISDIR(inode->i_mode) && oe && oe->stop == layer;
+}
+
 /*
  * A directory removed through the union but still pinned by a cwd or
  * fd: the VFS marked it S_DEAD, so no lookup can reach it again.
@@ -1029,7 +1047,8 @@ static int aufsng_dyn_scan_branch(struct super_block *sb,
 			continue;
 		spin_lock(&inode->i_lock);
 		if ((inode_state_read(inode) & (I_FREEING | I_WILL_FREE | I_NEW)) ||
-		    !aufsng_entry_has_layer(AUFSNG_I_E(inode), layer)) {
+		    (!aufsng_entry_has_layer(AUFSNG_I_E(inode), layer) &&
+		     !aufsng_dyn_cut_by(inode, layer))) {
 			spin_unlock(&inode->i_lock);
 			continue;
 		}
@@ -1108,29 +1127,92 @@ static int aufsng_dyn_copy_up_dirs(struct aufsng_dyn_scan *scan,
 	return err;
 }
 
+static struct aufsng_entry *aufsng_dyn_remerge(struct aufsng_fs *pfs,
+					       struct dentry *alias,
+					       const struct aufsng_layer *layer,
+					       struct aufsng_dyn_scan *scan,
+					       struct aufsng_entry **new_oes,
+					       unsigned int nr)
+{
+	struct dentry *upper = aufsng_upperdentry(d_inode(alias));
+	struct aufsng_entry *poe = NULL, *oe;
+	struct aufsng_merge m = {};
+	const struct cred *old_cred;
+	struct name_snapshot ns;
+	struct dentry *parent;
+	unsigned int j;
+	int err;
+
+	if (upper) {
+		old_cred = override_creds(pfs->creator_cred);
+		err = aufsng_check_diropq(aufsng_upper_mnt(pfs), upper);
+		revert_creds(old_cred);
+		if (err < 0)
+			return ERR_PTR(err);
+		if (err)
+			return aufsng_alloc_entry(0) ?: ERR_PTR(-ENOMEM);
+	}
+
+	parent = dget_parent(alias);
+	for (j = 0; j < nr; j++) {
+		if (new_oes[j] && scan->pinned[j] == d_inode(parent)) {
+			poe = new_oes[j];
+			break;
+		}
+	}
+	if (!poe)
+		poe = AUFSNG_E(parent);
+
+	take_dentry_name_snapshot(&ns, alias);
+	old_cred = override_creds(pfs->creator_cred);
+	err = aufsng_merge_dirs(&m, poe, 0, &ns.name, layer);
+	revert_creds(old_cred);
+	release_dentry_name_snapshot(&ns);
+	dput(parent);
+
+	oe = m.oe;
+	if (oe)
+		oe->numlower = m.n;
+	if (err) {
+		aufsng_free_entry(oe);
+		return ERR_PTR(err);
+	}
+	if (!oe) {
+		oe = aufsng_alloc_entry(0);
+		if (!oe)
+			return ERR_PTR(-ENOMEM);
+	}
+	oe->stop = m.stop;
+	return oe;
+}
+
 /*
- * Filter @layer out of a cached directory's stack.  If the removed
- * entry was the BOTTOM and carried an opaque marker, the merge that
- * built this stack stopped there and never probed the branches below,
- * which a fresh lookup will now merge - the marker leaves with its
- * branch.  Re-run that tail here by lookup's own rules, or the pinned
- * view stays permanently missing what the opaque branch hid.
- *
- * @tail_merge is false for the ROOT, whose stack is the branch list
- * itself.  Caller holds the root inode lock, s_vfs_rename_mutex and
- * dyn_lock(write).
+ * Filter @layer out of a cached directory's stack, or re-merge it when
+ * its merge stopped at @layer.  @scan is NULL for the ROOT, whose stack
+ * is the branch list itself.  Caller holds the root inode lock,
+ * s_vfs_rename_mutex and dyn_lock(write).
  */
 static struct aufsng_entry *aufsng_dyn_prep_rebuild(struct aufsng_fs *pfs,
-					      struct inode *inode,
-					      const struct aufsng_layer *layer,
-					      bool tail_merge)
+						      struct inode *inode,
+						      const struct aufsng_layer *layer,
+						      struct aufsng_dyn_scan *scan,
+						      struct aufsng_entry **new_oes,
+						      unsigned int nr)
 {
 	struct aufsng_entry *old_oe = AUFSNG_I_E(inode), *new_oe;
 	struct aufsng_path *nstack, *ostack;
-	struct dentry *alias = NULL, *parent = NULL;
-	struct aufsng_entry *poe = NULL;
-	unsigned int i, j, n, hits = 0, tail_from = 0, tail_room = 0;
-	int err = 0;
+	unsigned int i, j, n, hits = 0;
+
+	if (scan && aufsng_dyn_cut_by(inode, layer)) {
+		struct dentry *alias = d_find_alias(inode);
+
+		if (alias) {
+			new_oe = aufsng_dyn_remerge(pfs, alias, layer, scan,
+						    new_oes, nr);
+			dput(alias);
+			return new_oe;
+		}
+	}
 
 	n = old_oe->numlower;
 	ostack = old_oe->lowerstack;
@@ -1141,36 +1223,9 @@ static struct aufsng_entry *aufsng_dyn_prep_rebuild(struct aufsng_fs *pfs,
 	if (!hits)
 		return NULL;
 
-	if (tail_merge && ostack[n - 1].layer == layer) {
-		const struct cred *old_cred = override_creds(pfs->creator_cred);
-		int opq = aufsng_check_diropq(ostack[n - 1].mnt,
-					   ostack[n - 1].dentry);
-
-		revert_creds(old_cred);
-		if (opq < 0)
-			return ERR_PTR(opq);
-		if (opq) {
-			alias = d_find_alias(inode);
-			if (alias)
-				parent = dget_parent(alias);
-			poe = parent ? AUFSNG_E(parent) : NULL;
-			/* the merge resumes below the removed layer's position */
-			for (tail_from = 0; poe && tail_from < poe->numlower;
-			     tail_from++) {
-				if (poe->lowerstack[tail_from].layer == layer) {
-					tail_from++;
-					tail_room = poe->numlower - tail_from;
-					break;
-				}
-			}
-		}
-	}
-
-	new_oe = aufsng_alloc_entry(n - hits + tail_room);
-	if (!new_oe) {
-		new_oe = ERR_PTR(-ENOMEM);
-		goto out;
-	}
+	new_oe = aufsng_alloc_entry(n - hits);
+	if (!new_oe)
+		return ERR_PTR(-ENOMEM);
 
 	nstack = new_oe->lowerstack;
 	for (i = 0, j = 0; i < n; i++) {
@@ -1178,28 +1233,10 @@ static struct aufsng_entry *aufsng_dyn_prep_rebuild(struct aufsng_fs *pfs,
 			continue;
 		nstack[j] = ostack[i];
 		dget(nstack[j].dentry);
+		mntget(nstack[j].mnt);
 		j++;
 	}
-	if (tail_room) {
-		const struct cred *old_cred = override_creds(pfs->creator_cred);
-		/* append through the shared merge rule (see aufsng_merge_dirs) */
-		struct aufsng_merge m = { .oe = new_oe, .n = j };
-		struct name_snapshot ns;
-
-		take_dentry_name_snapshot(&ns, alias);
-		err = aufsng_merge_dirs(&m, poe, tail_from, &ns.name, layer);
-		j = m.n;
-		release_dentry_name_snapshot(&ns);
-		revert_creds(old_cred);
-	}
-	new_oe->numlower = j;
-	if (err) {
-		aufsng_free_entry(new_oe);
-		new_oe = ERR_PTR(err);
-	}
-out:
-	dput(parent);
-	dput(alias);
+	new_oe->stop = old_oe->stop;
 	return new_oe;
 }
 
@@ -1235,7 +1272,7 @@ static void aufsng_dyn_commit_rebuild(struct inode *inode,
 	 */
 	aufsng_copyattr(inode);
 
-	if (S_ISDIR(inode->i_mode)) {
+	if (!S_ISLNK(inode->i_mode)) {
 		parked->oe = old_oe;
 		parked->upper = NULL;
 		parked->nr_mnts = 0;
@@ -1253,8 +1290,10 @@ static void aufsng_dyn_put_list(struct aufsng_dyn_parked *p)
 		unsigned int n = p->oe ? p->oe->numlower : 0;
 		unsigned int i;
 
-		for (i = 0; i < n; i++)
+		for (i = 0; i < n; i++) {
 			dput(p->oe->lowerstack[i].dentry);
+			mntput(p->oe->lowerstack[i].mnt);
+		}
 		dput(p->upper);
 		/* only after every dentry into those branches is gone */
 		for (i = 0; i < p->nr_mnts; i++)
@@ -1342,6 +1381,49 @@ busy:
 	pr_info("aufs (aufs-ng): cannot remove branch '%s': re-pointing in-use inode %llu would alias another cached inode (hardlink siblings)\n",
 		brname, (u64)inode->i_ino);
 	return -EBUSY;
+}
+
+struct aufsng_dyn_depth {
+	struct inode *inode;
+	unsigned int depth;
+};
+
+static int aufsng_dyn_depth_cmp(const void *a, const void *b)
+{
+	const struct aufsng_dyn_depth *x = a, *y = b;
+
+	return (x->depth > y->depth) - (x->depth < y->depth);
+}
+
+static int aufsng_dyn_sort_scan(struct aufsng_dyn_scan *scan)
+{
+	struct aufsng_dyn_depth *v;
+	unsigned int i;
+
+	if (scan->nr < 2)
+		return 0;
+	v = kvmalloc_array(scan->nr, sizeof(*v), GFP_KERNEL);
+	if (!v)
+		return -ENOMEM;
+	for (i = 0; i < scan->nr; i++) {
+		struct dentry *d = d_find_alias(scan->pinned[i]);
+
+		v[i].inode = scan->pinned[i];
+		v[i].depth = 0;
+		while (d && !IS_ROOT(d)) {
+			struct dentry *p = dget_parent(d);
+
+			dput(d);
+			d = p;
+			v[i].depth++;
+		}
+		dput(d);
+	}
+	sort(v, scan->nr, sizeof(*v), aufsng_dyn_depth_cmp, NULL);
+	for (i = 0; i < scan->nr; i++)
+		scan->pinned[i] = v[i].inode;
+	kvfree(v);
+	return 0;
 }
 
 static void aufsng_dyn_release_branch(struct aufsng_layer *layer)
@@ -1446,6 +1528,9 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 		scan.nr = 0;
 	}
 
+	err = aufsng_dyn_sort_scan(&scan);
+	if (err)
+		goto out_unlock;
 	err = -ENOMEM;
 	new_oes = kcalloc(scan.nr, sizeof(*new_oes), GFP_KERNEL);
 	if (!new_oes)
@@ -1469,7 +1554,8 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 			else
 				new_oes[i] = aufsng_dyn_prep_rebuild(pfs,
 								  scan.pinned[i],
-								  layer, true);
+								  layer, &scan,
+								  new_oes, i);
 		} else
 			new_oes[i] = aufsng_dyn_prep_repoint(pfs,
 							  scan.pinned[i],
@@ -1490,7 +1576,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 		/* Sized for every mount the superseded - or KEPT - stack uses */
 		cur = AUFSNG_I_E(scan.pinned[i]);
 		nr_mnts = cur ? cur->numlower : 0;
-		if (new_oes[i] && S_ISDIR(scan.pinned[i]->i_mode))
+		if (new_oes[i] && !S_ISLNK(scan.pinned[i]->i_mode))
 			nr_mnts = 0;
 		parked[i] = kmalloc(struct_size(parked[i], mnts, nr_mnts),
 				    GFP_KERNEL);
@@ -1505,7 +1591,7 @@ int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path)
 	 * directory's.  NULL means the layer was not in it at all -
 	 * impossible for an active branch, so treat it as corruption.
 	 */
-	new_oe = aufsng_dyn_prep_rebuild(pfs, root_inode, layer, false);
+	new_oe = aufsng_dyn_prep_rebuild(pfs, root_inode, layer, NULL, NULL, 0);
 	if (IS_ERR(new_oe)) {
 		err = PTR_ERR(new_oe);
 		new_oe = NULL;

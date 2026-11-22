@@ -191,8 +191,10 @@ int aufsng_merge_dirs(struct aufsng_merge *m, struct aufsng_entry *poe,
 		this = aufsng_lookup_once(lower->mnt, lower->dentry, name, &wh);
 		if (IS_ERR(this))
 			return PTR_ERR(this);
-		if (wh)
-			break;
+		if (wh) {
+			m->stop = lower->layer;
+			return 0;
+		}
 		if (!this)
 			continue;
 		if (!m->oe) {
@@ -207,16 +209,17 @@ int aufsng_merge_dirs(struct aufsng_merge *m, struct aufsng_entry *poe,
 			if (m->allow_top_nondir && !m->n) {
 				m->oe->lowerstack[m->n].layer = lower->layer;
 				m->oe->lowerstack[m->n].dentry = this;
-				m->oe->lowerstack[m->n].mnt = lower->mnt;
+				m->oe->lowerstack[m->n].mnt = mntget(lower->mnt);
 				m->n++;
 			} else {
 				dput(this);
 			}
-			break;
+			m->stop = lower->layer;
+			return 0;
 		}
 		m->oe->lowerstack[m->n].layer = lower->layer;
 		m->oe->lowerstack[m->n].dentry = this;
-		m->oe->lowerstack[m->n].mnt = lower->mnt;
+		m->oe->lowerstack[m->n].mnt = mntget(lower->mnt);
 		m->n++;
 
 		/* On the last branch the opaque verdict changes nothing */
@@ -225,9 +228,12 @@ int aufsng_merge_dirs(struct aufsng_merge *m, struct aufsng_entry *poe,
 		opq = aufsng_check_diropq(lower->mnt, this);
 		if (opq < 0)
 			return opq;
-		if (opq)
-			break;
+		if (opq) {
+			m->stop = lower->layer;
+			return 0;
+		}
 	}
+	m->stop = poe ? poe->stop : NULL;
 	return 0;
 }
 
@@ -354,6 +360,7 @@ static void aufsng_fill_inode(struct inode *inode, struct inode *realinode)
 	case S_IFREG:
 		inode->i_op = &aufsng_file_inode_operations;
 		inode->i_fop = &aufsng_file_operations;
+		inode->i_mapping->a_ops = &aufsng_file_aops;
 		break;
 	default:
 		inode->i_op = &aufsng_special_inode_operations;
@@ -432,6 +439,8 @@ struct inode *aufsng_get_inode(struct super_block *sb,
 		return inode;
 	}
 
+	AUFSNG_I(inode)->protflags = aufsng_read_protattr(AUFSNG_FS(sb),
+							  upperdentry);
 	aufsng_fill_inode(inode, realinode);
 	inode->i_ino = aufsng_map_ino(key->i_ino, key_idx);
 	AUFSNG_I(inode)->oe = oe;
@@ -454,6 +463,7 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 	const struct cred *old_cred;
 	unsigned long stamp;
 	unsigned long gen;
+	const struct aufsng_layer *stop = NULL;
 	bool stopped = false;
 	int wh, err = 0;
 
@@ -545,6 +555,9 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 			oe->numlower = m.n;
 		if (err)
 			goto out;
+		stop = m.stop;
+	} else if (!stopped && poe) {
+		stop = poe->stop;
 	}
 
 	if (upper || (oe && oe->numlower)) {
@@ -555,6 +568,7 @@ struct dentry *aufsng_lookup(struct inode *dir, struct dentry *dentry,
 				goto out;
 			err = 0;
 		}
+		oe->stop = stop;
 
 		inode = aufsng_get_inode(dentry->d_sb, upper, oe);
 		upper = NULL;

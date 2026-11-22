@@ -44,8 +44,10 @@ static void aufsng_stack_put(struct aufsng_path *stack, unsigned int n)
 {
 	unsigned int i;
 
-	for (i = 0; stack && i < n; i++)
+	for (i = 0; stack && i < n; i++) {
 		dput(stack[i].dentry);
+		mntput(stack[i].mnt);
+	}
 }
 
 void aufsng_free_entry(struct aufsng_entry *oe)
@@ -73,6 +75,7 @@ struct aufsng_entry *aufsng_entry_from_origin(int found,
 	}
 	if (found) {
 		oe->lowerstack[0] = *origin;
+		mntget(origin->mnt);
 		origin->dentry = NULL;
 	}
 	return oe;
@@ -81,8 +84,7 @@ struct aufsng_entry *aufsng_entry_from_origin(int found,
 /*
  * Put @dentry (in @layer, via @mnt) on top of @cur's first @base_n
  * entries, one reference per copied dentry.  @mnt is passed in because
- * the add path builds the stack before publishing the slot.  No mntget:
- * a live stack's mounts are pinned by the branch itself.
+ * the add path builds the stack before publishing the slot.
  */
 struct aufsng_entry *aufsng_entry_prepend(struct aufsng_entry *cur,
 				     unsigned int base_n,
@@ -97,10 +99,11 @@ struct aufsng_entry *aufsng_entry_prepend(struct aufsng_entry *cur,
 		return NULL;
 	neu->lowerstack[0].layer = layer;
 	neu->lowerstack[0].dentry = dget(dentry);
-	neu->lowerstack[0].mnt = mnt;
+	neu->lowerstack[0].mnt = mntget(mnt);
 	for (i = 0; i < base_n; i++) {
 		neu->lowerstack[i + 1] = cur->lowerstack[i];
 		dget(neu->lowerstack[i + 1].dentry);
+		mntget(neu->lowerstack[i + 1].mnt);
 	}
 	return neu;
 }
@@ -118,6 +121,7 @@ static struct inode *aufsng_alloc_inode(struct super_block *sb)
 	oi->upperdentry = NULL;
 	oi->cache = NULL;
 	oi->dyn_parked = NULL;
+	oi->protflags = 0;
 	atomic64_set(&oi->version, 0);
 	mutex_init(&oi->lock);
 
@@ -548,7 +552,7 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 
 		oe->lowerstack[i - 1].layer = layer;
 		oe->lowerstack[i - 1].dentry = dget(layer->mnt->mnt_root);
-		oe->lowerstack[i - 1].mnt = layer->mnt;
+		oe->lowerstack[i - 1].mnt = mntget(layer->mnt);
 	}
 
 	root_inode = new_inode(sb);

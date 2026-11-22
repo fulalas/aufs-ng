@@ -6,8 +6,12 @@ config AUFSNG_FS
 	  aufs-ng is a standalone, from-scratch union filesystem
 	  compatible with many live Linux distributions. It registers
 	  as filesystem type "aufs", using AUFS's own mount option
-	  syntax and on-disk whiteout format, so that scripts issuing
-	  real AUFS mount/remount commands work unmodified.
+	  syntax and on-disk whiteout format, so that most scripts
+	  issuing real AUFS mount/remount commands work unmodified.
+
+	  Not supported: plink, dirren, shwh, RDU, more than one rw
+	  branch, NFS export, FHSM and add= at any position other than
+	  1.  Renaming a merged directory fails with EXDEV.
 
 	  A live-boot sequence typically needs this filesystem type
 	  mounted before any loadable module can be reached (the same

@@ -18,6 +18,8 @@
 #include <linux/posix_acl_xattr.h>
 #include <linux/uio.h>
 #include <linux/atomic.h>
+#include <linux/fileattr.h>
+#include <linux/security.h>
 #include "aufsng.h"
 
 static atomic_t aufsng_tmpfile_seq = ATOMIC_INIT(0);
@@ -129,10 +131,18 @@ static int aufsng_copy_xattr(struct aufsng_fs *pfs, const struct path *oldpath,
 		/* our own bookkeeping is never inherited; the commit sets it */
 		if (aufsng_is_private_xattr(name) || is_posix_acl_xattr(name))
 			continue;
+		err = security_inode_copy_up_xattr(oldpath->dentry, name);
+		if (err == -ECANCELED) {
+			err = 0;
+			continue;
+		}
+		if (err < 0 && err != -EOPNOTSUPP)
+			break;
+		err = 0;
 retry:
 		size = vfs_getxattr(old_idmap, oldpath->dentry, name, value,
 				    value_size);
-		if (size == -ERANGE || (size > 0 && !value)) {
+		if (size == -ERANGE || size > value_size) {
 			void *new_value;
 
 			/* The call above was the size probe; only -ERANGE needs a new one */
@@ -232,6 +242,83 @@ static int aufsng_set_attr_from(struct aufsng_fs *pfs, struct dentry *upper,
 	inode_unlock(d_inode(upper));
 
 	return err;
+}
+
+unsigned int aufsng_read_protattr(struct aufsng_fs *pfs, struct dentry *upper)
+{
+	const struct cred *old_cred;
+	unsigned int flags = 0;
+	char buf[4];
+	ssize_t len, i;
+
+	if (!upper || !d_is_dir(upper))
+		return 0;
+	old_cred = override_creds(pfs->creator_cred);
+	len = vfs_getxattr(mnt_idmap(aufsng_upper_mnt(pfs)), upper,
+			   AUFSNG_XATTR_PROTATTR, buf, sizeof(buf));
+	revert_creds(old_cred);
+	for (i = 0; i < len; i++) {
+		if (buf[i] == 'a')
+			flags |= S_APPEND;
+		else if (buf[i] == 'i')
+			flags |= S_IMMUTABLE;
+	}
+	return flags;
+}
+
+static void aufsng_set_protattr(struct aufsng_fs *pfs, struct dentry *upper,
+				u32 flags)
+{
+	char buf[2];
+	int len = 0, err;
+
+	if (flags & FS_APPEND_FL)
+		buf[len++] = 'a';
+	if (flags & FS_IMMUTABLE_FL)
+		buf[len++] = 'i';
+	if (!len)
+		return;
+	err = vfs_setxattr(mnt_idmap(aufsng_upper_mnt(pfs)), upper,
+			   AUFSNG_XATTR_PROTATTR, buf, len, 0);
+	if (err)
+		pr_warn_once("aufs (aufs-ng): rw branch cannot hold the folder flags marker (%d); copied-up folders lose immutable/append-only\n",
+			     err);
+}
+
+static int aufsng_set_fileattr(struct aufsng_fs *pfs, struct dentry *upper,
+			       u32 mask, u32 flags)
+{
+	struct file_kattr cur = {}, set = {};
+	int err;
+
+	if (!(flags & mask))
+		return 0;
+	err = vfs_fileattr_get(upper, &cur);
+	if (err)
+		return err;
+	fileattr_fill_flags(&set, (cur.flags & ~mask) | (flags & mask));
+	return vfs_fileattr_set(mnt_idmap(aufsng_upper_mnt(pfs)), upper, &set);
+}
+
+static void aufsng_copy_fileattr(struct aufsng_fs *pfs,
+				 const struct path *lowerpath,
+				 struct dentry *upper)
+{
+	struct file_kattr fa = {};
+	int err;
+
+	if (vfs_fileattr_get(lowerpath->dentry, &fa))
+		return;
+	if (d_is_dir(upper)) {
+		aufsng_set_protattr(pfs, upper, fa.flags);
+		return;
+	}
+	aufsng_set_fileattr(pfs, upper, FS_SYNC_FL | FS_NOATIME_FL, fa.flags);
+	err = aufsng_set_fileattr(pfs, upper, FS_APPEND_FL | FS_IMMUTABLE_FL,
+				  fa.flags);
+	if (err)
+		pr_warn_once("aufs (aufs-ng): rw branch cannot hold file flags (%d); copied-up files lose immutable/append-only\n",
+			     err);
 }
 
 static int aufsng_copy_data(struct aufsng_fs *pfs, const struct path *lowerpath,
@@ -414,6 +501,8 @@ static int aufsng_copy_up_commit_regular(struct aufsng_fs *pfs,
 	}
 	err = vfs_rename(&rd);
 	end_renaming(&rd);
+	if (!err)
+		aufsng_copy_fileattr(pfs, lowerpath, work);
 	return err;
 }
 
@@ -479,6 +568,8 @@ static struct dentry *aufsng_copy_up_inplace(struct aufsng_fs *pfs,
 	/* Directories are keyed by their merged stack; a marker is never read */
 	if (!err && !S_ISDIR(stat->mode))
 		aufsng_mark_origin(pfs, upper, name);
+	if (!err)
+		aufsng_copy_fileattr(pfs, lowerpath, upper);
 	if (err) {
 		/*
 		 * The cleanup the temp+rename scheme gives the file path
@@ -512,7 +603,9 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 	struct inode *inode = d_inode(dentry);
 	struct aufsng_inode *oi = AUFSNG_I(inode);
 	struct aufsng_fs *pfs = AUFSNG_FS(dentry->d_sb);
-	struct dentry *pupper = aufsng_upperdentry(d_inode(dentry->d_parent));
+	struct dentry *parent, *pupper;
+	const struct cred *old_cred = NULL;
+	struct cred *cu_cred = NULL;
 	struct aufsng_entry *oe;
 	struct path lowerpath;
 	struct kstat stat;
@@ -523,14 +616,6 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 	struct qstr tmpq;
 	int err;
 
-	/*
-	 * Nothing pins the parent's upper between the caller's walk and
-	 * this sample: under udba=reval a lookup can shed it.  -ESTALE,
-	 * not a WARN - this is reachable from an ordinary open, and the
-	 * retry loop copies the parent up again.
-	 */
-	if (!pupper)
-		return -ESTALE;
 	if (READ_ONCE(oi->upperdentry))
 		return 0;
 	/*
@@ -539,6 +624,25 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 	 */
 	if (d_unhashed(dentry) || !inode->i_nlink)
 		return -ENOENT;
+
+	parent = dget_parent(dentry);
+	pupper = dget(aufsng_upperdentry(d_inode(parent)));
+	/*
+	 * Nothing pins the parent's upper between the caller's walk and
+	 * this sample: under udba=reval a lookup can shed it.  -ESTALE,
+	 * not a WARN - this is reachable from an ordinary open, and the
+	 * retry loop copies the parent up again.
+	 */
+	if (!pupper) {
+		dput(parent);
+		return -ESTALE;
+	}
+
+	err = security_inode_copy_up(dentry, &cu_cred);
+	if (err < 0)
+		goto out_parent;
+	if (cu_cred)
+		old_cred = override_creds(cu_cred);
 
 	/*
 	 * The lower source is sampled without oi->lock: safe to READ (it
@@ -551,7 +655,8 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 	oe = AUFSNG_I_E(inode);
 	if (!oe || !oe->numlower) {
 		rcu_read_unlock();
-		return -ENOENT;
+		err = -ENOENT;
+		goto out_parent;
 	}
 	lowerpath.mnt = oe->lowerstack[0].mnt;
 	lowerpath.dentry = oe->lowerstack[0].dentry;
@@ -637,6 +742,7 @@ static int aufsng_copy_up_one(struct dentry *dentry)
 		}
 	}
 
+	WRITE_ONCE(oi->protflags, aufsng_read_protattr(pfs, upper));
 	WRITE_ONCE(oi->upperdentry, upper);
 	aufsng_copyattr(inode);
 out:
@@ -656,6 +762,13 @@ out_tmp:
 	release_dentry_name_snapshot(&ns);
 out_path:
 	path_put(&lowerpath);
+out_parent:
+	if (cu_cred) {
+		revert_creds(old_cred);
+		put_cred(cu_cred);
+	}
+	dput(pupper);
+	dput(parent);
 	return err;
 }
 
@@ -680,10 +793,13 @@ int aufsng_copy_up(struct dentry *dentry)
 		struct dentry *next = dget(dentry);
 
 		/* find the topmost ancestor still lacking an upper */
-		while (!IS_ROOT(next) &&
-		       !aufsng_upperdentry(d_inode(next->d_parent))) {
-			struct dentry *parent = dget(next->d_parent);
+		while (!IS_ROOT(next)) {
+			struct dentry *parent = dget_parent(next);
 
+			if (aufsng_upperdentry(d_inode(parent))) {
+				dput(parent);
+				break;
+			}
 			dput(next);
 			next = parent;
 		}

@@ -16,11 +16,14 @@
 static void aufsng_file_accessed(struct file *file)
 {
 	struct inode *inode = file_inode(file);
-	struct inode *real = aufsng_inode_real(inode);
+	struct inode *real;
 
+	rcu_read_lock();
+	real = aufsng_inode_real(inode);
 	/* no real object left to read the time off (see aufsng_path_real) */
 	if (real)
 		inode_set_atime_to_ts(inode, inode_get_atime(real));
+	rcu_read_unlock();
 }
 
 static void aufsng_file_end_write(struct kiocb *iocb, ssize_t ret)
@@ -49,9 +52,10 @@ static int aufsng_open(struct inode *inode, struct file *file)
 			return err;
 	}
 
-	aufsng_path_real(inode, &realpath);
+	aufsng_path_real_get(inode, &realpath);
 	realfile = backing_file_open(file, file->f_flags, &realpath,
 				     pfs->creator_cred);
+	aufsng_path_real_put(inode, &realpath);
 	if (IS_ERR(realfile))
 		return PTR_ERR(realfile);
 
@@ -93,10 +97,40 @@ static loff_t aufsng_llseek(struct file *file, loff_t offset, int whence)
 	return ret;
 }
 
+#define AUFSNG_SETFL_MASK (O_APPEND | O_NONBLOCK | O_NDELAY | O_DIRECT)
+
+static int aufsng_sync_flags(struct file *file)
+{
+	struct file *realfile = file->private_data;
+	unsigned int flags = READ_ONCE(file->f_flags) & AUFSNG_SETFL_MASK;
+	int err;
+
+	if (!((flags ^ realfile->f_flags) & AUFSNG_SETFL_MASK))
+		return 0;
+	if (((flags ^ realfile->f_flags) & O_APPEND) &&
+	    IS_APPEND(file_inode(realfile)))
+		return -EPERM;
+	if ((flags & O_DIRECT) && !(realfile->f_mode & FMODE_CAN_ODIRECT))
+		return -EINVAL;
+	if (realfile->f_op->check_flags) {
+		err = realfile->f_op->check_flags(flags);
+		if (err)
+			return err;
+	}
+	spin_lock(&realfile->f_lock);
+	realfile->f_flags = (realfile->f_flags & ~AUFSNG_SETFL_MASK) | flags;
+	realfile->f_iocb_flags = iocb_flags(realfile);
+	spin_unlock(&realfile->f_lock);
+	return 0;
+}
+
 static ssize_t aufsng_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 {
 	struct file *file = iocb->ki_filp;
+	int err = aufsng_sync_flags(file);
 
+	if (err)
+		return err;
 	return backing_file_read_iter(file->private_data, iter, iocb,
 				      iocb->ki_flags,
 				      aufsng_backing_ctx(file_inode(file)->i_sb));
@@ -110,6 +144,9 @@ static ssize_t aufsng_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 
 	if (!iov_iter_count(iter))
 		return 0;
+	ret = aufsng_sync_flags(file);
+	if (ret)
+		return ret;
 
 	/*
 	 * Locked for the set-id kill: backing_file_write_iter drops the
@@ -132,6 +169,9 @@ static ssize_t aufsng_splice_read(struct file *in, loff_t *ppos,
 	struct kiocb iocb;
 	ssize_t ret;
 
+	ret = aufsng_sync_flags(in);
+	if (ret)
+		return ret;
 	init_sync_kiocb(&iocb, in);
 	iocb.ki_pos = *ppos;
 	ret = backing_file_splice_read(in->private_data, &iocb, pipe, len,
@@ -149,6 +189,9 @@ static ssize_t aufsng_splice_write(struct pipe_inode_info *pipe, struct file *ou
 	struct kiocb iocb;
 	ssize_t ret;
 
+	ret = aufsng_sync_flags(out);
+	if (ret)
+		return ret;
 	/* locked for the same set-id kill as aufsng_write_iter */
 	inode_lock(inode);
 	init_sync_kiocb(&iocb, out);
@@ -266,6 +309,10 @@ const struct file_operations aufsng_file_operations = {
 	.fsync		= aufsng_fsync,
 	.flush		= aufsng_flush,
 	.fallocate	= aufsng_fallocate,
+};
+
+const struct address_space_operations aufsng_file_aops = {
+	.direct_IO	= noop_direct_IO,
 };
 
 void aufsng_backing_ctx_init(struct aufsng_fs *pfs)

@@ -62,6 +62,7 @@
  */
 #define AUFSNG_XATTR_PFX	"trusted.aufs_ng."
 #define AUFSNG_XATTR_ORIGIN	AUFSNG_XATTR_PFX "origin"
+#define AUFSNG_XATTR_PROTATTR	AUFSNG_XATTR_PFX "protattr"
 
 enum aufsng_br_perm {
 	AUFSNG_BR_RW,
@@ -98,6 +99,7 @@ struct aufsng_path {
  */
 struct aufsng_entry {
 	unsigned int numlower;
+	const struct aufsng_layer *stop;
 	struct aufsng_path lowerstack[];
 };
 
@@ -155,6 +157,7 @@ struct aufsng_inode {
 	struct aufsng_dir_cache *cache;	/* merged readdir cache (dirs) */
 	struct aufsng_dyn_parked *dyn_parked;
 	atomic64_t version;		/* merged readdir cache validity */
+	unsigned int protflags;
 	/* synchronize copy up and more */
 	struct mutex lock;
 	struct inode vfs_inode;
@@ -292,10 +295,6 @@ static inline void aufsng_path_real(struct inode *inode, struct path *path)
 static inline void aufsng_path_real_get(struct inode *inode,
 					struct path *path)
 {
-	if (!S_ISDIR(inode->i_mode)) {
-		aufsng_path_real(inode, path);
-		return;
-	}
 	rcu_read_lock();
 	aufsng_path_real(inode, path);
 	path_get(path);
@@ -305,8 +304,7 @@ static inline void aufsng_path_real_get(struct inode *inode,
 static inline void aufsng_path_real_put(struct inode *inode,
 					struct path *path)
 {
-	if (S_ISDIR(inode->i_mode))
-		path_put(path);
+	path_put(path);
 }
 
 /* aufsng_path_real() owns the lockless upper/stack read protocol */
@@ -328,6 +326,8 @@ static inline bool aufsng_origin_type_ok(struct dentry *origin, umode_t mode)
 	return (d_inode(origin)->i_mode & S_IFMT) == (mode & S_IFMT);
 }
 
+#define AUFSNG_COPY_I_FLAGS	(S_SYNC | S_NOATIME | S_APPEND | S_IMMUTABLE)
+
 /*
  * "The union inode mirrors the real inode's attributes", shared by
  * first instantiation and every later refresh.
@@ -348,6 +348,10 @@ static inline void aufsng_copyattr_from(struct inode *inode,
 	inode_set_ctime_to_ts(inode, inode_get_ctime(realinode));
 	i_size_write(inode, i_size_read(realinode));
 	set_nlink(inode, realinode->i_nlink);
+	inode_set_flags(inode, (realinode->i_flags & AUFSNG_COPY_I_FLAGS) |
+			(S_ISDIR(inode->i_mode) ?
+			 READ_ONCE(AUFSNG_I(inode)->protflags) : 0),
+			AUFSNG_COPY_I_FLAGS);
 #ifdef CONFIG_FS_POSIX_ACL
 	{
 		struct posix_acl *acl = NULL;
@@ -521,6 +525,7 @@ extern const struct super_operations aufsng_super_operations;
 
 /* file.c */
 extern const struct file_operations aufsng_file_operations;
+extern const struct address_space_operations aufsng_file_aops;
 void aufsng_backing_ctx_init(struct aufsng_fs *pfs);
 
 /* readdir.c */
@@ -553,6 +558,7 @@ int aufsng_find_origin_ex(struct aufsng_entry *poe, const struct qstr *name,
 struct aufsng_merge {
 	struct aufsng_entry *oe;	/* lazily allocated when NULL */
 	unsigned int n;			/* entries filled so far */
+	const struct aufsng_layer *stop;
 	bool allow_top_nondir;
 };
 
@@ -584,6 +590,7 @@ int aufsng_copy_up(struct dentry *dentry);
 struct dentry *aufsng_copy_up_upper(struct dentry *dentry);
 bool aufsng_has_origin(struct aufsng_fs *pfs, struct dentry *upper,
 		    const struct qstr *name);
+unsigned int aufsng_read_protattr(struct aufsng_fs *pfs, struct dentry *upper);
 
 /* dir.c */
 int aufsng_create(AUFSNG_IDMAP *idmap, struct inode *dir,
