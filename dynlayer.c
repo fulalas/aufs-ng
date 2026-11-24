@@ -717,7 +717,7 @@ out_iput:
 }
 
 int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
-		       const struct path *path)
+		       const struct path *path, enum aufsng_br_perm perm)
 {
 	struct aufsng_fs *pfs = AUFSNG_FS(sb);
 	struct inode *root_inode = aufsng_root_inode(sb);
@@ -797,6 +797,9 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	layer->mnt = mnt;
 	pfs->namelen = min(pfs->namelen, namelen);
 	layer->path = dup_name;
+	layer->user_path = *path;
+	path_get(&layer->user_path);
+	layer->perm = perm == AUFSNG_BR_RW ? AUFSNG_BR_RO : perm;
 	if (idx == pfs->numlayer)
 		pfs->numlayer++;
 
@@ -1430,6 +1433,8 @@ static void aufsng_dyn_release_branch(struct aufsng_layer *layer)
 {
 	kfree(layer->path);
 	layer->path = NULL;
+	path_put(&layer->user_path);
+	layer->user_path = (struct path){};
 	/*
 	 * Private clones are longterm mounts: mntput()'s fast path never
 	 * schedules cleanup, so it would leak the mount, its root dentry
@@ -1715,12 +1720,12 @@ int aufsng_dyn_reconfigure(struct fs_context *fc)
 
 		/*
 		 * An added branch is always a lower, so read-only whatever the
-		 * mode says.  Warn: no branch mode is echoed to userspace.
+		 * mode says.
 		 */
 		if (b->perm == AUFSNG_BR_RW)
 			pr_warn("aufs (aufs-ng): branch '%s' declared rw but only the first branch is writable; using ro\n",
 				b->name);
-		err = aufsng_dyn_add_branch(sb, b->name, &b->path);
+		err = aufsng_dyn_add_branch(sb, b->name, &b->path, b->perm);
 		/*
 		 * Tolerate re-adding a present branch: legacy remounts
 		 * may replay the current mount options.
@@ -1732,5 +1737,6 @@ int aufsng_dyn_reconfigure(struct fs_context *fc)
 	for (i = 0; !err && i < ctx->nr_dyn_del; i++)
 		err = aufsng_dyn_del_branch(sb, &ctx->dyn_del[i]);
 
+	aufsng_sysfs_sync(sb);
 	return err;
 }

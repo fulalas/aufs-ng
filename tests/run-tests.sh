@@ -13,8 +13,9 @@ guest_main() {
 	$M tmpfs tmpfs /dev
 	mknod /dev/null c 1 3 2>/dev/null
 	$M tmpfs tmpfs /mnt
+	$M sysfs sysfs /sys
 
-	N=0; TOTAL=162; PASS=0; FAIL=0
+	N=0; TOTAL=176; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -30,6 +31,8 @@ guest_main() {
 		done; return 1; }
 	checkfail() { local desc="$1"; shift
 		if "$@" >/dev/null 2>&1; then bad "$desc"; else ok "$desc"; fi; }
+	si_of() { sed -n "s|.* $1 aufs .*si=\([0-9a-f]*\).*|\1|p" /proc/mounts; }
+	nbr_of() { ls /sys/fs/aufs/si_$1 | grep -c '^br'; }
 
 	W=/mnt/w; L1=/mnt/l1; L2=/mnt/l2; L3=/mnt/l3; U=/mnt/union
 	mkdir -p $W $L1 $L2 $L3 $U
@@ -441,9 +444,7 @@ guest_main() {
 
 	echo "=== 28. lower branch declared rw is demoted, and warned about ==="
 	# AUFS grammar allows "=rw" on any branch; aufs-ng only ever writes
-	# branch 0, so a lower "=rw" is accepted but clamped read-only.  The
-	# branch modes are not echoed to userspace anywhere, so the kernel
-	# log warning is the only notice the demotion happened.
+	# branch 0, so a lower "=rw" is accepted but clamped read-only.
 	mkdir -p /mnt/dw /mnt/dl /mnt/du
 	$M tmpfs tmpfs /mnt/dw; $M tmpfs tmpfs /mnt/dl
 	echo lowerdata > /mnt/dl/lf
@@ -460,6 +461,8 @@ guest_main() {
 	echo new > /mnt/du/lf
 	check "write to a lower-=rw name lands in branch 0" grep -q new /mnt/dw/lf
 	check "the demoted lower branch stays untouched"    grep -q lowerdata /mnt/dl/lf
+	check "sysfs shows the demoted lower as ro" \
+		grep -qx "/mnt/dl=ro" /sys/fs/aufs/si_$(si_of /mnt/du)/br1
 	$M -u /mnt/du
 
 	echo "=== 29. noxino and si= accepted at mount time (aufs compatibility) ==="
@@ -632,6 +635,8 @@ for e in os.scandir(sys.argv[1]):
 	# plain sibling directories, which is all a branch has to be.
 	MANY=140
 	mkdir -p /mnt/many
+	usi=$(si_of $U)
+	nbr=$(nbr_of $usi)
 	i=1
 	while [ $i -le $MANY ]; do
 		mkdir -p /mnt/many/b$i
@@ -645,6 +650,10 @@ for e in os.scandir(sys.argv[1]):
 	# add=1 always inserts on top, so the last one added owns the name
 	check "the newest of many branches wins the shared name" \
 		grep -q "^b$MANY\$" $U/manyfile
+	[ "$(nbr_of $usi)" = $((nbr + MANY)) ] \
+		&& [ "$(cat /sys/fs/aufs/si_$usi/br1)" = "/mnt/many/b$MANY=rr" ] \
+		&& ok "sysfs lists all $MANY added branches, newest as br1" \
+		|| bad "sysfs lists all $MANY added branches, newest as br1"
 	# Readers with fixed line buffers fail once a mountinfo line fills
 	# 4096 bytes, which printing every branch used to do.
 	len=$(awk -v m=$U '$5 == m { print length($0); exit }' /proc/self/mountinfo)
@@ -662,6 +671,9 @@ for e in os.scandir(sys.argv[1]):
 	[ $i -eq 0 ] \
 		&& ok "all $MANY branches removed again" \
 		|| bad "all $MANY branches removed again (del $i failed)"
+	[ "$(nbr_of $usi)" = $nbr ] \
+		&& ok "sysfs drops the removed branches" \
+		|| bad "sysfs drops the removed branches"
 	checkfail "the shared name is gone with the branches" test -e $U/manyfile
 	# every slot is free now: the next add must reuse one, not grow
 	$M aufs aufs $U "add=1:/mnt/many/b1=rr" 32 \
@@ -973,6 +985,48 @@ while True:
 		&& ok "copy-up of a file with data after a hole up to its end" \
 		|| bad "copy-up of a file with data after a hole up to its end ($b blocks)"
 	$M -u $SU; $M -u $SW; $M -u $SL
+
+	echo "=== 39. branch list in /sys/fs/aufs/si_<id>/br<N> ==="
+	SY=/mnt/sy
+	mkdir -p $SY/w $SY/a $SY/b $SY/b2 "$SY/c d" $SY/u
+	for d in $SY/w $SY/a $SY/b "$SY/c d"; do $M tmpfs tmpfs "$d"; done
+	(cd /mnt && $M aufs aufs $SY/u "br:sy/w=rw:sy/a=rr:$SY/b=ro") \
+		|| bad "precondition: sysfs union mount"
+	si=$(si_of $SY/u)
+	SD=/sys/fs/aufs/si_$si
+	brs() { local i=0 out=
+		while [ -e $SD/br$i ]; do out="$out$(cat $SD/br$i)|"; i=$((i+1)); done
+		echo "$out"; }
+	brs_is() { [ "$(brs)" = "$1" ] && ok "$2" || bad "$2 ($(brs))"; }
+	C="$SY/c\\040d=rr"
+	check "the si= id names a folder in /sys/fs/aufs" test -n "$si" -a -d $SD
+	brs_is "$SY/w=rw|$SY/a=rr|$SY/b=ro|" \
+		"br0..brN list the mount's branches as absolute paths and modes"
+	$M aufs aufs $SY/u "add=1:$SY/c d=rr" 32 || bad "precondition: sysfs add"
+	brs_is "$SY/w=rw|$C|$SY/a=rr|$SY/b=ro|" \
+		"an added branch shows as br1, with a space escaped"
+	$M aufs aufs $SY/u "add=1:$SY/a=ro" 32
+	brs_is "$SY/w=rw|$C|$SY/a=rr|$SY/b=ro|" \
+		"re-adding a present branch leaves the list alone"
+	$M none $SY/b $SY/b2 "" 8192 || bad "precondition: move a branch's mount"
+	brs_is "$SY/w=rw|$C|$SY/a=rr|$SY/b2=ro|" \
+		"a moved branch mount shows its new path"
+	checkfail "a branch's mount cannot be unmounted while in use" \
+		$M -u $SY/b2
+	$M aufs aufs $SY/u "del=$SY/a" 32 || bad "precondition: sysfs del"
+	brs_is "$SY/w=rw|$C|$SY/b2=ro|" \
+		"a removed branch leaves the list and the rest move up"
+	checkfail "no br file past the last branch" test -e $SD/br3
+	$M aufs aufs $SY/u "del=$SY/c d" 32
+	$M aufs aufs $SY/u "del=$SY/b2" 32
+	brs_is "$SY/w=rw|" "only br0 is left with no lower branch"
+	si2=$(si_of $U)
+	[ -n "$si2" ] && [ "$si2" != "$si" ] && [ -r /sys/fs/aufs/si_$si2/br0 ] \
+		&& ok "each mount has its own si folder" \
+		|| bad "each mount has its own si folder"
+	$M -u $SY/u
+	checkfail "umount removes the si folder" test -e $SD
+	for d in $SY/w $SY/a $SY/b2 "$SY/c d"; do $M -u "$d"; done
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.

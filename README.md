@@ -94,8 +94,15 @@ layer is not refused, but it is not supported either. An encrypted folder
 
 Unknown options are rejected when mounting and ignored when remounting.
 
-`/proc/mounts` shows the mount id and the options, not the list of layers —
-same as `aufs`.
+`/proc/mounts` shows the mount id (`si=`) and the options, not the list of
+layers. The layers are listed in `/sys/fs/aufs/si_<id>/`, one file per
+layer, same as `aufs`: `br0` is the writable one, then `br1`, `br2`... from
+the top read-only layer down. Each holds `<path>=<mode>`: the mode as given
+(`rw`, `ro` or `rr`; a later layer given as `rw` shows `ro`), and the layer's
+current path as seen by the reader, so it stays right after a mount is moved
+(e.g. by `switch_root`). Spaces and other special characters show as `\ooo`
+octal. As with `aufs`, a layer's own mount cannot be unmounted while it is in
+the union.
 
 Removing a layer works even while a file it provides is open, unless that
 file is memory-mapped: the open file keeps working until it is closed, and

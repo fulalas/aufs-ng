@@ -267,6 +267,7 @@ static void aufsng_free_fs(struct aufsng_fs *pfs)
 			else
 				kern_unmount(layer->mnt);
 		}
+		path_put(&layer->user_path);
 		kfree(layer->path);
 		kfree(layer);
 	}
@@ -526,7 +527,10 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		layer->mnt = mnt;
 		layer->path = ctx->br[i].name;
 		ctx->br[i].name = NULL;
-		/* The only notice: no branch mode is echoed to userspace. */
+		layer->user_path = ctx->br[i].path;
+		path_get(&layer->user_path);
+		layer->perm = i && ctx->br[i].perm == AUFSNG_BR_RW ?
+			      AUFSNG_BR_RO : ctx->br[i].perm;
 		if (i > 0 && ctx->br[i].perm == AUFSNG_BR_RW)
 			pr_warn("aufs (aufs-ng): branch '%s' declared rw but only the first branch is writable; using ro\n",
 				layer->path);
@@ -580,7 +584,7 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto out_free;
 
 	sb->s_root = root;
-	return 0;
+	return aufsng_sysfs_mount(sb);
 
 out_free:
 	aufsng_free_entry(oe);
@@ -589,12 +593,18 @@ out_free:
 	return err;
 }
 
+static void aufsng_kill_sb(struct super_block *sb)
+{
+	aufsng_sysfs_umount(sb);
+	kill_anon_super(sb);
+}
+
 static struct file_system_type aufsng_fs_type = {
 	.owner			= THIS_MODULE,
 	.name			= AUFSNG_NAME,
 	.init_fs_context	= aufsng_init_fs_context,
 	.parameters		= aufsng_parameter_spec,
-	.kill_sb		= kill_anon_super,
+	.kill_sb		= aufsng_kill_sb,
 };
 
 static void aufsng_inode_init_once(void *data)
@@ -616,16 +626,24 @@ static int __init aufsng_init(void)
 		return -ENOMEM;
 
 	err = register_filesystem(&aufsng_fs_type);
-	if (err) {
-		kmem_cache_destroy(aufsng_inode_cachep);
-		return err;
-	}
+	if (err)
+		goto out_cache;
+	err = aufsng_sysfs_init();
+	if (err)
+		goto out_fs;
 	return 0;
+
+out_fs:
+	unregister_filesystem(&aufsng_fs_type);
+out_cache:
+	kmem_cache_destroy(aufsng_inode_cachep);
+	return err;
 }
 
 static void __exit aufsng_exit(void)
 {
 	unregister_filesystem(&aufsng_fs_type);
+	aufsng_sysfs_exit();
 	/* wait out RCU-delayed inode frees before destroying the cache */
 	rcu_barrier();
 	kmem_cache_destroy(aufsng_inode_cachep);

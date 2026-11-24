@@ -66,7 +66,8 @@
 
 enum aufsng_br_perm {
 	AUFSNG_BR_RW,
-	AUFSNG_BR_RO,	/* "ro"/"rr": read-only, never written to */
+	AUFSNG_BR_RO,
+	AUFSNG_BR_RR,
 };
 
 /*
@@ -78,6 +79,8 @@ struct aufsng_layer {
 	unsigned int idx;	/* stable slot number, see aufsng_layer_idx() */
 	/* path as given, for log messages; the clone has none.  NULL if free */
 	char *path;
+	struct path user_path;
+	enum aufsng_br_perm perm;
 };
 
 struct aufsng_path {
@@ -145,6 +148,7 @@ struct aufsng_fs {
 	struct aufsng_config config;
 	/* long, as statfs's f_namelen and aufsng_probe_namelen() both are */
 	long namelen;
+	struct aufsng_sysfs *sysfs;
 };
 
 struct aufsng_dir_cache;
@@ -618,12 +622,19 @@ unsigned long aufsng_reval_stamp(struct aufsng_fs *pfs, struct inode *dir);
 
 /* dynlayer.c */
 int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
-		       const struct path *path);
+		       const struct path *path, enum aufsng_br_perm perm);
 int aufsng_dyn_del_branch(struct super_block *sb, const struct path *path);
 bool aufsng_dyn_adopt_upper(struct inode *inode, struct dentry *lowerdentry,
 			 struct dentry *upperdentry);
 bool aufsng_dyn_shed_upper(struct inode *inode);
 void aufsng_dyn_put_parked(struct aufsng_inode *oi);
 void aufsng_dyn_free_parked(struct aufsng_inode *oi);
+
+struct aufsng_sysfs;
+int aufsng_sysfs_init(void);
+void aufsng_sysfs_exit(void);
+int aufsng_sysfs_mount(struct super_block *sb);
+void aufsng_sysfs_umount(struct super_block *sb);
+void aufsng_sysfs_sync(struct super_block *sb);
 
 #endif /* AUFSNG_H */

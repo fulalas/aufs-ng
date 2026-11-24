@@ -108,8 +108,10 @@ static int aufsng_parse_perm(const char *s, enum aufsng_br_perm *perm)
 {
 	if (!strncmp(s, "rw", 2))
 		*perm = AUFSNG_BR_RW;
-	else if (!strncmp(s, "ro", 2) || !strncmp(s, "rr", 2))
+	else if (!strncmp(s, "ro", 2))
 		*perm = AUFSNG_BR_RO;
+	else if (!strncmp(s, "rr", 2))
+		*perm = AUFSNG_BR_RR;
 	else
 		return -EINVAL;
 	if (s[2] != '\0' && s[2] != '+')

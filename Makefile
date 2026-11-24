@@ -5,7 +5,7 @@ ifneq ($(KERNELRELEASE),)
 # loadable module (=m, useful for a quick standalone test build
 # against an already-built kernel tree without a full rebuild).
 obj-$(CONFIG_AUFSNG_FS) += aufs-ng.o
-aufs-ng-y := super.o params.o namei.o dcache.o file.o readdir.o inode.o copy_up.o dir.o dynlayer.o
+aufs-ng-y := super.o params.o namei.o dcache.o file.o readdir.o inode.o copy_up.o dir.o dynlayer.o sysfs.o
 
 else
 
