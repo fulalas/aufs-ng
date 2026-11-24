@@ -47,9 +47,8 @@ benchmarks.
   table to write.
 - **Copy-up** — `aufs` copies file data through a page-at-a-time
   buffer; `aufs-ng` moves it with in-kernel splice, faster for large
-  files. Holes in sparse files stay holes when the lower filesystem
-  reports them, and when both layers sit on the same btrfs or XFS
-  filesystem the copy shares the data blocks.
+  files. Sparse files stay sparse, and on a shared btrfs or XFS the copy
+  shares data blocks.
 
 **RAM**
 
@@ -75,16 +74,10 @@ Each layer is `rw` (writable, first layer only) or `ro`/`rr` (read-only).
 A later layer asking for `rw` is accepted but stays read-only, with a note
 in the kernel log. Layers may not overlap: one cannot be inside another.
 
-Layers must be on a local filesystem. NFS, CIFS and other network or
-FUSE filesystems are refused, except `fuseblk` (e.g. `ntfs-3g`).
-Case-insensitive filesystems are refused too: FAT, exFAT, HFS/HFS+, HPFS,
-AFFS, ADFS, Joliet-only ISOs, ISOs mounted with `check=relaxed`, and ntfs3
-or JFS in case-insensitive mode. XFS with `ascii-ci` and the `ntfs` driver
-with `nocase` are not detected, so don't use them as layers.
-A case-insensitive folder (casefold, `chattr +F`) cannot be a layer; other
-folders of a filesystem with casefold enabled can. Such a folder inside a
-layer is not refused, but it is not supported either. An encrypted folder
-(fscrypt) inside a layer gives `ENOKEY` until its key is loaded.
+Layers must be on a local, case-sensitive filesystem: network and FUSE
+filesystems (except `fuseblk`), FAT, exFAT, HFS and other case-insensitive
+ones are refused. XFS `ascii-ci` and `ntfs` `nocase` are not detected, so
+don't use them.
 
 - `udba=` — whether to notice changes made directly inside a layer, behind
   the union's back. `reval` (the default) notices them; `none` trusts the
@@ -94,15 +87,9 @@ layer is not refused, but it is not supported either. An encrypted folder
 
 Unknown options are rejected when mounting and ignored when remounting.
 
-`/proc/mounts` shows the mount id (`si=`) and the options, not the list of
-layers. The layers are listed in `/sys/fs/aufs/si_<id>/`, one file per
-layer, same as `aufs`: `br0` is the writable one, then `br1`, `br2`... from
-the top read-only layer down. Each holds `<path>=<mode>`: the mode as given
-(`rw`, `ro` or `rr`; a later layer given as `rw` shows `ro`), and the layer's
-current path as seen by the reader, so it stays right after a mount is moved
-(e.g. by `switch_root`). Spaces and other special characters show as `\ooo`
-octal. As with `aufs`, a layer's own mount cannot be unmounted while it is in
-the union.
+As in `aufs`, `/proc/mounts` shows a mount id (`si=`) but not the layers;
+they are in `/sys/fs/aufs/si_<id>/br0`, `br1`... (writable first, then top
+down), as `<path>=<mode>`. A layer's mount can't be unmounted while in use.
 
 Removing a layer works even while a file it provides is open, unless that
 file is memory-mapped: the open file keeps working until it is closed, and
@@ -136,11 +123,9 @@ A writable layer that cannot store xattrs still works. Copied files just get
 a new inode number once the kernel drops them from its cache, and the log
 says so once. (`OverlayFS` refuses to mount at all.)
 
-POSIX ACLs on a layer are enforced through the union, kept when a file is
-copied, and can be changed with `setfacl` when the writable layer supports
-them. When the writable layer cannot store ACLs, a copied file loses its
-ACL, and its group permission is cut to what the ACL gave the owning group,
-so the copy never grants more than the original.
+POSIX ACLs are enforced and kept on copy-up. If the writable layer can't
+store them, the copy's group bits are cut so it never grants more than the
+original.
 
 ## Trade-offs
 
