@@ -90,6 +90,8 @@ Unknown options are rejected when mounting and ignored when remounting.
 As in `aufs`, `/proc/mounts` shows a mount id (`si=`) but not the layers;
 they are in `/sys/fs/aufs/si_<id>/br0`, `br1`... (writable first, then top
 down), as `<path>=<mode>`. A layer's mount can't be unmounted while in use.
+If it is detached anyway (`umount -l`), the file shows the layer's original
+path while that still leads to it, and fails otherwise.
 
 Removing a layer works even while a file it provides is open, unless that
 file is memory-mapped: the open file keeps working until it is closed, and

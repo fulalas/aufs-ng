@@ -80,6 +80,7 @@ struct aufsng_layer {
 	/* path as given, for log messages; the clone has none.  NULL if free */
 	char *path;
 	struct path user_path;
+	char *abs_path;
 	enum aufsng_br_perm perm;
 };
 
@@ -521,6 +522,7 @@ int aufsng_check_overlap(struct aufsng_fs *pfs, struct dentry *dentry,
 		      const char *name);
 struct aufsng_layer *aufsng_layer_reserve(struct aufsng_fs *pfs,
 					  unsigned int idx);
+void aufsng_layer_put_paths(struct aufsng_layer *layer);
 int aufsng_grow_array(void **arr, size_t *cap, size_t need, size_t elemsize,
 		   gfp_t gfp);
 int aufsng_probe_namelen(const struct path *path, long *namelen);
@@ -636,5 +638,6 @@ void aufsng_sysfs_exit(void);
 int aufsng_sysfs_mount(struct super_block *sb);
 void aufsng_sysfs_umount(struct super_block *sb);
 void aufsng_sysfs_sync(struct super_block *sb);
+char *aufsng_abs_path(const struct path *path);
 
 #endif /* AUFSNG_H */

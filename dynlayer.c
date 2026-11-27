@@ -725,7 +725,7 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	struct aufsng_dyn_parked *retired = NULL;
 	struct aufsng_layer *layer;
 	struct vfsmount *mnt;
-	char *dup_name;
+	char *dup_name, *abs_path;
 	unsigned int idx;
 	long namelen;
 	int err;
@@ -763,6 +763,7 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	dup_name = kstrdup(name, GFP_KERNEL);
 	if (!dup_name)
 		return -ENOMEM;
+	abs_path = aufsng_abs_path(path);
 
 	mnt = clone_private_mount(path);
 	if (IS_ERR(mnt)) {
@@ -799,6 +800,7 @@ int aufsng_dyn_add_branch(struct super_block *sb, const char *name,
 	layer->path = dup_name;
 	layer->user_path = *path;
 	path_get(&layer->user_path);
+	layer->abs_path = abs_path;
 	layer->perm = perm == AUFSNG_BR_RW ? AUFSNG_BR_RO : perm;
 	if (idx == pfs->numlayer)
 		pfs->numlayer++;
@@ -836,6 +838,7 @@ out_mnt:
 	/* Private clones are longterm mounts: only kern_unmount() tears them down */
 	kern_unmount(mnt);
 out_name:
+	kfree(abs_path);
 	kfree(dup_name);
 	return err;
 }
@@ -1431,10 +1434,7 @@ static int aufsng_dyn_sort_scan(struct aufsng_dyn_scan *scan)
 
 static void aufsng_dyn_release_branch(struct aufsng_layer *layer)
 {
-	kfree(layer->path);
-	layer->path = NULL;
-	path_put(&layer->user_path);
-	layer->user_path = (struct path){};
+	aufsng_layer_put_paths(layer);
 	/*
 	 * Private clones are longterm mounts: mntput()'s fast path never
 	 * schedules cleanup, so it would leak the mount, its root dentry

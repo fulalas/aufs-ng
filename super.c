@@ -202,6 +202,16 @@ static int aufsng_show_options(struct seq_file *m, struct dentry *dentry)
 	return 0;
 }
 
+void aufsng_layer_put_paths(struct aufsng_layer *layer)
+{
+	kfree(layer->path);
+	layer->path = NULL;
+	kfree(layer->abs_path);
+	layer->abs_path = NULL;
+	path_put(&layer->user_path);
+	layer->user_path = (struct path){};
+}
+
 /*
  * Make slot @idx exist and return its branch, growing the slot table if
  * needed.  Table and branches live until umount, so a slot freed by a
@@ -267,8 +277,7 @@ static void aufsng_free_fs(struct aufsng_fs *pfs)
 			else
 				kern_unmount(layer->mnt);
 		}
-		path_put(&layer->user_path);
-		kfree(layer->path);
+		aufsng_layer_put_paths(layer);
 		kfree(layer);
 	}
 	if (nr)
@@ -529,6 +538,7 @@ int aufsng_fill_super(struct super_block *sb, struct fs_context *fc)
 		ctx->br[i].name = NULL;
 		layer->user_path = ctx->br[i].path;
 		path_get(&layer->user_path);
+		layer->abs_path = aufsng_abs_path(&layer->user_path);
 		layer->perm = i && ctx->br[i].perm == AUFSNG_BR_RW ?
 			      AUFSNG_BR_RO : ctx->br[i].perm;
 		if (i > 0 && ctx->br[i].perm == AUFSNG_BR_RW)

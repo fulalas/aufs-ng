@@ -15,7 +15,7 @@ guest_main() {
 	$M tmpfs tmpfs /mnt
 	$M sysfs sysfs /sys
 
-	N=0; TOTAL=176; PASS=0; FAIL=0
+	N=0; TOTAL=179; PASS=0; FAIL=0
 	ok()  { N=$((N+1)); PASS=$((PASS+1))
 		printf '%d/%d - %s... \033[1;32mPASSED\033[0m\n' "$N" "$TOTAL" "$1"; }
 	bad() { N=$((N+1)); FAIL=$((FAIL+1))
@@ -1027,6 +1027,27 @@ while True:
 	$M -u $SY/u
 	checkfail "umount removes the si folder" test -e $SD
 	for d in $SY/w $SY/a $SY/b2 "$SY/c d"; do $M -u "$d"; done
+	mkdir -p $SY/w2 $SY/run $SY/run2 $SY/u2
+	$M tmpfs tmpfs $SY/w2; $M tmpfs tmpfs $SY/run
+	mkdir $SY/run/l; $M tmpfs tmpfs $SY/run/l
+	$M aufs aufs $SY/u2 "br:$SY/w2=rw:$SY/run/l=ro" \
+		|| bad "precondition: sysfs detach union mount"
+	SD=/sys/fs/aufs/si_$(si_of $SY/u2)
+	$M none $SY/run $SY/run2 "" 20480 && $M -l $SY/run \
+		|| bad "precondition: copy and detach a branch's mount"
+	checkfail "a branch whose mount was detached is not shown as /" \
+		cat $SD/br1
+	mkdir $SY/run/l
+	checkfail "a detached branch is not shown at a path now holding another folder" \
+		cat $SD/br1
+	rmdir $SY/run/l
+	$M none $SY/run2 $SY/run "" 20480 \
+		|| bad "precondition: copy the branch's mount back"
+	[ "$(cat $SD/br1)" = "$SY/run/l=ro" ] \
+		&& ok "a detached branch shows its path again once a copy is there" \
+		|| bad "a detached branch shows its path again once a copy is there"
+	$M -u $SY/u2
+	for d in $SY/run/l $SY/run $SY/run2/l $SY/run2 $SY/w2; do $M -u $d; done
 
 	# A miscount here means a check was added/removed without updating
 	# TOTAL - fail loudly so the "N/TOTAL" numbering stays honest.
@@ -1063,8 +1084,8 @@ int main(int argc, char **argv)
 		perror("reboot");
 		return 1;
 	}
-	if (argc >= 3 && !strcmp(argv[1], "-u")) {	/* umount TGT */
-		if (umount2(argv[2], 0)) {
+	if (argc >= 3 && (!strcmp(argv[1], "-u") || !strcmp(argv[1], "-l"))) {
+		if (umount2(argv[2], argv[1][1] == 'l' ? MNT_DETACH : 0)) {
 			perror("umount");
 			return 1;
 		}
@@ -1072,7 +1093,7 @@ int main(int argc, char **argv)
 	}
 	/* mnt TYPE SRC TGT [DATA] [FLAGS] */
 	if (argc < 4) {
-		fprintf(stderr, "usage: mnt TYPE SRC TGT [DATA] [FLAGS] | mnt -u TGT | mnt -o\n");
+		fprintf(stderr, "usage: mnt TYPE SRC TGT [DATA] [FLAGS] | mnt -u TGT | mnt -l TGT | mnt -o\n");
 		return 2;
 	}
 	{

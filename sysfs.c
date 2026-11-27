@@ -4,6 +4,8 @@
 #include <linux/sysfs.h>
 #include <linux/slab.h>
 #include <linux/string_helpers.h>
+#include <linux/mount.h>
+#include <linux/namei.h>
 #include "aufsng.h"
 
 struct aufsng_br_attr {
@@ -33,6 +35,31 @@ static const char * const aufsng_perm_str[] = {
 	[AUFSNG_BR_RR] = "rr",
 };
 
+char *aufsng_abs_path(const struct path *path)
+{
+	char *tmp = __getname(), *p, *ret = NULL;
+
+	if (!tmp)
+		return NULL;
+	p = d_path(path, tmp, PATH_MAX);
+	if (!IS_ERR(p))
+		ret = kstrdup(p, GFP_KERNEL);
+	__putname(tmp);
+	return ret;
+}
+
+static bool aufsng_br_reaches(const char *name, const struct dentry *dentry)
+{
+	struct path now;
+	bool same;
+
+	if (kern_path(name, 0, &now))
+		return false;
+	same = now.dentry == dentry;
+	path_put(&now);
+	return same;
+}
+
 static ssize_t aufsng_br_show(struct kobject *kobj, struct kobj_attribute *ka,
 			      char *buf)
 {
@@ -43,6 +70,7 @@ static ssize_t aufsng_br_show(struct kobject *kobj, struct kobj_attribute *ka,
 	int room = PAGE_SIZE - sizeof("=rw\n");
 	char *tmp = __getname(), *p = ERR_PTR(-ENOENT);
 	enum aufsng_br_perm perm = AUFSNG_BR_RO;
+	struct dentry *detached = NULL;
 	int len;
 
 	if (!tmp)
@@ -57,11 +85,23 @@ static ssize_t aufsng_br_show(struct kobject *kobj, struct kobj_attribute *ka,
 			layer = oe->lowerstack[a->idx - 1].layer;
 	}
 	if (layer) {
-		p = d_path(&layer->user_path, tmp, PATH_MAX);
 		perm = layer->perm;
+		p = d_path(&layer->user_path, tmp, PATH_MAX);
+		if (READ_ONCE(layer->user_path.mnt->mnt_flags) & MNT_UMOUNT) {
+			p = ERR_PTR(-ENOENT);
+			if (layer->abs_path) {
+				strscpy(tmp, layer->abs_path, PATH_MAX);
+				detached = dget(layer->user_path.dentry);
+			}
+		}
 	}
 	percpu_up_read(&pfs->dyn_lock);
 
+	if (detached) {
+		if (aufsng_br_reaches(tmp, detached))
+			p = tmp;
+		dput(detached);
+	}
 	if (IS_ERR(p)) {
 		len = PTR_ERR(p);
 	} else {
